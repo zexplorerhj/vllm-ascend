@@ -15,6 +15,9 @@ from operator_test_framework import BaseOperatorTest, PrecisionType, DeviceType
 
 class RMSNormOperatorTest(BaseOperatorTest):
     """RMSNorm算子测试实现"""
+
+    CUDA_IMPLEMENTATION = "cuda_vllm_rms_norm_out"
+    NPU_IMPLEMENTATION = "npu_torch_npu_rms_norm"
     
     def __init__(self):
         super().__init__("RMSNorm")
@@ -22,6 +25,24 @@ class RMSNormOperatorTest(BaseOperatorTest):
         self.supported_devices = []
         if torch_npu is not None:
             self.supported_devices.append(DeviceType.NPU)
+        if torch.cuda.is_available():
+            self.supported_devices.append(DeviceType.GPU)
+
+    @staticmethod
+    def _primary_output(result):
+        """Select the tensor used for correctness without changing timed returns."""
+        return result[0] if isinstance(result, (tuple, list)) else result
+
+    @staticmethod
+    def _cuda_rms_norm_callable():
+        try:
+            from vllm import _custom_ops as vllm_ops
+        except (ImportError, OSError, RuntimeError) as exc:
+            raise RuntimeError(f"vLLM RMSNorm provider is unavailable: {exc}") from exc
+        operator = getattr(vllm_ops, "rms_norm", None)
+        if not callable(operator):
+            raise RuntimeError("vllm._custom_ops.rms_norm is unavailable")
+        return operator
     
     def generate_test_data(
         self,
@@ -31,7 +52,7 @@ class RMSNormOperatorTest(BaseOperatorTest):
         **kwargs
     ) -> Dict[str, Any]:
         """生成RMSNorm测试数据"""
-        
+
         # input tensor
         x = torch.rand(shape) * (value_range[1] - value_range[0]) + value_range[0]
         
@@ -85,41 +106,41 @@ class RMSNormOperatorTest(BaseOperatorTest):
     ) -> torch.Tensor:
         """运行设备实现"""
         
-        # Move data to device and cast to precision
-        x = data['x'].to(device=device, dtype=precision.value)
-        gamma = data['gamma'].to(device=device, dtype=precision.value)
-        eps = data['eps']
-        
-        if implementation == "default":
-            if "npu" in device and torch_npu is not None and hasattr(torch_npu, 'npu_rms_norm'):
-                 # Signature: npu_rms_norm(Tensor self, Tensor gamma, float epsilon=1e-06) -> (Tensor, Tensor)
-                 # Returns (y, rstd)
-                 y, _ = torch_npu.npu_rms_norm(x, gamma, epsilon=eps)
-                 return y.cpu().float()
-            else:
-                 # Fallback to manual if NPU op not available or on CPU
-                 pass
-
-        # Manual implementation (works for CPU and NPU if custom op not available)
-        # implementation == "manual" or fallback from default
-        mean_square = torch.mean(x ** 2, dim=-1, keepdim=True)
-        # Use rsqrt for potentially better performance/stability
-        result = x * torch.rsqrt(mean_square + eps) * gamma
-            
-        return result.cpu().float()
+        prepared = self._prepare_data_for_core_operator(
+            data, device, precision, implementation
+        )
+        result = self._execute_core_operator(prepared, implementation)
+        return self._primary_output(result).cpu().float()
 
     def _prepare_data_for_core_operator(self, data: Dict[str, Any], device: str, precision: PrecisionType, implementation: str = "default") -> Dict[str, Any]:
         """为核心算子准备数据（排除预处理开销）"""
-        x = data['x'].to(device=device, dtype=precision.value)
-        gamma = data['gamma'].to(device=device, dtype=precision.value)
-        
-        return {
+        if implementation == "default":
+            formal = self.get_formal_implementations(device)
+            implementation = formal[0] if formal else "manual"
+        x = data['x'].to(
+            device=device, dtype=precision.value, copy=True
+        )
+        gamma = data['gamma'].to(
+            device=device, dtype=precision.value, copy=True
+        )
+
+        prepared = {
             'x': x,
             'gamma': gamma,
             'eps': data['eps'],
             'implementation': implementation,
             'device': device
         }
+        if implementation == self.CUDA_IMPLEMENTATION:
+            prepared['operator'] = self._cuda_rms_norm_callable()
+            prepared['output'] = torch.empty_like(x)
+        elif implementation == self.NPU_IMPLEMENTATION:
+            if (
+                torch_npu is None
+                or not hasattr(torch_npu, 'npu_rms_norm')
+            ):
+                raise RuntimeError("torch_npu.npu_rms_norm is unavailable")
+        return prepared
 
     def _execute_core_operator(self, prepared_data: Dict[str, Any], implementation: str = "default") -> torch.Tensor:
         """执行核心算子（只测量核心计算，不包括数据移动）"""
@@ -129,10 +150,18 @@ class RMSNormOperatorTest(BaseOperatorTest):
         device = prepared_data.get('device', '')
         impl = prepared_data.get('implementation', implementation)
         
-        if impl == "default":
-            if "npu" in device and torch_npu is not None and hasattr(torch_npu, 'npu_rms_norm'):
-                y, _ = torch_npu.npu_rms_norm(x, gamma, epsilon=eps)
-                return y
+        if impl == self.CUDA_IMPLEMENTATION:
+            prepared_data['operator'](
+                prepared_data['output'],
+                x,
+                gamma,
+                eps,
+            )
+            return prepared_data['output']
+        if impl == self.NPU_IMPLEMENTATION:
+            return torch_npu.npu_rms_norm(x, gamma, epsilon=eps)
+        if impl != "manual":
+            raise ValueError(f"不支持的 RMSNorm 实现: {impl}")
         
         # Manual implementation
         mean_square = torch.mean(x ** 2, dim=-1, keepdim=True)
@@ -141,9 +170,17 @@ class RMSNormOperatorTest(BaseOperatorTest):
 
     def get_available_implementations(self, device: str) -> List[str]:
         """获取可用的实现列表"""
-        if "npu" in device and torch_npu is not None and hasattr(torch_npu, 'npu_rms_norm'):
-            return ["default"]
+        if device.startswith(("cuda", "npu")):
+            return self.get_formal_implementations(device)
         return ["manual"]
+
+    def get_formal_implementations(self, device: str) -> List[str]:
+        """Return the fixed native provider used by formal curves."""
+        if device.startswith("cuda"):
+            return [self.CUDA_IMPLEMENTATION]
+        if device.startswith("npu"):
+            return [self.NPU_IMPLEMENTATION]
+        return []
     
     def calculate_throughput(self, data: Dict[str, Any], time_ms: float) -> Optional[float]:
         """计算吞吐量（GFLOPS）"""

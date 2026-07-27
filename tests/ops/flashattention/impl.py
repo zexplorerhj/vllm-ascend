@@ -1,11 +1,228 @@
 
+from contextlib import contextmanager
+import math
+from typing import Any, Callable, Dict, List, Optional
+
 import torch
+import torch.nn.functional as F
+
 try:
     import torch_npu
 except ImportError:
     torch_npu = None
-import math
-from typing import Dict, Any, List, Optional
+
+
+class FlashAttentionCudaImpl:
+    """CUDA FlashAttention implemented by PyTorch's fused SDPA backend.
+
+    The backend context deliberately enables *only* FLASH_ATTENTION.  This is
+    important for a performance test: silently falling back to the math,
+    memory-efficient, or cuDNN SDPA implementation would produce a valid
+    looking curve for a different operator.
+    """
+
+    def __init__(self):
+        self.name = "cuda_sdpa_flash_attention"
+
+    @contextmanager
+    def flash_backend_context(self):
+        """Force PyTorch SDPA to use its CUDA FlashAttention backend."""
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+        except (ImportError, AttributeError):
+            # PyTorch < 2.3 compatibility.  Keep every non-flash backend
+            # disabled so this path can never turn into a fallback benchmark.
+            legacy_sdp_kernel = getattr(torch.backends.cuda, "sdp_kernel", None)
+            if legacy_sdp_kernel is None:
+                raise RuntimeError(
+                    "This PyTorch build has no API for forcing CUDA "
+                    "FlashAttention SDPA"
+                )
+            try:
+                context = legacy_sdp_kernel(
+                    enable_flash=True,
+                    enable_math=False,
+                    enable_mem_efficient=False,
+                    enable_cudnn=False,
+                )
+            except TypeError:
+                context = legacy_sdp_kernel(
+                    enable_flash=True,
+                    enable_math=False,
+                    enable_mem_efficient=False,
+                )
+            with context:
+                yield
+            return
+
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            yield
+
+    def prepare_data(
+        self, data: Dict[str, Any], device: str, precision
+    ) -> Dict[str, Any]:
+        """Move one BNSD input set to CUDA outside the measured region."""
+        if not device.startswith("cuda"):
+            raise ValueError(f"CUDA FlashAttention requires a CUDA device, got {device}")
+        if not torch.cuda.is_available():
+            raise RuntimeError("torch.cuda.is_available() is False")
+
+        input_layout = data.get("input_layout", "BNSD")
+        if input_layout != "BNSD":
+            raise ValueError(
+                "CUDA SDPA FlashAttention benchmark currently supports only "
+                f"BNSD input, got {input_layout}"
+            )
+
+        dtype = precision.value
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "CUDA FlashAttention benchmark supports only FP16/BF16, "
+                f"got {dtype}"
+            )
+
+        query = data["query"].to(
+            device=device, dtype=dtype, copy=True
+        ).contiguous()
+        key = data["key"].to(
+            device=device, dtype=dtype, copy=True
+        ).contiguous()
+        value = data["value"].to(
+            device=device, dtype=dtype, copy=True
+        ).contiguous()
+        if query.shape[1] != key.shape[1] or key.shape[1] != value.shape[1]:
+            raise ValueError(
+                "This CUDA benchmark path does not expand GQA heads: "
+                f"q_heads={query.shape[1]}, k_heads={key.shape[1]}, "
+                f"v_heads={value.shape[1]}"
+            )
+
+        sparse_mode = data.get("sparse_mode", 0)
+        if sparse_mode not in (0, 2, 3):
+            raise ValueError(
+                f"Unsupported sparse_mode={sparse_mode} for CUDA SDPA"
+            )
+
+        return {
+            "query": query,
+            "key": key,
+            "value": value,
+            "is_causal": sparse_mode in (2, 3),
+            "scale": data.get("scale"),
+        }
+
+    def execute_core_operator_in_active_context(
+        self, prepared_data: Dict[str, Any]
+    ) -> torch.Tensor:
+        """Run SDPA while ``flash_backend_context`` is already active."""
+        query = prepared_data["query"]
+        key = prepared_data["key"]
+        value = prepared_data["value"]
+        kwargs = {"is_causal": prepared_data["is_causal"]}
+        if prepared_data.get("scale") is not None:
+            kwargs["scale"] = prepared_data["scale"]
+
+        try:
+            return F.scaled_dot_product_attention(query, key, value, **kwargs)
+        except Exception as exc:
+            capability = torch.cuda.get_device_capability(query.device)
+            raise RuntimeError(
+                "Forced PyTorch CUDA FLASH_ATTENTION failed; no fallback was "
+                f"enabled (shape={tuple(query.shape)}, dtype={query.dtype}, "
+                f"device={query.device}, capability={capability}, "
+                f"torch={torch.__version__}): {exc}"
+            ) from exc
+
+    def execute_core_operator(
+        self, prepared_data: Dict[str, Any]
+    ) -> torch.Tensor:
+        with self.flash_backend_context():
+            return self.execute_core_operator_in_active_context(prepared_data)
+
+    def run_full_implementation(
+        self, data: Dict[str, Any], device: str, precision
+    ) -> torch.Tensor:
+        prepared_data = self.prepare_data(data, device, precision)
+        output = self.execute_core_operator(prepared_data)
+        return output.cpu().float()
+
+
+class FlashAttentionExternalCudaImpl:
+    """External flash-attn provider with lazy, non-fallback resolution."""
+
+    name = "cuda_flash_attn_func"
+
+    def __init__(self) -> None:
+        self._operator: Optional[Callable[..., torch.Tensor]] = None
+
+    def operator(self) -> Callable[..., torch.Tensor]:
+        if self._operator is not None:
+            return self._operator
+        try:
+            from flash_attn import flash_attn_func
+        except (ImportError, OSError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"external flash_attn_func provider is unavailable: {exc}"
+            ) from exc
+        self._operator = flash_attn_func
+        return self._operator
+
+    def prepare_data(
+        self, data: Dict[str, Any], device: str, precision
+    ) -> Dict[str, Any]:
+        if not device.startswith("cuda"):
+            raise ValueError(
+                f"external flash-attn requires a CUDA device, got {device}"
+            )
+        if data.get("input_layout", "BNSD") != "BNSD":
+            raise ValueError("external flash_attn_func formal provider requires BNSD")
+        dtype = precision.value
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("external flash-attn supports only FP16/BF16")
+
+        operator = self.operator()
+        query = data["query"].to(
+            device=device, dtype=dtype, copy=True
+        ).transpose(1, 2).contiguous()
+        key = data["key"].to(
+            device=device, dtype=dtype, copy=True
+        ).transpose(1, 2).contiguous()
+        value = data["value"].to(
+            device=device, dtype=dtype, copy=True
+        ).transpose(1, 2).contiguous()
+        sparse_mode = data.get("sparse_mode", 0)
+        if sparse_mode not in (0, 2, 3):
+            raise ValueError(
+                f"unsupported sparse_mode={sparse_mode} for flash_attn_func"
+            )
+        return {
+            "operator": operator,
+            "query": query,
+            "key": key,
+            "value": value,
+            "causal": sparse_mode in (2, 3),
+            "scale": data.get("scale"),
+        }
+
+    def execute_core_operator(
+        self, prepared_data: Dict[str, Any]
+    ) -> torch.Tensor:
+        return prepared_data["operator"](
+            prepared_data["query"],
+            prepared_data["key"],
+            prepared_data["value"],
+            dropout_p=0.0,
+            softmax_scale=prepared_data["scale"],
+            causal=prepared_data["causal"],
+        )
+
+    def run_full_implementation(
+        self, data: Dict[str, Any], device: str, precision
+    ) -> torch.Tensor:
+        prepared = self.prepare_data(data, device, precision)
+        output = self.execute_core_operator(prepared)
+        return output.transpose(1, 2).cpu().float()
+
 
 class FlashAttentionNpuImpl:
     """FlashAttention implementation using npu_fused_infer_attention_score"""
@@ -16,9 +233,15 @@ class FlashAttentionNpuImpl:
     def prepare_data(self, data: Dict[str, Any], device: str, precision) -> Dict[str, Any]:
 
         """Prepare data for core operator execution"""
-        query = data['query'].to(dtype=precision.value, device=device)
-        key = data['key'].to(dtype=precision.value, device=device)
-        value = data['value'].to(dtype=precision.value, device=device)
+        query = data['query'].to(
+            dtype=precision.value, device=device, copy=True
+        )
+        key = data['key'].to(
+            dtype=precision.value, device=device, copy=True
+        )
+        value = data['value'].to(
+            dtype=precision.value, device=device, copy=True
+        )
         
         num_heads = data['num_heads']
         num_kv_heads = data.get('num_kv_heads', num_heads)
@@ -109,7 +332,9 @@ class FlashAttentionNpuImpl:
         }
         
         if 'atten_mask' in data and data['atten_mask'] is not None:
-            kwargs["atten_mask"] = data['atten_mask'].to(device=device)
+            kwargs["atten_mask"] = data['atten_mask'].to(
+                device=device, copy=True
+            )
         elif kwargs.get('sparse_mode', 0) == 3:
              # NPU requires atten_mask for sparse_mode=3
              # Create a full mask (all True) or causal mask?
@@ -152,7 +377,9 @@ class FlashAttentionNpuImpl:
              # kwargs["sparse_mode"] = 0
 
         if 'block_table' in data and data['block_table'] is not None:
-            kwargs["block_table"] = data['block_table'].to(device=device)
+            kwargs["block_table"] = data['block_table'].to(
+                device=device, copy=True
+            )
             kwargs["block_size"] = data.get('block_size', 128)
             
             # If block_table is used, key and value must be reshaped to (num_blocks, block_size, num_heads, head_dim)
@@ -229,13 +456,12 @@ class FlashAttentionNpuImpl:
         
         return kwargs
 
-    def execute_core_operator(self, prepared_data: Dict[str, Any]) -> torch.Tensor:
+    def execute_core_operator(self, prepared_data: Dict[str, Any]):
         """Execute core operator - torch_npu.npu_fused_infer_attention_score"""
         if torch_npu is None:
             raise RuntimeError("torch_npu is not available")
             
-        output, _ = torch_npu.npu_fused_infer_attention_score(**prepared_data)
-        return output
+        return torch_npu.npu_fused_infer_attention_score(**prepared_data)
 
     def run_full_implementation(self, data: Dict[str, Any], device: str, precision) -> torch.Tensor:
         """Run full implementation (including data preparation and post-processing)"""
@@ -244,7 +470,8 @@ class FlashAttentionNpuImpl:
         
         prepared_data = self.prepare_data(data, device, precision)
         
-        output = self.execute_core_operator(prepared_data)
+        native_result = self.execute_core_operator(prepared_data)
+        output = native_result[0]
         
         # Post-process for layout if needed
         input_layout = prepared_data.get('input_layout', "BNSD")

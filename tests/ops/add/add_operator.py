@@ -12,11 +12,18 @@ from operator_test_framework import BaseOperatorTest, PrecisionType, DeviceType
 
 class AddOperatorTest(BaseOperatorTest):
     """Add算子测试实现"""
+
+    CUDA_IMPLEMENTATION = "cuda_torch_add_out"
+    NPU_IMPLEMENTATION = "npu_torch_add_out"
     
     def __init__(self):
         super().__init__("Add")
         self.supported_precisions = [PrecisionType.FP16, PrecisionType.BF16]
-        self.supported_devices = [DeviceType.CPU, DeviceType.NPU]
+        self.supported_devices = [
+            DeviceType.CPU,
+            DeviceType.NPU,
+            DeviceType.GPU,
+        ]
     
     def generate_test_data(
         self,
@@ -53,6 +60,17 @@ class AddOperatorTest(BaseOperatorTest):
         implementation: str = "default"
     ) -> torch.Tensor:
         """运行设备实现"""
+
+        if implementation in (
+            self.CUDA_IMPLEMENTATION,
+            self.NPU_IMPLEMENTATION,
+        ):
+            prepared = self._prepare_data_for_core_operator(
+                data, device, precision, implementation
+            )
+            return self._execute_core_operator(
+                prepared, implementation
+            ).cpu().float()
         
         # 转换数据类型和设备
         tensor_a = data['tensor_a'].to(dtype=precision.value, device=device)
@@ -70,12 +88,19 @@ class AddOperatorTest(BaseOperatorTest):
     
     def get_available_implementations(self, device: str) -> List[str]:
         """获取可用的实现列表"""
+        if device.startswith(("cuda", "npu")):
+            return self.get_formal_implementations(device)
         if "cpu" in device:
             return ["torch_add", "operator_add"]
-        elif "npu" in device:
-            return ["torch_add", "operator_add"]
-        else:
-            return ["torch_add", "operator_add"]
+        return []
+
+    def get_formal_implementations(self, device: str) -> List[str]:
+        """Return the fixed native provider used by formal curves."""
+        if device.startswith("cuda"):
+            return [self.CUDA_IMPLEMENTATION]
+        if device.startswith("npu"):
+            return [self.NPU_IMPLEMENTATION]
+        return []
     
     def calculate_throughput(self, data: Dict[str, Any], time_ms: float) -> float:
         """计算吞吐量（GFLOPS）"""
@@ -132,28 +157,37 @@ class AddOperatorTest(BaseOperatorTest):
     def _prepare_data_for_core_operator(self, data: Dict[str, Any], device: str, precision: PrecisionType, implementation: str = "default") -> Dict[str, Any]:
         """为核心算子准备数据（排除预处理开销）"""
         # 将数据移动到目标设备和精度
-        tensor_a = data['tensor_a'].to(dtype=precision.value, device=device)
-        tensor_b = data['tensor_b'].to(dtype=precision.value, device=device)
+        if implementation == "default":
+            formal = self.get_formal_implementations(device)
+            implementation = formal[0] if formal else "torch_add"
+        tensor_a = data['tensor_a'].to(
+            dtype=precision.value, device=device, copy=True
+        )
+        tensor_b = data['tensor_b'].to(
+            dtype=precision.value, device=device, copy=True
+        )
+        output = torch.empty_like(tensor_a)
         
         return {
             'tensor_a': tensor_a,
             'tensor_b': tensor_b,
+            'output': output,
             'implementation': implementation
         }
     
     def _execute_core_operator(self, prepared_data: Dict[str, Any], implementation: str = "default") -> torch.Tensor:
         """执行核心算子（只测量核心计算，不包括数据移动）"""
         # 根据实现类型选择不同的加法方式
-        if implementation == "torch_add" or implementation == "default":
+        impl = prepared_data.get('implementation', implementation)
+        if impl in (self.CUDA_IMPLEMENTATION, self.NPU_IMPLEMENTATION):
+            return torch.add(
+                prepared_data['tensor_a'],
+                prepared_data['tensor_b'],
+                out=prepared_data['output'],
+            )
+        if impl == "torch_add" or impl == "default":
             return torch.add(prepared_data['tensor_a'], prepared_data['tensor_b'])
-        elif implementation == "operator_add":
+        elif impl == "operator_add":
             return prepared_data['tensor_a'] + prepared_data['tensor_b']  # 使用操作符重载
         else:
-            # 如果prepared_data中有implementation信息，使用它
-            impl = prepared_data.get('implementation', 'torch_add')
-            if impl == "torch_add":
-                return torch.add(prepared_data['tensor_a'], prepared_data['tensor_b'])
-            elif impl == "operator_add":
-                return prepared_data['tensor_a'] + prepared_data['tensor_b']
-            else:
-                return torch.add(prepared_data['tensor_a'], prepared_data['tensor_b'])
+            raise ValueError(f"不支持的实现类型: {impl}")

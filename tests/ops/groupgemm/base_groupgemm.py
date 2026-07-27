@@ -21,6 +21,12 @@ from abc import ABC, abstractmethod
 
 class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
     """GroupGemm算子基础抽象类"""
+
+    CUDA_BF16_IMPLEMENTATION = "cuda_bmm_balanced_grouped_mm_jagged_bf16"
+    CUDA_INT8_IMPLEMENTATION = "cuda_vllm_cutlass_scaled_mm_bf16"
+    CUDA_INT8_FALLBACK_IMPLEMENTATION = (
+        "cuda_torch_int_mm_col_major_raw_int32"
+    )
     
     def __init__(self, operator_name: str = None, num_experts: int = 8, hidden_dim: int = 7168, 
                  out_channel: int = 4096, use_nz_format: bool = False):
@@ -163,7 +169,7 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         device: str, 
         precision: PrecisionType,
         implementation: str = "default"
-    ) -> torch.Tensor:
+    ) -> Any:
         """设备实现
         
         Args:
@@ -175,23 +181,13 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         Returns:
             torch.Tensor: 设备计算结果
         """
-        if not device.startswith("npu"):
-            raise ValueError("GroupGemm 目前只支持 NPU 设备")
-        
-        # 将数据移动到设备（通用逻辑）
-        device_data = {}
-        for key, value in data.items():
-            if isinstance(value, torch.Tensor):
-                device_data[key] = value.to(device)
-            else:
-                device_data[key] = value
-        
-        # 获取npu_grouped_matmul的参数
-        kwargs = self.get_npu_grouped_matmul_kwargs(device_data, device_data['group_list'])
-        
-        # 执行 groupgemm
-        result = torch_npu.npu_grouped_matmul(**kwargs)
-        return result
+        prepared_data = self._prepare_data_for_core_operator(
+            data, device, precision, implementation
+        )
+        result = self._execute_core_operator(
+            prepared_data, prepared_data["_implementation"]
+        )
+        return self._coalesce_group_outputs(result)
     
     def run_core_operator(
         self, 
@@ -199,7 +195,7 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         device: str, 
         precision: PrecisionType,
         implementation: str = "default"
-    ) -> torch.Tensor:
+    ) -> Any:
         """运行核心算子操作（用于精确性能测试）
         
         Args:
@@ -211,15 +207,261 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         Returns:
             torch.Tensor: 计算结果
         """
-        if not device.startswith("npu"):
-            raise ValueError("GroupGemm 目前只支持 NPU 设备")
-        
-        # 获取npu_grouped_matmul的参数（数据已经在设备上）
-        kwargs = self.get_npu_grouped_matmul_kwargs(data, data['group_list'])
-        
-        # 只执行核心算子操作
-        result = torch_npu.npu_grouped_matmul(**kwargs)
-        return result
+        prepared_data = self._prepare_data_for_core_operator(
+            data, device, precision, implementation
+        )
+        return self._execute_core_operator(
+            prepared_data, prepared_data["_implementation"]
+        )
+
+    def _resolve_implementation(self, device: str, implementation: str) -> str:
+        """解析并验证当前设备的 GroupGemm 实现。"""
+        formal = self.get_formal_implementations(device)
+        if not formal:
+            raise RuntimeError(f"{device} 上没有可用的 GroupGemm 实现")
+
+        if implementation == "default":
+            return formal[0]
+        if implementation not in formal:
+            raise ValueError(
+                f"实现 {implementation!r} 不适用于 {device}；"
+                f"formal 实现: {formal}"
+            )
+        return implementation
+
+    @staticmethod
+    def _cuda_grouped_mm_callable():
+        """优先返回 PyTorch 2.11 公开的 grouped_mm 包装。"""
+        functional_op = getattr(torch.nn.functional, "grouped_mm", None)
+        if functional_op is not None:
+            return functional_op
+        return getattr(torch, "_grouped_mm", None)
+
+    @staticmethod
+    def _cuda_cutlass_scaled_mm_callable():
+        """Resolve the low-level out= CUTLASS op after lazy vLLM registration."""
+        try:
+            from vllm import _custom_ops as vllm_ops  # noqa: F401
+        except (ImportError, OSError, RuntimeError):
+            return None
+
+        c_namespace = getattr(torch.ops, "_C", None)
+        if c_namespace is None:
+            return None
+        op = getattr(c_namespace, "cutlass_scaled_mm", None)
+        return op if callable(op) else None
+
+    @staticmethod
+    def _coalesce_group_outputs(result: Any) -> torch.Tensor:
+        """把完整设备调用的 group 输出统一成 [sum(M), N] Tensor。
+
+        核心吞吐计时直接调用 ``_execute_core_operator``，因此多 expert
+        CUTLASS 输出的 cat 不会混入 GEMM kernel 时间。
+        """
+        if isinstance(result, torch.Tensor):
+            if result.dim() == 3:
+                return result.reshape(-1, result.shape[-1])
+            return result
+        if isinstance(result, (tuple, list)):
+            if not result:
+                raise RuntimeError("GroupGemm 返回了空的 expert 输出")
+            if len(result) == 1:
+                return result[0]
+            if not all(isinstance(value, torch.Tensor) for value in result):
+                raise TypeError("GroupGemm expert 输出必须全部是 Tensor")
+            return torch.cat(tuple(result), dim=0)
+        raise TypeError(f"未知 GroupGemm 输出类型: {type(result)!r}")
+
+    @staticmethod
+    def _group_counts(data: Dict[str, Any]) -> List[int]:
+        """在进入设备核心算子前验证 expert token 分组。"""
+        group_list = data.get("group_list")
+        if not isinstance(group_list, torch.Tensor) or group_list.dim() != 1:
+            raise ValueError("group_list 必须是 1D Tensor")
+        x = data.get("x")
+        weight = data.get("weight")
+        if (not isinstance(x, torch.Tensor) or x.dim() != 2
+                or not isinstance(weight, torch.Tensor) or weight.dim() != 3):
+            raise ValueError("GroupGemm 要求 x 为 2D，weight 为 3D Tensor")
+        if x.shape[1] != weight.shape[1]:
+            raise ValueError(
+                f"x 与 weight 的 K 维不一致: {x.shape[1]} != {weight.shape[1]}"
+            )
+
+        counts = [int(value) for value in group_list.detach().cpu().tolist()]
+        if not counts or any(value <= 0 for value in counts):
+            raise ValueError(f"group_list 中每个 expert 必须至少有一个 token: {counts}")
+        if len(counts) != int(weight.shape[0]):
+            raise ValueError(
+                f"group_list expert 数 {len(counts)} 与 weight 的 expert 维 "
+                f"{weight.shape[0]} 不一致"
+            )
+        if sum(counts) != int(x.shape[0]):
+            raise ValueError(
+                f"group_list token 总数 {sum(counts)} 与 x.shape[0]="
+                f"{x.shape[0]} 不一致"
+            )
+        return counts
+
+    def _prepare_cuda_core_data(
+        self, data: Dict[str, Any], device: str, implementation: str
+    ) -> Dict[str, Any]:
+        """CUDA 预处理：转移不计时，计时区间只包含 GEMM。"""
+        if self.use_nz_format:
+            raise ValueError("NZ 是 Ascend 权重格式，CUDA GroupGemm 不支持 --use-nz-format")
+
+        counts = self._group_counts(data)
+        hidden_dim = int(data["x"].shape[1])
+        out_channel = int(data["weight"].shape[2])
+        if hidden_dim % 8 != 0 or out_channel % 8 != 0:
+            raise ValueError(
+                "CUDA GroupGemm 要求 K(hidden_dim) 和 N(out_channel) "
+                f"都是 8 的倍数，当前为 K={hidden_dim}, N={out_channel}"
+            )
+
+        if implementation == self.CUDA_BF16_IMPLEMENTATION:
+            if (data["x"].dtype != torch.bfloat16
+                    or data["weight"].dtype != torch.bfloat16):
+                raise TypeError(
+                    "CUDA torch.bmm 路径要求 x/weight 都是 torch.bfloat16"
+                )
+            if len(set(counts)) != 1:
+                raise ValueError(
+                    "formal CUDA BF16 GroupGemm requires balanced expert rows "
+                    f"for torch.bmm, got {counts}"
+                )
+
+            x = data["x"].to(device=device, copy=True)
+            weight = data["weight"].to(device=device, copy=True)
+            rows_per_expert = counts[0]
+            output = torch.empty(
+                len(counts),
+                rows_per_expert,
+                out_channel,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            return {
+                "_implementation": implementation,
+                "_kernel": "torch_bmm_cublas",
+                "op": torch.bmm,
+                "mat_a": x.reshape(
+                    len(counts), rows_per_expert, hidden_dim
+                ),
+                "mat_b": weight,
+                "output": output,
+            }
+
+        if implementation == self.CUDA_INT8_IMPLEMENTATION:
+            scaled_mm = self._cuda_cutlass_scaled_mm_callable()
+            if scaled_mm is None:
+                raise RuntimeError(
+                    "当前 vLLM 安装没有可用的 CUTLASS cutlass_scaled_mm"
+                )
+            if hidden_dim % 16 != 0 or out_channel % 16 != 0:
+                raise ValueError(
+                    "vLLM CUTLASS scaled-mm 要求 K 和 N 都是 16 的倍数，"
+                    f"当前为 K={hidden_dim}, N={out_channel}"
+                )
+            if data["x"].dtype != torch.int8 or data["weight"].dtype != torch.int8:
+                raise TypeError("CUDA INT8 CUTLASS 路径要求 x/weight 都是 torch.int8")
+
+            scale = data.get("scale")
+            per_token_scale = data.get("per_token_scale")
+            expected_scale_shape = (len(counts), out_channel)
+            if (not isinstance(scale, torch.Tensor)
+                    or tuple(scale.shape) != expected_scale_shape):
+                raise ValueError(
+                    "INT8 GroupGemm scale 必须是 [num_experts, N]，"
+                    f"期望 {expected_scale_shape}，实际 "
+                    f"{getattr(scale, 'shape', None)}"
+                )
+            if (not isinstance(per_token_scale, torch.Tensor)
+                    or per_token_scale.numel() != int(data["x"].shape[0])):
+                raise ValueError(
+                    "INT8 GroupGemm per_token_scale 必须为每个 token 提供一个 scale"
+                )
+
+            x = data["x"].to(device=device, copy=True)
+            # CUTLASS 的 B=[K,N] 要求 column-major。先生成连续 [E,N,K]，
+            # 再零拷贝转置，得到每个 expert stride=(1,K)。
+            weight = data["weight"].to(device=device, copy=True)
+            weight = weight.transpose(1, 2).contiguous().transpose(1, 2)
+            token_scale = per_token_scale.to(
+                device=device, dtype=torch.float32, copy=True
+            )
+            token_scale = token_scale.reshape(-1, 1)
+            weight_scale = scale.to(
+                device=device, dtype=torch.float32, copy=True
+            )
+
+            expert_inputs = []
+            expert_outputs = []
+            start = 0
+            for expert, rows in enumerate(counts):
+                end = start + rows
+                expert_inputs.append((
+                    x[start:end],
+                    weight[expert],
+                    token_scale[start:end],
+                    weight_scale[expert].reshape(1, out_channel),
+                ))
+                expert_outputs.append(torch.empty(
+                    rows,
+                    out_channel,
+                    dtype=torch.bfloat16,
+                    device=device,
+                ))
+                start = end
+
+            return {
+                "_implementation": implementation,
+                "_kernel": "vllm_cutlass_scaled_mm",
+                "op": scaled_mm,
+                "expert_inputs": expert_inputs,
+                "expert_outputs": tuple(expert_outputs),
+            }
+
+        if implementation == self.CUDA_INT8_FALLBACK_IMPLEMENTATION:
+            int_mm = getattr(torch, "_int_mm", None)
+            if int_mm is None:
+                raise RuntimeError("当前 PyTorch 没有 torch._int_mm")
+            if data["x"].dtype != torch.int8 or data["weight"].dtype != torch.int8:
+                raise TypeError("CUDA INT8 路径要求 x/weight 都是 torch.int8")
+
+            # 当前 H20/PyTorch 栈实测 torch._int_mm 要求 M > 16 且
+            # M 为 32 的倍数。profile 显示它落到 CUTLASS SM80
+            # compatibility kernel，而不是 cuBLASLt；这里不做 padding。
+            invalid_groups = [
+                index for index, rows in enumerate(counts)
+                if rows <= 16 or rows % 32 != 0
+            ]
+            if invalid_groups:
+                raise ValueError(
+                    "H20 上的 CUDA torch._int_mm 要求每个 expert 的 "
+                    "M > 16 且 M % 32 == 0；"
+                    f"不满足的 expert={invalid_groups}, group_rows={counts}。"
+                    "为保持 FLOPS 语义不做隐式 padding"
+                )
+
+            x = data["x"].to(device)
+            weight = data["weight"].to(device)
+            weight = weight.transpose(1, 2).contiguous().transpose(1, 2)
+            expert_inputs = []
+            start = 0
+            for expert, rows in enumerate(counts):
+                end = start + rows
+                expert_inputs.append((x[start:end], weight[expert]))
+                start = end
+
+            return {
+                "_implementation": implementation,
+                "_kernel": "torch_int_mm_col_major_raw_int32",
+                "op": int_mm,
+                "expert_inputs": expert_inputs,
+            }
+
+        raise ValueError(f"未知 CUDA GroupGemm 实现: {implementation}")
     
     def _prepare_data_for_core_operator(
         self, 
@@ -239,31 +481,39 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         Returns:
             Dict[str, Any]: 准备好的数据，包含 npu_grouped_matmul 的所有参数
         """
+        implementation = self._resolve_implementation(device, implementation)
+
+        if device.startswith("cuda"):
+            return self._prepare_cuda_core_data(data, device, implementation)
         if not device.startswith("npu"):
-            raise ValueError("GroupGemm 目前只支持 NPU 设备")
-        
+            raise ValueError(f"GroupGemm 不支持设备 {device}")
+        if torch_npu is None:
+            raise RuntimeError("torch_npu 未安装，无法运行 npu_grouped_matmul")
+
         # 将数据移动到设备
         device_data = {}
         for key, value in data.items():
             if isinstance(value, torch.Tensor):
-                device_data[key] = value.to(device)
+                device_data[key] = value.to(device=device, copy=True)
             else:
                 device_data[key] = value
-        
+
         # 如果使用NZ格式，对权重进行格式转换
         if self.use_nz_format and 'weight' in device_data:
             device_data['weight'] = self._apply_nz_format(device_data['weight'])
-        
-        # 预先计算 npu_grouped_matmul 的参数
-        kwargs = self.get_npu_grouped_matmul_kwargs(device_data, device_data['group_list'])
-        
-        return kwargs
+
+        kwargs = self.get_npu_grouped_matmul_kwargs(
+            device_data, device_data['group_list']
+        )
+        if self.get_precision_config().get("input_dtype") == torch.bfloat16:
+            kwargs["bias"] = None
+        return {"_implementation": implementation, "kwargs": kwargs}
     
     def _execute_core_operator(
         self, 
         prepared_data: Dict[str, Any], 
         implementation: str = "default"
-    ) -> torch.Tensor:
+    ) -> Any:
         """执行核心算子操作（只计算核心算子执行时间）
         
         Args:
@@ -273,9 +523,46 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         Returns:
             torch.Tensor: 计算结果
         """
-        # 直接执行核心算子，不包含任何数据预处理
-        result = torch_npu.npu_grouped_matmul(**prepared_data)
-        return result
+        actual_implementation = prepared_data.get("_implementation")
+        if implementation != "default" and implementation != actual_implementation:
+            raise ValueError(
+                f"预处理数据使用 {actual_implementation}，执行时却请求 {implementation}"
+            )
+
+        if actual_implementation == "npu_grouped_matmul":
+            return torch_npu.npu_grouped_matmul(**prepared_data["kwargs"])
+        if actual_implementation == self.CUDA_BF16_IMPLEMENTATION:
+            prepared_data["op"](
+                prepared_data["mat_a"],
+                prepared_data["mat_b"],
+                out=prepared_data["output"],
+            )
+            output = prepared_data["output"]
+            return output.reshape(-1, output.shape[-1])
+        if actual_implementation == self.CUDA_INT8_IMPLEMENTATION:
+            for expert_input, expert_output in zip(
+                prepared_data["expert_inputs"],
+                prepared_data["expert_outputs"],
+            ):
+                expert_x, expert_weight, token_scale, weight_scale = (
+                    expert_input
+                )
+                prepared_data["op"](
+                    expert_output,
+                    expert_x,
+                    expert_weight,
+                    token_scale,
+                    weight_scale,
+                    None,
+                )
+            return prepared_data["expert_outputs"]
+        if actual_implementation == self.CUDA_INT8_FALLBACK_IMPLEMENTATION:
+            # 诊断 fallback：raw INT32 accumulator，不应用 scale。
+            return tuple(
+                prepared_data["op"](expert_x, expert_weight)
+                for expert_x, expert_weight in prepared_data["expert_inputs"]
+            )
+        raise ValueError(f"未知 GroupGemm 实现: {actual_implementation}")
 
     def get_available_implementations(self, device: str) -> List[str]:
         """获取可用的实现方式
@@ -286,10 +573,19 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         Returns:
             List[str]: 可用实现列表
         """
+        return self.get_formal_implementations(device)
+
+    def get_formal_implementations(self, device: str) -> List[str]:
+        """Return formal providers without probing optional accelerator libs."""
         if device.startswith("npu"):
             return ["npu_grouped_matmul"]
-        else:
-            return []
+        if device.startswith("cuda"):
+            input_dtype = self.get_precision_config().get("input_dtype")
+            if input_dtype == torch.bfloat16:
+                return [self.CUDA_BF16_IMPLEMENTATION]
+            if input_dtype == torch.int8:
+                return [self.CUDA_INT8_IMPLEMENTATION]
+        return []
     
     def calculate_flops(self, data: Dict[str, Any]) -> Optional[float]:
         """计算FLOPS
@@ -365,6 +661,10 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         input_dtype_size = precision_config.get('input_dtype_size', 2)  # BF16默认2字节
         weight_dtype_size = precision_config.get('weight_dtype_size', 2)
         output_dtype_size = precision_config.get('output_dtype_size', 2)
+        implementation = data.get("benchmark_implementation")
+        if implementation == self.CUDA_INT8_FALLBACK_IMPLEMENTATION:
+            # torch._int_mm 返回 INT32 accumulator。
+            output_dtype_size = 4
         
         # 计算内存访问量（字节）
         # 输入读取：seq_len * hidden_dim * input_dtype_size
@@ -375,7 +675,8 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         output_bytes = seq_len * out_channel * output_dtype_size
         
         # 如果有bias，也要计算bias的内存访问
-        if data.get('bias') is not None:
+        if (data.get('bias') is not None
+                and implementation != self.CUDA_BF16_IMPLEMENTATION):
             bias_dtype_size = precision_config.get('bias_dtype_size', 4)  # FP32默认4字节
             bias_bytes = num_experts * out_channel * bias_dtype_size
         else:
@@ -383,9 +684,15 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
             
         # 如果有scale等量化参数，也要计算
         scale_bytes = 0
-        if data.get('scale') is not None:
-            scale_bytes += num_experts * out_channel * 2  # BF16
-        if data.get('per_token_scale') is not None:
+        if (data.get('scale') is not None
+                and implementation != self.CUDA_INT8_FALLBACK_IMPLEMENTATION):
+            # CUDA CUTLASS 在 prepare 中把 NPU 的 BF16 channel scale 转 FP32。
+            scale_dtype_size = (
+                4 if implementation == self.CUDA_INT8_IMPLEMENTATION else 2
+            )
+            scale_bytes += num_experts * out_channel * scale_dtype_size
+        if (data.get('per_token_scale') is not None
+                and implementation != self.CUDA_INT8_FALLBACK_IMPLEMENTATION):
             scale_bytes += seq_len * 4  # FP32
             
         total_bytes = input_bytes + weight_bytes + output_bytes + bias_bytes + scale_bytes

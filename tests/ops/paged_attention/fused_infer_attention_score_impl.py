@@ -19,10 +19,18 @@ class FusedInferAttentionScoreImpl:
     
     def prepare_data(self, data: Dict[str, Any], device: str, precision) -> Dict[str, Any]:
         """准备数据用于核心算子执行 - TND格式"""
-        query = data['query'].to(dtype=precision.value, device=device)
-        key_cache = data['key_cache'].to(dtype=precision.value, device=device)
-        value_cache = data['value_cache'].to(dtype=precision.value, device=device)
-        block_table = data['block_table'].to(device=device)
+        query = data['query'].to(
+            dtype=precision.value, device=device, copy=True
+        )
+        key_cache = data['key_cache'].to(
+            dtype=precision.value, device=device, copy=True
+        )
+        value_cache = data['value_cache'].to(
+            dtype=precision.value, device=device, copy=True
+        )
+        block_table = data['block_table'].to(
+            device=device, copy=True
+        )
         
         # 准备序列长度列表
         seq_lens_list = data['context_lens'].tolist()
@@ -66,10 +74,10 @@ class FusedInferAttentionScoreImpl:
             'atten_mask': attn_mask
         }
     
-    def execute_core_operator(self, prepared_data: Dict[str, Any]) -> torch.Tensor:
+    def execute_core_operator(self, prepared_data: Dict[str, Any]):
         """执行核心算子 - torch_npu.npu_fused_infer_attention_score"""
         
-        output, _ = torch_npu.npu_fused_infer_attention_score(
+        return torch_npu.npu_fused_infer_attention_score(
             query=prepared_data['query'],
             key=prepared_data['key'],
             value=prepared_data['value'],
@@ -84,13 +92,12 @@ class FusedInferAttentionScoreImpl:
             scale=prepared_data['scale'],
             sparse_mode=3,
         )
-        
-        return output
     
     def run_full_implementation(self, data: Dict[str, Any], device: str, precision) -> torch.Tensor:
         """运行完整实现"""
         prepared_data = self.prepare_data(data, device, precision)
-        output = self.execute_core_operator(prepared_data)
+        native_result = self.execute_core_operator(prepared_data)
+        output = native_result[0]
         
         # 后处理
         num_heads = prepared_data['num_heads']

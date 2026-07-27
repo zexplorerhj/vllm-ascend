@@ -13,11 +13,14 @@ from operator_test_framework import BaseOperatorTest, PrecisionType, DeviceType
 
 class LinearOperatorTest(BaseOperatorTest):
     """Linear算子测试实现"""
+
+    CUDA_IMPLEMENTATION = "cuda_torch_mm_out"
+    NPU_IMPLEMENTATION = "npu_torch_linear"
     
     def __init__(self):
         super().__init__("Linear")
         self.supported_precisions = [PrecisionType.FP16, PrecisionType.BF16]
-        self.supported_devices = [DeviceType.NPU]
+        self.supported_devices = [DeviceType.NPU, DeviceType.GPU]
     
     def generate_test_data(
         self,
@@ -84,6 +87,15 @@ class LinearOperatorTest(BaseOperatorTest):
         implementation: str = "default"
     ) -> torch.Tensor:
         """运行设备实现"""
+
+        if implementation in (
+            self.CUDA_IMPLEMENTATION,
+            self.NPU_IMPLEMENTATION,
+        ):
+            prepared = self._prepare_data_for_core_operator(
+                data, device, precision, implementation
+            )
+            return self._execute_core_operator(prepared, implementation)
         
         # 将数据移动到指定设备和精度
         input_tensor = data['input'].to(device=device, dtype=precision.value)
@@ -136,14 +148,31 @@ class LinearOperatorTest(BaseOperatorTest):
         Returns:
             Dict[str, Any]: 准备好的数据
         """
-        # 将数据移动到设备并转换精度
-        prepared_data = {}
-        for key, value in data.items():
-            if isinstance(value, torch.Tensor):
-                prepared_data[key] = value.to(device=device, dtype=precision.value)
-            else:
-                prepared_data[key] = value
-        
+        if implementation == "default":
+            formal = self.get_formal_implementations(device)
+            if not formal:
+                raise ValueError(f"Linear 不支持设备 {device}")
+            implementation = formal[0]
+
+        input_tensor = data['input'].to(
+            device=device, dtype=precision.value, copy=True
+        )
+        weight = data['weight'].to(
+            device=device, dtype=precision.value, copy=True
+        )
+        prepared_data = {
+            'input': input_tensor,
+            'weight': weight,
+            'implementation': implementation,
+        }
+        if implementation == self.CUDA_IMPLEMENTATION:
+            prepared_data['weight_t'] = weight.t()
+            prepared_data['output'] = torch.empty(
+                input_tensor.shape[0],
+                weight.shape[0],
+                dtype=precision.value,
+                device=device,
+            )
         return prepared_data
     
     def _execute_core_operator(
@@ -160,13 +189,32 @@ class LinearOperatorTest(BaseOperatorTest):
         Returns:
             torch.Tensor: 计算结果
         """
-        result = F.linear(prepared_data['input'], prepared_data['weight'], prepared_data['bias'])
-        return result
+        impl = prepared_data.get('implementation', implementation)
+        if impl == self.CUDA_IMPLEMENTATION:
+            return torch.mm(
+                prepared_data['input'],
+                prepared_data['weight_t'],
+                out=prepared_data['output'],
+            )
+        if impl == self.NPU_IMPLEMENTATION:
+            return F.linear(
+                prepared_data['input'],
+                prepared_data['weight'],
+                None,
+            )
+        raise ValueError(f"不支持的 Linear 实现: {impl}")
     
     def get_available_implementations(self, device: str) -> List[str]:
         """获取可用的实现方式"""
-        # Linear算子通常只有默认实现（torch.nn.functional.linear）
-        return ["default"]
+        return self.get_formal_implementations(device)
+
+    def get_formal_implementations(self, device: str) -> List[str]:
+        """Return the fixed native provider used by formal curves."""
+        if device.startswith("cuda"):
+            return [self.CUDA_IMPLEMENTATION]
+        if device.startswith("npu"):
+            return [self.NPU_IMPLEMENTATION]
+        return []
     
     def calculate_flops(self, data: Dict[str, Any]) -> Optional[float]:
         """计算浮点运算次数 (FLOPS)

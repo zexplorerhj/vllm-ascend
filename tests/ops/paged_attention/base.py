@@ -19,16 +19,34 @@ class PagedAttentionOperatorTest(BaseOperatorTest):
     def __init__(self):
         super().__init__("paged_attention")
         self.supported_precisions = [PrecisionType.BF16]  # 只测试BF16精度
-        self.supported_devices = [DeviceType.CPU, DeviceType.NPU]
+        self.supported_devices = [DeviceType.CPU]
+        if torch_npu is not None and torch_npu.npu.is_available():
+            self.supported_devices.append(DeviceType.NPU)
+        if torch.cuda.is_available():
+            self.supported_devices.append(DeviceType.GPU)
         
         # 导入具体实现
         from .original_impl import OriginalPagedAttentionImpl
         from .fused_infer_attention_score_impl import FusedInferAttentionScoreImpl
+        from .cuda_impl import FlashInferPagedKVImpl
         
         self.implementations = {
             "npu_original": OriginalPagedAttentionImpl(),
             "npu_fused_infer_attention_score": FusedInferAttentionScoreImpl()
         }
+
+        self.npu_implementation = "npu_fused_infer_attention_score"
+
+        # Provider construction is import-safe. FlashInfer is resolved lazily
+        # during prepare and failure is explicit; formal curves never fallback.
+        cuda_impl = FlashInferPagedKVImpl(backend="fa2")
+        self.implementations[cuda_impl.name] = cuda_impl
+        self.cuda_implementation = cuda_impl.name
+
+    @staticmethod
+    def _primary_output(result):
+        """Select the correctness tensor while timing retains native tuples."""
+        return result[0] if isinstance(result, (tuple, list)) else result
     
     def generate_test_data(
         self,
@@ -98,6 +116,118 @@ class PagedAttentionOperatorTest(BaseOperatorTest):
                 'test_name': 'paged_attention'
             }
         }
+
+    def generate_latency_test_data(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        num_heads: int = 8,
+        num_kv_heads: int = 1,
+        head_size: int = 128,
+        num_blocks: int = 0,
+        block_size: int = 128,
+        seed: int = 0,
+        storage_device: str = "cpu",
+    ) -> Dict[str, Any]:
+        """Generate a compact, deterministic decode-attention benchmark input.
+
+        ``num_blocks=0`` allocates disjoint physical pages for every batch row.
+        Supplying a smaller explicit pool is allowed for shared-prefix/cache
+        experiments and is recorded in metadata, but is not the default used
+        by the latency curves.
+        """
+        if batch_size <= 0 or max_seq_len <= 0:
+            raise ValueError("batch_size and max_seq_len must be positive")
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+
+        blocks_per_sequence = math.ceil(max_seq_len / block_size)
+        disjoint_num_blocks = blocks_per_sequence * batch_size
+        effective_num_blocks = num_blocks or disjoint_num_blocks
+        if effective_num_blocks < blocks_per_sequence:
+            raise ValueError(
+                f"num_blocks={effective_num_blocks} is too small for "
+                f"max_seq_len={max_seq_len}, block_size={block_size}; "
+                f"need at least {blocks_per_sequence}"
+            )
+
+        tensor_device = torch.device(storage_device)
+        if tensor_device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA storage requested but unavailable: {storage_device}"
+            )
+
+        query_generator = torch.Generator(device=tensor_device)
+        key_generator = torch.Generator(device=tensor_device)
+        value_generator = torch.Generator(device=tensor_device)
+        query_generator.manual_seed(seed)
+        key_generator.manual_seed(seed + 1)
+        value_generator.manual_seed(seed + 2)
+        query = torch.randn(
+            batch_size,
+            num_heads,
+            head_size,
+            generator=query_generator,
+            dtype=torch.bfloat16,
+            device=tensor_device,
+        )
+        key_cache = torch.randn(
+            effective_num_blocks,
+            block_size,
+            num_kv_heads,
+            head_size,
+            generator=key_generator,
+            dtype=torch.bfloat16,
+            device=tensor_device,
+        )
+        value_cache = torch.randn(
+            effective_num_blocks,
+            block_size,
+            num_kv_heads,
+            head_size,
+            generator=value_generator,
+            dtype=torch.bfloat16,
+            device=tensor_device,
+        )
+
+        context_lens = torch.full(
+            (batch_size,), max_seq_len, dtype=torch.int32
+        )
+        base_blocks = torch.arange(blocks_per_sequence, dtype=torch.int32)
+        block_rows = []
+        disjoint_pages = effective_num_blocks >= disjoint_num_blocks
+        for batch_idx in range(batch_size):
+            offset = (
+                seed + batch_idx * blocks_per_sequence
+            ) % effective_num_blocks
+            block_rows.append((base_blocks + offset) % effective_num_blocks)
+        block_table = torch.stack(block_rows, dim=0)
+
+        return {
+            "query": query,
+            "key_cache": key_cache,
+            "value_cache": value_cache,
+            "block_table": block_table,
+            "context_lens": context_lens,
+            "num_heads": num_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_size": head_size,
+            "scale": 1.0 / math.sqrt(head_size),
+            "block_size": block_size,
+            "metadata": {
+                "batch_size": batch_size,
+                "max_seq_len": max_seq_len,
+                "num_blocks": effective_num_blocks,
+                "block_size": block_size,
+                "blocks_per_sequence": blocks_per_sequence,
+                "page_pool_policy": "disjoint" if disjoint_pages else "shared",
+                "seed": seed,
+                "storage_device": str(tensor_device),
+                "test_name": "paged_attention_latency",
+            },
+        }
     
     def run_cpu_reference(self, data: Dict[str, Any]) -> torch.Tensor:
         """运行CPU参考实现"""
@@ -122,24 +252,36 @@ class PagedAttentionOperatorTest(BaseOperatorTest):
         implementation: str = "default"
     ) -> torch.Tensor:
         """运行设备实现"""
-        if device.startswith("npu"):
-            if implementation == "default":
-                implementation = "npu_original"
-            
-            if implementation in self.implementations:
-                impl = self.implementations[implementation]
-                return impl.run_full_implementation(data, device, precision)
-            else:
-                raise ValueError(f"不支持的实现方式: {implementation}")
-        else:
-            raise NotImplementedError(f"设备 {device} 暂不支持")
+        prepared = self._prepare_data_for_core_operator(
+            data, device, precision, implementation
+        )
+        native_result = self._execute_core_operator(prepared, implementation)
+        output = self._primary_output(native_result)
+        num_heads = prepared.get("num_heads")
+        head_size = prepared.get("head_size")
+        if num_heads is not None and head_size is not None:
+            output = output.view(-1, num_heads, head_size)
+        return output.cpu().float()
     
     def get_available_implementations(self, device: str) -> List[str]:
         """获取可用的实现方式"""
+        return self.get_formal_implementations(device)
+
+    def get_formal_implementations(self, device: str) -> List[str]:
+        """Return formal providers without probing optional accelerator libs."""
         if device.startswith("npu"):
-            return list(self.implementations.keys())
-        else:
-            return []
+            return [self.npu_implementation]
+        if device.startswith("cuda"):
+            return [self.cuda_implementation]
+        return []
+
+    def get_preferred_implementation(self, device: str) -> str:
+        """Return the provider used by cross-hardware latency curves."""
+        if device.startswith("cuda"):
+            return self.cuda_implementation
+        if device.startswith("npu"):
+            return self.npu_implementation
+        raise ValueError(f"PagedAttention does not support device {device}")
     
     def calculate_flops(self, data: Dict[str, Any]) -> float:
         """计算PagedAttention的FLOPS
@@ -306,7 +448,10 @@ class PagedAttentionOperatorTest(BaseOperatorTest):
     ) -> torch.Tensor:
         """运行核心算子操作（兼容性方法）"""
         if implementation == "default":
-            implementation = "npu_original"
+            implementation = (
+                self.cuda_implementation if device.startswith("cuda")
+                else self.npu_implementation
+            )
             
         if implementation in self.implementations:
             impl = self.implementations[implementation]
@@ -324,19 +469,71 @@ class PagedAttentionOperatorTest(BaseOperatorTest):
         implementation: str
     ) -> Dict[str, Any]:
         """准备核心算子数据（兼容性方法）"""
+        if implementation == "default":
+            implementation = self.get_preferred_implementation(device)
+        formal = self.get_formal_implementations(device)
+        if implementation not in formal:
+            raise ValueError(
+                f"实现 {implementation!r} 不是 {device} formal provider; "
+                f"formal={formal}"
+            )
+        block_size = int(data.get("block_size", 0))
+        if block_size != 128:
+            raise ValueError(
+                f"formal PagedAttention requires block_size=128, got {block_size}"
+            )
         if implementation in self.implementations:
             impl = self.implementations[implementation]
-            return impl.prepare_data(data, device, precision)
+            prepared_data = impl.prepare_data(data, device, precision)
+            prepared_data["_implementation"] = implementation
+            return prepared_data
         else:
             raise ValueError(f"不支持的实现方式: {implementation}")
     
-    def _execute_core_operator(self, prepared_data: Dict[str, Any], implementation: str) -> torch.Tensor:
+    def _execute_core_operator(self, prepared_data: Dict[str, Any], implementation: str) -> Any:
         """执行核心算子（兼容性方法）"""
+        if implementation == "default":
+            implementation = prepared_data.get("_implementation", "default")
         if implementation in self.implementations:
             impl = self.implementations[implementation]
             return impl.execute_core_operator(prepared_data)
         else:
             raise ValueError(f"不支持的实现方式: {implementation}")
+
+    def _verify_preallocated_output_aliases(
+        self,
+        prepared_data_list: List[Dict[str, Any]],
+        outputs: List[torch.Tensor],
+        implementation: str,
+    ) -> int:
+        """Verify ``out=`` providers returned each invocation's owned buffer."""
+        if len(prepared_data_list) != len(outputs):
+            raise RuntimeError(
+                "prepared/output count mismatch: "
+                f"{len(prepared_data_list)} != {len(outputs)}"
+            )
+        resolved = implementation
+        if resolved == "default" and prepared_data_list:
+            resolved = prepared_data_list[0].get("_implementation", "default")
+        if resolved not in {"cuda_flashinfer_fa2", "npu_original"}:
+            return 0
+
+        for index, (prepared_data, output) in enumerate(
+            zip(prepared_data_list, outputs)
+        ):
+            expected = prepared_data["output"]
+            if not isinstance(output, torch.Tensor):
+                raise RuntimeError(
+                    f"preallocated provider returned non-tensor output at {index}"
+                )
+            if (
+                output.untyped_storage().data_ptr()
+                != expected.untyped_storage().data_ptr()
+            ):
+                raise RuntimeError(
+                    f"provider output does not alias preallocated out at {index}"
+                )
+        return len(outputs)
     
     def _cpu_paged_attention(
         self,

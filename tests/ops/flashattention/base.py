@@ -1,4 +1,4 @@
-
+from contextlib import nullcontext
 import torch
 import math
 from typing import Dict, Any, List, Optional
@@ -10,14 +10,29 @@ class FlashAttentionOperatorTest(BaseOperatorTest):
     def __init__(self):
         super().__init__("flash_attention")
         self.supported_precisions = [PrecisionType.BF16, PrecisionType.FP16]
-        self.supported_devices = [DeviceType.CPU, DeviceType.NPU]
+        self.supported_devices = [
+            DeviceType.CPU,
+            DeviceType.NPU,
+            DeviceType.GPU,
+        ]
         
         # 导入具体实现
-        from .impl import FlashAttentionNpuImpl
+        from .impl import (
+            FlashAttentionCudaImpl,
+            FlashAttentionExternalCudaImpl,
+            FlashAttentionNpuImpl,
+        )
         
         self.implementations = {
-            "npu_flash_attention": FlashAttentionNpuImpl()
+            "npu_flash_attention": FlashAttentionNpuImpl(),
+            "cuda_sdpa_flash_attention": FlashAttentionCudaImpl(),
+            "cuda_flash_attn_func": FlashAttentionExternalCudaImpl(),
         }
+
+    @staticmethod
+    def _primary_output(result):
+        """Select the correctness tensor while timed paths retain native tuples."""
+        return result[0] if isinstance(result, (tuple, list)) else result
     
     def generate_test_data(
         self,
@@ -233,9 +248,42 @@ class FlashAttentionOperatorTest(BaseOperatorTest):
     
     def get_available_implementations(self, device: str) -> List[str]:
         """获取可用的实现方式"""
+        return self.get_formal_implementations(device)
+
+    def get_formal_implementations(self, device: str) -> List[str]:
+        """Return every fixed provider reported by formal curves."""
+        if device.startswith("cuda"):
+            return [
+                "cuda_sdpa_flash_attention",
+                "cuda_flash_attn_func",
+            ]
         if device.startswith("npu"):
-            return list(self.implementations.keys())
+            return ["npu_flash_attention"]
         return []
+
+    def _resolve_implementation(self, device: str, implementation: str) -> str:
+        formal = self.get_formal_implementations(device)
+        if implementation == "default":
+            if not formal:
+                raise ValueError(f"FlashAttention 不支持设备 {device}")
+            return formal[0]
+        if implementation not in formal:
+            raise ValueError(
+                f"实现 {implementation!r} 不适用于 {device}; formal={formal}"
+            )
+        return implementation
+
+    def _core_operator_benchmark_context(
+        self,
+        device: str,
+        precision: PrecisionType,
+        implementation: str,
+    ):
+        del precision
+        resolved = self._resolve_implementation(device, implementation)
+        if resolved == "cuda_sdpa_flash_attention":
+            return self.implementations[resolved].flash_backend_context()
+        return nullcontext()
         
     def run_device_implementation(
         self, 
@@ -245,14 +293,20 @@ class FlashAttentionOperatorTest(BaseOperatorTest):
         implementation: str = "default"
     ) -> torch.Tensor:
         """运行设备实现"""
-        if implementation == "default":
-            implementation = list(self.implementations.keys())[0]
-            
-        if implementation not in self.implementations:
-            raise ValueError(f"Unknown implementation: {implementation}")
-            
+        implementation = self._resolve_implementation(device, implementation)
         impl = self.implementations[implementation]
-        return impl.run_full_implementation(data, device, precision)
+        prepared = impl.prepare_data(data, device, precision)
+        if implementation == "cuda_sdpa_flash_attention":
+            with impl.flash_backend_context():
+                native_result = impl.execute_core_operator_in_active_context(
+                    prepared
+                )
+        else:
+            native_result = impl.execute_core_operator(prepared)
+        output = self._primary_output(native_result)
+        if implementation == "cuda_flash_attn_func":
+            output = output.transpose(1, 2)
+        return output.cpu().float()
 
     def calculate_flops(self, data: Dict[str, Any], mode: str = "fwd") -> Optional[float]:
         metadata = data.get("metadata", {})
@@ -294,16 +348,22 @@ class FlashAttentionOperatorTest(BaseOperatorTest):
         implementation: str
     ) -> Dict[str, Any]:
         """准备核心算子数据（兼容性方法）"""
-        if implementation in self.implementations:
-            impl = self.implementations[implementation]
-            return impl.prepare_data(data, device, precision)
-        else:
-            raise ValueError(f"不支持的实现方式: {implementation}")
+        implementation = self._resolve_implementation(device, implementation)
+        impl = self.implementations[implementation]
+        prepared = impl.prepare_data(data, device, precision)
+        prepared["_implementation"] = implementation
+        return prepared
     
     def _execute_core_operator(self, prepared_data: Dict[str, Any], implementation: str) -> torch.Tensor:
         """执行核心算子（兼容性方法）"""
+        if implementation == "default":
+            implementation = prepared_data["_implementation"]
         if implementation in self.implementations:
             impl = self.implementations[implementation]
+            if implementation == "cuda_sdpa_flash_attention":
+                return impl.execute_core_operator_in_active_context(
+                    prepared_data
+                )
             return impl.execute_core_operator(prepared_data)
         else:
             raise ValueError(f"不支持的实现方式: {implementation}")

@@ -511,3 +511,361 @@ def test_failed_point_is_checkpointed_and_curve_fails(
         rows = list(csv.DictReader(handle))
     assert rows[0]["status"] == "error"
     assert "synthetic point failure" in rows[0]["error"]
+
+
+def test_add_quick_keeps_first_formal_point_identity(
+    monkeypatch, tmp_path
+):
+    framework = _FakeFramework(tmp_path)
+    suite = AddTestSuite()
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["cuda_torch_add_out"])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    result = suite.run_bandwidth_test(
+        sizes=[8, 16, 32],
+        device="cuda:0",
+        quick=True,
+        shard_index=0,
+        num_shards=1,
+        plot_results=False,
+    )
+
+    assert [call["data"]["shape"] for call in framework.calls] == [(8,)]
+    assert [row["point_index"] for row in result["rows"]] == [0]
+
+
+def test_linear_shard_keeps_global_formal_point_identity(
+    monkeypatch, tmp_path
+):
+    framework = _FakeFramework(tmp_path)
+    suite = LinearTestSuite(precision="bf16")
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["cuda_torch_mm_out"])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    result = suite.run_tflops_test(
+        sizes=[8, 16, 32],
+        device="cuda:0",
+        shard_index=1,
+        num_shards=2,
+        plot_results=False,
+    )
+
+    assert [call["data"]["batch_size"] for call in framework.calls] == [16]
+    assert [row["point_index"] for row in result["rows"]] == [1]
+    assert result["rows"][0]["shard_index"] == 1
+    assert result["rows"][0]["num_shards"] == 2
+
+
+def test_rmsnorm_quick_keeps_one_point_per_formal_matrix(
+    monkeypatch, tmp_path
+):
+    framework = _FakeFramework(tmp_path)
+    suite = RMSNormTestSuite()
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["cuda_vllm_rms_norm_out"])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    result = suite.run_bandwidth_test(
+        sizes=[4096, 8192],
+        hidden_sizes=[1024, 2048],
+        target_total_elements=8192,
+        device="cuda:0",
+        quick=True,
+        plot_results=False,
+    )
+
+    assert len(framework.calls) == 2
+    rows = result["size_rows"] + result["hidden_rows"]
+    assert [row["point_index"] for row in rows] == [0, 2]
+
+
+def test_flash_quick_keeps_one_shape_for_each_formal_provider(
+    monkeypatch, tmp_path
+):
+    framework = _FakeFramework(tmp_path)
+    suite = FlashAttentionTestSuite()
+    suite.framework = framework
+    suite.operator_test = _FakeOperator([
+        "cuda_sdpa_flash_attention",
+        "cuda_flash_attn_func",
+    ])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "fake")
+    monkeypatch.setattr(
+        suite,
+        "_cuda_benchmark_data",
+        lambda **kwargs: {
+            "metadata": kwargs,
+            "sparse_mode": 3 if kwargs["causal"] else 0,
+        },
+    )
+
+    result = suite.run_tflops_test(
+        precision="fp16",
+        n_ctx_values=[32, 64],
+        head_dims=[64],
+        causal_values=[True],
+        device="cuda:0",
+        quick=True,
+        plot_results=False,
+    )
+
+    assert [call["implementation"] for call in framework.calls] == [
+        "cuda_sdpa_flash_attention",
+        "cuda_flash_attn_func",
+    ]
+    assert [row["point_index"] for row in result["rows"]] == [0, 2]
+
+
+def test_groupgemm_shard_keeps_global_formal_point_identity(
+    monkeypatch, tmp_path
+):
+    framework = _FakeFramework(tmp_path)
+    suite = GroupGemmTestSuite(
+        precision="bf16",
+        num_experts=1,
+        hidden_dim=16,
+        out_channel=16,
+    )
+    suite.framework = framework
+    provider = "cuda_bmm_balanced_grouped_mm_jagged_bf16"
+    suite.operator_test = _FakeOperator([provider])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    result = suite.run_tflops_test(
+        seq_lens=[8, 16, 32],
+        num_experts=1,
+        hidden_dim=16,
+        out_channel=16,
+        device="cuda:0",
+        shard_index=1,
+        num_shards=2,
+        plot_results=False,
+    )
+
+    assert [call["data"]["seq_len"] for call in framework.calls] == [16]
+    assert [row["point_index"] for row in result["results"]] == [1]
+
+
+def test_paged_attention_quick_keeps_one_point_per_formal_matrix(
+    monkeypatch, tmp_path
+):
+    framework = _FakeFramework(tmp_path)
+    suite = PagedAttentionTestSuite()
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["cuda_flashinfer_fa2"])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "fake")
+
+    result = suite.run_latency_plot_test(
+        device="cuda:0",
+        seqlen_start=128,
+        seqlen_end=256,
+        seqlen_step=128,
+        seqlen_batch_size=1,
+        batch_min=1,
+        batch_max=2,
+        batch_step=1,
+        batch_curve_seq_lens=[128, 256],
+        num_blocks=10000,
+        block_size=128,
+        quick=True,
+        plot_results=False,
+    )
+
+    assert len(framework.calls) == 2
+    rows = result["seqlen_rows"] + result["batch_rows"]
+    assert [row["point_index"] for row in rows] == [0, 2]
+
+
+def test_recurrent_quick_keeps_first_batch_of_each_mode(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "recurrent-quick.csv"
+    framework = _FakeFramework(tmp_path)
+    operator = _FakeOperator(["cuda_vllm_fla_direct_out"])
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "resolve_device",
+        lambda requested: ("cuda:0", "fake"),
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "RecurrentGatedDeltaRuleOperatorTest",
+        lambda: operator,
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "OperatorTestFramework",
+        lambda result_dir: framework,
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "environment",
+        lambda *args: {},
+    )
+
+    exit_code = recurrent_benchmark.main([
+        "--device", "cuda:0",
+        "--modes", "decode,mtp3",
+        "--batches", "1,4",
+        "--output", str(output),
+        "--skip-correctness",
+        "--quick",
+    ])
+
+    assert exit_code == 0
+    assert [call["data"]["mode"] for call in framework.calls] == [
+        "decode",
+        "mtp3",
+    ]
+    assert [call["data"]["batch_size"] for call in framework.calls] == [1, 1]
+    with output.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["point_index"]) for row in rows] == [0, 2]
+
+
+def test_default_formal_shape_matrices_remain_reachable(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "fake")
+
+    add_framework = _FakeFramework(tmp_path / "add")
+    add_suite = AddTestSuite()
+    add_suite.framework = add_framework
+    add_suite.operator_test = _FakeOperator(["cuda_torch_add_out"])
+    add_suite.run_bandwidth_test(device="cuda:0", plot_results=False)
+    assert [
+        call["data"]["shape"][0] for call in add_framework.calls
+    ] == [2**power for power in range(12, 28)]
+
+    linear_framework = _FakeFramework(tmp_path / "linear")
+    linear_suite = LinearTestSuite(precision="fp16")
+    linear_suite.framework = linear_framework
+    linear_suite.operator_test = _FakeOperator(["cuda_torch_mm_out"])
+    linear_suite.run_tflops_test(device="cuda:0", plot_results=False)
+    assert [
+        call["data"]["batch_size"] for call in linear_framework.calls
+    ] == list(range(256, 4097, 128))
+
+    rms_framework = _FakeFramework(tmp_path / "rmsnorm")
+    rms_suite = RMSNormTestSuite()
+    rms_suite.framework = rms_framework
+    rms_suite.operator_test = _FakeOperator(["cuda_vllm_rms_norm_out"])
+    rms_suite.run_bandwidth_test(device="cuda:0", plot_results=False)
+    assert len(rms_framework.calls) == 32
+    assert [
+        call["data"]["shape"][1] for call in rms_framework.calls[16:]
+    ] == [1024 * index for index in range(1, 17)]
+
+    flash_framework = _FakeFramework(tmp_path / "flash")
+    flash_suite = FlashAttentionTestSuite()
+    flash_suite.framework = flash_framework
+    flash_suite.operator_test = _FakeOperator([
+        "cuda_sdpa_flash_attention",
+        "cuda_flash_attn_func",
+    ])
+    monkeypatch.setattr(
+        flash_suite,
+        "_cuda_benchmark_data",
+        lambda **kwargs: {
+            "metadata": kwargs,
+            "sparse_mode": 3 if kwargs["causal"] else 0,
+        },
+    )
+    flash_suite.run_tflops_test(
+        precision="bf16",
+        device="cuda:0",
+        plot_results=False,
+    )
+    assert len(flash_framework.calls) == 40
+    assert {
+        call["data"]["metadata"]["seq_len"]
+        for call in flash_framework.calls
+    } == {1024, 2048, 4096, 8192, 16384}
+    assert {
+        call["data"]["metadata"]["head_dim"]
+        for call in flash_framework.calls
+    } == {64, 128}
+    assert {
+        call["data"]["metadata"]["causal"]
+        for call in flash_framework.calls
+    } == {True, False}
+
+    group_framework = _FakeFramework(tmp_path / "group")
+    group_suite = GroupGemmTestSuite(
+        precision="int8",
+        num_experts=8,
+        hidden_dim=7168,
+        out_channel=4096,
+    )
+    group_suite.framework = group_framework
+    group_suite.operator_test = _FakeOperator([
+        "cuda_vllm_cutlass_scaled_mm_bf16"
+    ])
+    group_suite.run_tflops_test(device="cuda:0", plot_results=False)
+    assert [
+        call["data"]["seq_len"] for call in group_framework.calls
+    ] == [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+    paged_framework = _FakeFramework(tmp_path / "paged")
+    paged_suite = PagedAttentionTestSuite()
+    paged_suite.framework = paged_framework
+    paged_suite.operator_test = _FakeOperator(["cuda_flashinfer_fa2"])
+    paged_suite.run_latency_plot_test(
+        device="cuda:0",
+        plot_results=False,
+    )
+    assert len(paged_framework.calls) == 32 + 2 * 128
+    assert {
+        call["data"]["max_seq_len"]
+        for call in paged_framework.calls[:32]
+    } == set(range(1024, 32769, 1024))
+    assert {
+        call["data"]["batch_size"]
+        for call in paged_framework.calls[32:]
+    } == set(range(1, 129))
+    assert {
+        call["data"]["max_seq_len"]
+        for call in paged_framework.calls[32:]
+    } == {10000, 30000}
+
+    recurrent_framework = _FakeFramework(tmp_path / "recurrent")
+    recurrent_operator = _FakeOperator(["cuda_vllm_fla_direct_out"])
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "resolve_device",
+        lambda requested: ("cuda:0", "fake"),
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "RecurrentGatedDeltaRuleOperatorTest",
+        lambda: recurrent_operator,
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "OperatorTestFramework",
+        lambda result_dir: recurrent_framework,
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "environment",
+        lambda *args: {},
+    )
+    output = tmp_path / "recurrent" / "curve.csv"
+    assert recurrent_benchmark.main([
+        "--device", "cuda:0",
+        "--output", str(output),
+        "--skip-correctness",
+    ]) == 0
+    assert [
+        (call["data"]["mode"], call["data"]["batch_size"])
+        for call in recurrent_framework.calls
+    ] == [
+        (mode, batch)
+        for mode in ("decode", "mtp3")
+        for batch in (1, 4, 8, 16, 32, 64, 128)
+    ]

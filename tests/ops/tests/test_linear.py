@@ -248,6 +248,9 @@ class LinearTestSuite(BaseTestSuite):
         num_iterations=50,
         num_repeats=3,
         plot_results=True,
+        quick=False,
+        shard_index=0,
+        num_shards=1,
     ):
         """Run the bias-free formal GEMM curve with Framework V2."""
         import csv
@@ -255,6 +258,10 @@ class LinearTestSuite(BaseTestSuite):
         import time
         import torch
 
+        if num_shards <= 0 or not 0 <= shard_index < num_shards:
+            raise ValueError(
+                "shard index must satisfy 0 <= index < num_shards"
+            )
         if sizes is None:
             if start <= 0 or end < start or step <= 0:
                 raise ValueError("require 0 < start <= end and step > 0")
@@ -265,6 +272,14 @@ class LinearTestSuite(BaseTestSuite):
             sizes = list(sizes)
         if not sizes or any(size <= 0 for size in sizes):
             raise ValueError("sizes must contain positive integers")
+        indexed_sizes = list(enumerate(sizes))
+        if quick:
+            indexed_sizes = indexed_sizes[:1]
+        indexed_sizes = [
+            (point_index, size)
+            for point_index, size in indexed_sizes
+            if point_index % num_shards == shard_index
+        ]
 
         if device == "auto":
             try:
@@ -316,14 +331,18 @@ class LinearTestSuite(BaseTestSuite):
             "timed_region",
         ]
         fieldnames = [
-            "M", "N", "K", "bias", "provider", "device", "precision",
-            "avg_time_ms", "TFLOPS", "status", "error",
+            "point_index", "shard_index", "num_shards", "M", "N", "K",
+            "bias", "provider", "device", "precision", "avg_time_ms",
+            "TFLOPS", "status", "error",
             *provenance_fields,
         ]
         rows = []
         failures = []
-        for size in sizes:
+        for point_index, size in indexed_sizes:
             row = {
+                "point_index": point_index,
+                "shard_index": shard_index,
+                "num_shards": num_shards,
                 "M": size,
                 "N": size,
                 "K": size,
@@ -447,6 +466,10 @@ def main():
     parser.add_argument('--tflops-warmup', type=int, default=10)
     parser.add_argument('--tflops-iterations', type=int, default=50)
     parser.add_argument('--tflops-repeats', type=int, default=3)
+    parser.add_argument('--result-dir', default='test_results')
+    parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--shard-index', type=int, default=0)
+    parser.add_argument('--num-shards', type=int, default=1)
     parser.add_argument('--no-plot', action='store_true')
 
     parser.add_argument('--custom-dims', type=str, help='自定义维度列表，格式: batch,input,output (例如: 64,512,2048)')
@@ -454,7 +477,7 @@ def main():
     args = parser.parse_args()
     
     # 创建测试框架
-    framework = OperatorTestFramework()
+    framework = OperatorTestFramework(result_dir=args.result_dir)
     
     # 创建测试套件
     test_suite = LinearTestSuite(
@@ -542,6 +565,9 @@ def main():
                 num_iterations=args.tflops_iterations,
                 num_repeats=args.tflops_repeats,
                 plot_results=not args.no_plot,
+                quick=args.quick,
+                shard_index=args.shard_index,
+                num_shards=args.num_shards,
             )
         return 0
     except Exception as e:

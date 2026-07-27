@@ -119,6 +119,9 @@ class RMSNormTestSuite(BaseTestSuite):
         num_iterations=50,
         num_repeats=3,
         plot_results=True,
+        quick=False,
+        shard_index=0,
+        num_shards=1,
     ):
         """Run both formal BF16 RMSNorm bandwidth matrices."""
         import csv
@@ -127,6 +130,10 @@ class RMSNormTestSuite(BaseTestSuite):
         import torch
         from operator_test_framework import PrecisionType
 
+        if num_shards <= 0 or not 0 <= shard_index < num_shards:
+            raise ValueError(
+                "shard index must satisfy 0 <= index < num_shards"
+            )
         sizes = list(sizes) if sizes is not None else [
             2**i for i in range(12, 28)
         ]
@@ -141,6 +148,22 @@ class RMSNormTestSuite(BaseTestSuite):
             or target_total_elements <= 0
         ):
             raise ValueError("RMSNorm curve dimensions must be positive")
+        indexed_sizes = list(enumerate(sizes))
+        indexed_hidden_sizes = [
+            (len(sizes) + index, hidden_size)
+            for index, hidden_size in enumerate(hidden_sizes)
+        ]
+        if quick:
+            indexed_sizes = indexed_sizes[:1]
+            indexed_hidden_sizes = indexed_hidden_sizes[:1]
+        indexed_sizes = [
+            item for item in indexed_sizes
+            if item[0] % num_shards == shard_index
+        ]
+        indexed_hidden_sizes = [
+            item for item in indexed_hidden_sizes
+            if item[0] % num_shards == shard_index
+        ]
         if device == "auto":
             try:
                 import torch_npu
@@ -189,16 +212,22 @@ class RMSNormTestSuite(BaseTestSuite):
             "timed_region",
         ]
         fieldnames = [
-            "curve", "total_elements", "hidden_size", "provider", "device",
-            "precision", "avg_time_ms", "bandwidth_gb_s", "status", "error",
-            *provenance_fields,
+            "point_index", "shard_index", "num_shards", "curve",
+            "total_elements", "hidden_size", "provider", "device",
+            "precision", "avg_time_ms", "bandwidth_gb_s", "status",
+            "error", *provenance_fields,
         ]
         size_rows = []
         hidden_rows = []
         failures = []
 
-        def measure_point(curve, total_elements, hidden_size):
+        def measure_point(
+            point_index, curve, total_elements, hidden_size
+        ):
             row = {
+                "point_index": point_index,
+                "shard_index": shard_index,
+                "num_shards": num_shards,
                 "curve": curve,
                 "total_elements": total_elements,
                 "hidden_size": hidden_size,
@@ -254,20 +283,26 @@ class RMSNormTestSuite(BaseTestSuite):
                 )
             return row
 
-        for size in sizes:
+        for point_index, size in indexed_sizes:
             effective_size = max(4096, (size // 4096) * 4096)
-            size_rows.append(measure_point("total_size", effective_size, 4096))
+            size_rows.append(
+                measure_point(
+                    point_index, "total_size", effective_size, 4096
+                )
+            )
             with size_csv.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(size_rows)
 
-        for hidden_size in hidden_sizes:
+        for point_index, hidden_size in indexed_hidden_sizes:
             total_elements = (
                 target_total_elements // hidden_size
             ) * hidden_size
             hidden_rows.append(
-                measure_point("hidden_size", total_elements, hidden_size)
+                measure_point(
+                    point_index, "hidden_size", total_elements, hidden_size
+                )
             )
             with hidden_csv.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -343,6 +378,9 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--sizes", type=int, nargs="+")
     parser.add_argument("--hidden-sizes", type=int, nargs="+")
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument(
         "--target-total-elements",
         type=int,
@@ -384,6 +422,9 @@ def main():
             num_iterations=args.iterations,
             num_repeats=args.repeats,
             plot_results=not args.no_plot,
+            quick=args.quick,
+            shard_index=args.shard_index,
+            num_shards=args.num_shards,
         )
     return 0
 

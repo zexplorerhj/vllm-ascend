@@ -194,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--environment-output", type=Path)
     parser.add_argument("--skip-correctness", action="store_true")
+    parser.add_argument("--quick", action="store_true")
     args = parser.parse_args(argv)
 
     unknown_modes = sorted(set(args.modes).difference(TOKEN_COUNTS))
@@ -289,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
     points = [(mode, batch) for mode in args.modes for batch in args.batches]
     rows: list[dict[str, Any]] = []
     for point_index, (mode, batch_size) in enumerate(points):
+        if args.quick and point_index % len(args.batches) != 0:
+            continue
         if point_index % args.num_shards != args.shard_index:
             continue
         tokens_per_sequence = TOKEN_COUNTS[mode]

@@ -129,6 +129,9 @@ class GroupGemmTestSuite(BaseTestSuite):
         num_iterations=30,
         num_repeats=3,
         plot_results=True,
+        quick=False,
+        shard_index=0,
+        num_shards=1,
     ):
         """Run the formal pure-GEMM throughput curve with Framework V2."""
         import csv
@@ -155,6 +158,10 @@ class GroupGemmTestSuite(BaseTestSuite):
             or num_repeats <= 0
         ):
             raise ValueError("W >= 0 and I/R > 0 are required")
+        if num_shards <= 0 or not 0 <= shard_index < num_shards:
+            raise ValueError(
+                "shard index must satisfy 0 <= index < num_shards"
+            )
         npu_available = False
         try:
             import torch_npu
@@ -193,6 +200,13 @@ class GroupGemmTestSuite(BaseTestSuite):
             seq_lens = list(seq_lens)
         if not seq_lens or any(value <= 0 for value in seq_lens):
             raise ValueError(f"seq_lens 必须是非空正整数列表: {seq_lens}")
+        indexed_seq_lens = list(enumerate(seq_lens))
+        if quick:
+            indexed_seq_lens = indexed_seq_lens[:1]
+        indexed_seq_lens = [
+            item for item in indexed_seq_lens
+            if item[0] % num_shards == shard_index
+        ]
 
         metric_name = "INT8_TOPS" if self.precision == "int8" else "BF16_TFLOPS"
 
@@ -226,16 +240,20 @@ class GroupGemmTestSuite(BaseTestSuite):
             "timed_region",
         ]
         fieldnames = [
-            "seq_len", "num_experts", "hidden_dim", "out_channel",
-            "implementation", "kernel", "output_semantics",
+            "point_index", "shard_index", "num_shards", "seq_len",
+            "num_experts", "hidden_dim", "out_channel", "implementation",
+            "kernel", "output_semantics",
             "avg_time_ms", "metric", "throughput_trillion_ops_s",
             "status", "error", *provenance_fields,
         ]
 
-        for seq_len in seq_lens:
+        for point_index, seq_len in indexed_seq_lens:
             kernel = ""
             output_semantics = ""
             row = {
+                "point_index": point_index,
+                "shard_index": shard_index,
+                "num_shards": num_shards,
                 "seq_len": seq_len,
                 "num_experts": num_experts,
                 "hidden_dim": hidden_dim,
@@ -428,6 +446,10 @@ def main():
         '--tflops-iterations', type=int, default=30, help='TFLOPS 测试计时次数'
     )
     parser.add_argument('--tflops-repeats', type=int, default=3)
+    parser.add_argument('--result-dir', default='test_results')
+    parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--shard-index', type=int, default=0)
+    parser.add_argument('--num-shards', type=int, default=1)
     parser.add_argument('--no-plot', action='store_true')
     parser.add_argument('--use-nz-format', action='store_true', help='使用NZ格式（仅对INT8有效）')
     parser.add_argument(
@@ -442,7 +464,7 @@ def main():
     args = parser.parse_args()
     
     # 创建测试框架
-    framework = OperatorTestFramework()
+    framework = OperatorTestFramework(result_dir=args.result_dir)
     
     # 根据精度类型创建测试套件
     test_suite = GroupGemmTestSuite(
@@ -537,6 +559,9 @@ def main():
                 num_iterations=args.tflops_iterations,
                 num_repeats=args.tflops_repeats,
                 plot_results=not args.no_plot,
+                quick=args.quick,
+                shard_index=args.shard_index,
+                num_shards=args.num_shards,
             )
         
     except Exception as e:

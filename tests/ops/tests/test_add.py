@@ -99,15 +99,30 @@ class AddTestSuite(BaseTestSuite):
         num_iterations: int = 20,
         num_repeats: int = 3,
         plot_results: bool = True,
+        quick: bool = False,
+        shard_index: int = 0,
+        num_shards: int = 1,
     ):
         """Run the formal BF16 bandwidth curve with Framework V2."""
         from operator_test_framework import PrecisionType
 
+        if num_shards <= 0 or not 0 <= shard_index < num_shards:
+            raise ValueError(
+                "shard index must satisfy 0 <= index < num_shards"
+            )
         if sizes is None:
             sizes = [2**i for i in range(12, 28)]
         sizes = list(sizes)
         if not sizes or any(size <= 0 for size in sizes):
             raise ValueError("sizes must contain positive integers")
+        indexed_sizes = list(enumerate(sizes))
+        if quick:
+            indexed_sizes = indexed_sizes[:1]
+        indexed_sizes = [
+            (point_index, size)
+            for point_index, size in indexed_sizes
+            if point_index % num_shards == shard_index
+        ]
         if device == "auto":
             try:
                 import torch_npu
@@ -152,14 +167,18 @@ class AddTestSuite(BaseTestSuite):
             "timed_region",
         ]
         fieldnames = [
-            "size", "provider", "device", "precision", "avg_time_ms",
-            "bandwidth_gb_s", "status", "error", *provenance_fields,
+            "point_index", "shard_index", "num_shards", "size", "provider",
+            "device", "precision", "avg_time_ms", "bandwidth_gb_s",
+            "status", "error", *provenance_fields,
         ]
         rows = []
         failures = []
 
-        for size in sizes:
+        for point_index, size in indexed_sizes:
             row = {
+                "point_index": point_index,
+                "shard_index": shard_index,
+                "num_shards": num_shards,
                 "size": size,
                 "provider": implementation,
                 "device": device,
@@ -277,6 +296,9 @@ def main():
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--sizes", type=int, nargs="+")
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--no-plot", action="store_true")
     
     args = parser.parse_args()
@@ -313,6 +335,9 @@ def main():
                 num_iterations=args.iterations,
                 num_repeats=args.repeats,
                 plot_results=not args.no_plot,
+                quick=args.quick,
+                shard_index=args.shard_index,
+                num_shards=args.num_shards,
             )
         else:
             print(f"❌ 不支持的测试模式: {args.mode}")

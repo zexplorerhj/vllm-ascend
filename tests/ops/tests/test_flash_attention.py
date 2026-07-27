@@ -220,6 +220,9 @@ class FlashAttentionTestSuite(BaseTestSuite):
         device: str = "auto",
         provider: str = None,
         plot_results: bool = True,
+        quick: bool = False,
+        shard_index: int = 0,
+        num_shards: int = 1,
     ):
         from operator_test_framework import PrecisionType
 
@@ -247,6 +250,10 @@ class FlashAttentionTestSuite(BaseTestSuite):
                     f"{count_name} must be a non-bool int {comparator} "
                     f"{boundary}"
                 )
+        if num_shards <= 0 or not 0 <= shard_index < num_shards:
+            raise ValueError(
+                "shard index must satisfy 0 <= index < num_shards"
+            )
 
         if device == "auto":
             device = self._select_device()
@@ -267,6 +274,7 @@ class FlashAttentionTestSuite(BaseTestSuite):
                 f"expected {expected_provider_count} formal FlashAttention "
                 f"provider(s) for {device}, got {implementations}"
             )
+        formal_implementations = tuple(implementations)
         if provider is not None:
             provider_aliases = {
                 "pytorch_sdpa_flash_attention": (
@@ -344,9 +352,10 @@ class FlashAttentionTestSuite(BaseTestSuite):
             "timed_region",
         ]
         fieldnames = [
-            "head_dim", "causal", "n_ctx", "provider", "device",
-            "device_name", "precision", "avg_time_ms", "TFLOPS", "status",
-            "error", *provenance_fields,
+            "point_index", "shard_index", "num_shards", "head_dim",
+            "causal", "n_ctx", "provider", "device", "device_name",
+            "precision", "avg_time_ms", "TFLOPS", "status", "error",
+            *provenance_fields,
         ]
 
         results = []
@@ -377,15 +386,31 @@ class FlashAttentionTestSuite(BaseTestSuite):
             for implementation in implementations
             for case in benchmark_cases
         }
+        shape_points_per_provider = len(benchmark_cases) * len(n_ctx_values)
         for implementation in implementations:
-            for case in benchmark_cases:
+            implementation_index = formal_implementations.index(
+                implementation
+            )
+            for case_index, case in enumerate(benchmark_cases):
                 head_dim = case["head_dim"]
                 causal = case["causal"]
                 curve_key = (implementation, head_dim, causal)
-                for n_ctx in n_ctx_values:
+                for n_ctx_index, n_ctx in enumerate(n_ctx_values):
+                    point_index = (
+                        implementation_index * shape_points_per_provider
+                        + case_index * len(n_ctx_values)
+                        + n_ctx_index
+                    )
+                    if quick and (case_index != 0 or n_ctx_index != 0):
+                        continue
+                    if point_index % num_shards != shard_index:
+                        continue
                     sparse_mode = 3 if causal else 0
                     test_data = None
                     row = {
+                        "point_index": point_index,
+                        "shard_index": shard_index,
+                        "num_shards": num_shards,
                         "head_dim": head_dim,
                         "causal": causal,
                         "n_ctx": n_ctx,
@@ -644,6 +669,9 @@ def main(argv=None):
         action="store_true",
         help="不导入matplotlib或生成PNG"
     )
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
     
     args = parser.parse_args(argv)
     
@@ -676,6 +704,9 @@ def main(argv=None):
                 device=args.device,
                 provider=args.provider,
                 plot_results=not args.no_plot,
+                quick=args.quick,
+                shard_index=args.shard_index,
+                num_shards=args.num_shards,
             )
     except Exception as exc:
         print(f"❌ FlashAttention算子测试失败: {exc}")

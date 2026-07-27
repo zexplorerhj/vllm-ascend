@@ -237,6 +237,9 @@ class PagedAttentionTestSuite(BaseTestSuite):
         allow_fallback: bool = False,
         providers: List[str] = None,
         plot_results: bool = True,
+        quick: bool = False,
+        shard_index: int = 0,
+        num_shards: int = 1,
     ):
         import csv
         import time
@@ -268,6 +271,10 @@ class PagedAttentionTestSuite(BaseTestSuite):
         if num_warmup < 0 or num_iterations <= 0 or repeats <= 0:
             raise ValueError(
                 "num_warmup must be >= 0 and num_iterations/repeats > 0"
+            )
+        if num_shards <= 0 or not 0 <= shard_index < num_shards:
+            raise ValueError(
+                "shard index must satisfy 0 <= index < num_shards"
             )
         if num_blocks != 10000:
             raise ValueError(
@@ -385,7 +392,10 @@ class PagedAttentionTestSuite(BaseTestSuite):
         )
         print(f"{'='*80}")
 
-        seqlen_latency_ms = {impl: [] for impl in implementations}
+        seqlen_latency_ms = {
+            impl: [float("nan")] * len(seqlens)
+            for impl in implementations
+        }
         seqlen_rows = []
 
         def measure_one(data, implementation):
@@ -427,12 +437,21 @@ class PagedAttentionTestSuite(BaseTestSuite):
         ]
         seqlen_fields = [
             *common_fields[:9], "seq_len", *common_fields[9:],
+            "point_index", "shard_index", "num_shards",
             *provenance_fields,
         ]
         failures = []
-        for impl in implementations:
+        seqlen_point_count = len(implementations) * len(seqlens)
+        for implementation_index, impl in enumerate(implementations):
             print(f"\n  provider: {impl}")
-            for seq_len in seqlens:
+            for seqlen_index, seq_len in enumerate(seqlens):
+                point_index = (
+                    implementation_index * len(seqlens) + seqlen_index
+                )
+                if quick and seqlen_index != 0:
+                    continue
+                if point_index % num_shards != shard_index:
+                    continue
                 row = {
                     "provider": impl,
                     "device": device,
@@ -452,6 +471,9 @@ class PagedAttentionTestSuite(BaseTestSuite):
                     "latency_ms": "",
                     "status": "pending",
                     "error": "",
+                    "point_index": point_index,
+                    "shard_index": shard_index,
+                    "num_shards": num_shards,
                     "warmup": num_warmup,
                     "iterations": num_iterations,
                     "repeats": repeats,
@@ -479,14 +501,13 @@ class PagedAttentionTestSuite(BaseTestSuite):
                         latency_ms=latency,
                         status="ok",
                     )
-                    seqlen_latency_ms[impl].append(latency)
+                    seqlen_latency_ms[impl][seqlen_index] = latency
                 except Exception as exc:
                     failures.append(("seqlen", impl, seq_len, exc))
                     row.update(
                         status="error",
                         error=f"{type(exc).__name__}: {exc}",
                     )
-                    seqlen_latency_ms[impl].append(float("nan"))
                 seqlen_rows.append(row)
                 with seqlen_csv.open(
                     "w", newline="", encoding="utf-8"
@@ -508,12 +529,16 @@ class PagedAttentionTestSuite(BaseTestSuite):
                     )
 
         batch_latency_ms = {
-            impl: {fixed_seq: [] for fixed_seq in batch_curve_seq_lens}
+            impl: {
+                fixed_seq: [float("nan")] * len(batch_sizes)
+                for fixed_seq in batch_curve_seq_lens
+            }
             for impl in implementations
         }
         batch_rows = []
         batch_fields = [
             *common_fields[:9], "seq_len_fixed", *common_fields[9:],
+            "point_index", "shard_index", "num_shards",
             *provenance_fields,
         ]
 
@@ -521,11 +546,28 @@ class PagedAttentionTestSuite(BaseTestSuite):
             f"\n📈 曲线2: batch={batch_min}..{batch_max}, "
             f"seqlen固定 {batch_curve_seq_lens}"
         )
-        for impl in implementations:
+        batch_points_per_provider = (
+            len(batch_curve_seq_lens) * len(batch_sizes)
+        )
+        for implementation_index, impl in enumerate(implementations):
             print(f"\n  provider: {impl}")
-            for fixed_seq in batch_curve_seq_lens:
+            for fixed_seq_index, fixed_seq in enumerate(
+                batch_curve_seq_lens
+            ):
                 print(f"\n  固定 seqlen={fixed_seq}")
-                for batch_size in batch_sizes:
+                for batch_index, batch_size in enumerate(batch_sizes):
+                    point_index = (
+                        seqlen_point_count
+                        + implementation_index * batch_points_per_provider
+                        + fixed_seq_index * len(batch_sizes)
+                        + batch_index
+                    )
+                    if quick and (
+                        fixed_seq_index != 0 or batch_index != 0
+                    ):
+                        continue
+                    if point_index % num_shards != shard_index:
+                        continue
                     row = {
                         "provider": impl,
                         "device": device,
@@ -545,6 +587,9 @@ class PagedAttentionTestSuite(BaseTestSuite):
                         "latency_ms": "",
                         "status": "pending",
                         "error": "",
+                        "point_index": point_index,
+                        "shard_index": shard_index,
+                        "num_shards": num_shards,
                         "warmup": num_warmup,
                         "iterations": num_iterations,
                         "repeats": repeats,
@@ -572,14 +617,15 @@ class PagedAttentionTestSuite(BaseTestSuite):
                             latency_ms=latency,
                             status="ok",
                         )
-                        batch_latency_ms[impl][fixed_seq].append(latency)
+                        batch_latency_ms[impl][fixed_seq][
+                            batch_index
+                        ] = latency
                     except Exception as exc:
                         failures.append(("batch", impl, fixed_seq, batch_size, exc))
                         row.update(
                             status="error",
                             error=f"{type(exc).__name__}: {exc}",
                         )
-                        batch_latency_ms[impl][fixed_seq].append(float("nan"))
                     batch_rows.append(row)
                     with batch_csv.open(
                         "w", newline="", encoding="utf-8"
@@ -767,6 +813,9 @@ def main():
         action="store_true",
         help="仅生成 CSV；适用于没有 matplotlib 的远端运行环境",
     )
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
     
     args = parser.parse_args()
     
@@ -812,6 +861,9 @@ def main():
             allow_fallback=args.allow_fallback,
             providers=args.providers,
             plot_results=not args.no_plot,
+            quick=args.quick,
+            shard_index=args.shard_index,
+            num_shards=args.num_shards,
         )
     
     print(f"\n✓ PagedAttention算子测试完成，结果已保存到 {args.result_dir}")

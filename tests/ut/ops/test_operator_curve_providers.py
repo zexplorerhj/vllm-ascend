@@ -25,9 +25,11 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from add.add_operator import AddOperatorTest  # noqa: E402
 from flashattention.base import FlashAttentionOperatorTest  # noqa: E402
+import flashattention.impl as flashattention_impl  # noqa: E402
 from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest  # noqa: E402
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest  # noqa: E402
 from linear.linear_operator import LinearOperatorTest  # noqa: E402
+from operator_test_framework import OperatorTestFramework  # noqa: E402
 from paged_attention.base import PagedAttentionOperatorTest  # noqa: E402
 from paged_attention.cuda_impl import FlashInferPagedKVImpl  # noqa: E402
 from recurrent_gated_delta_rule.base import (  # noqa: E402
@@ -337,18 +339,9 @@ def test_rmsnorm_timed_npu_result_keeps_auxiliary_output(monkeypatch):
     assert correctness_result is primary
 
 
-@pytest.mark.parametrize(
-    ("factory", "implementation"),
-    [
-        (FlashAttentionOperatorTest, "npu_flash_attention"),
-        (PagedAttentionOperatorTest, "npu_fused_infer_attention_score"),
-    ],
-)
-def test_attention_timed_result_keeps_auxiliary_output(
-    factory,
-    implementation,
-):
-    operator = factory()
+def test_paged_attention_timed_result_keeps_auxiliary_output():
+    implementation = "npu_fused_infer_attention_score"
+    operator = PagedAttentionOperatorTest()
     primary = torch.tensor([1.0])
     auxiliary = torch.tensor([2.0])
     native_result = (primary, auxiliary)
@@ -364,6 +357,149 @@ def test_attention_timed_result_keeps_auxiliary_output(
 
     assert timed_result is native_result
     assert correctness_result is primary
+
+
+@pytest.mark.parametrize(
+    "execute_implementation",
+    ["default", "npu_flash_attention"],
+)
+def test_flashattention_npu_framework_metadata_never_reaches_provider(
+    monkeypatch,
+    execute_implementation,
+):
+    operator = FlashAttentionOperatorTest()
+    primary = torch.tensor([1.0])
+    auxiliary = torch.tensor([2.0])
+    log_sum_exp = torch.tensor([3.0])
+    native_result = (primary, auxiliary, log_sum_exp)
+    provider_calls = []
+    requested_devices = _fake_accelerator_tensor_to(monkeypatch, "npu:0")
+
+    def fake_fused_infer_attention_score(**kwargs):
+        provider_calls.append(kwargs)
+        assert "_implementation" not in kwargs
+        return native_result
+
+    monkeypatch.setattr(
+        flashattention_impl,
+        "torch_npu",
+        SimpleNamespace(
+            npu_fused_infer_attention_score=(
+                fake_fused_infer_attention_score
+            )
+        ),
+    )
+    prepared = operator._prepare_data_for_core_operator(
+        {
+            "query": torch.ones(1, 2, 4, 8),
+            "key": torch.ones(1, 2, 4, 8),
+            "value": torch.ones(1, 2, 4, 8),
+            "num_heads": 2,
+            "num_kv_heads": 2,
+            "input_layout": "BNSD",
+        },
+        "npu:0",
+        SimpleNamespace(value=torch.float32),
+        "default",
+    )
+
+    timed_result = operator._execute_core_operator(
+        prepared,
+        execute_implementation,
+    )
+
+    assert requested_devices == ["npu:0"] * 3
+    assert set(prepared) == {"_implementation", "provider_data"}
+    assert prepared["_implementation"] == "npu_flash_attention"
+    assert provider_calls[0].keys() == prepared["provider_data"].keys()
+    assert timed_result is native_result
+    assert operator._primary_output(timed_result) is primary
+
+
+@pytest.mark.parametrize(
+    ("implementation", "execute_implementation", "method_name"),
+    [
+        (
+            "cuda_sdpa_flash_attention",
+            "default",
+            "execute_core_operator_in_active_context",
+        ),
+        (
+            "cuda_sdpa_flash_attention",
+            "cuda_sdpa_flash_attention",
+            "execute_core_operator_in_active_context",
+        ),
+        (
+            "cuda_flash_attn_func",
+            "cuda_flash_attn_func",
+            "execute_core_operator",
+        ),
+    ],
+)
+def test_flashattention_cuda_execute_receives_only_nested_provider_data(
+    implementation,
+    execute_implementation,
+    method_name,
+):
+    operator = FlashAttentionOperatorTest()
+    provider_data = {"query": torch.tensor([1.0])}
+    received = []
+
+    def execute(prepared):
+        received.append(("execute_core_operator", prepared))
+        return prepared["query"]
+
+    def execute_in_active_context(prepared):
+        received.append(
+            ("execute_core_operator_in_active_context", prepared)
+        )
+        return prepared["query"]
+
+    provider = SimpleNamespace(
+        prepare_data=lambda data, device, precision: provider_data,
+        execute_core_operator=execute,
+        execute_core_operator_in_active_context=execute_in_active_context,
+    )
+    operator.implementations[implementation] = provider
+    prepared = operator._prepare_data_for_core_operator(
+        {},
+        "cuda:0",
+        SimpleNamespace(value=torch.float32),
+        implementation if execute_implementation != "default" else "default",
+    )
+
+    result = operator._execute_core_operator(
+        prepared,
+        execute_implementation,
+    )
+
+    assert set(prepared) == {"_implementation", "provider_data"}
+    assert received == [(method_name, provider_data)]
+    assert result is provider_data["query"]
+
+
+def test_flashattention_nested_provider_data_remains_visible_to_storage_audit():
+    prepared_sets = [
+        {
+            "_implementation": "npu_flash_attention",
+            "provider_data": {"query": torch.ones(2)},
+        },
+        {
+            "_implementation": "npu_flash_attention",
+            "provider_data": {"query": torch.ones(2)},
+        },
+    ]
+
+    verified_sets, pointer_count = (
+        OperatorTestFramework._verify_independent_storage_sets(
+            prepared_sets,
+            "cpu",
+            "nested FlashAttention provider data",
+        )
+    )
+
+    assert verified_sets == 2
+    assert pointer_count == 2
 
 
 def test_add_formal_prepare_owns_fresh_inputs_and_output(monkeypatch):

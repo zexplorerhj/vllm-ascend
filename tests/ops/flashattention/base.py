@@ -350,20 +350,26 @@ class FlashAttentionOperatorTest(BaseOperatorTest):
         """准备核心算子数据（兼容性方法）"""
         implementation = self._resolve_implementation(device, implementation)
         impl = self.implementations[implementation]
-        prepared = impl.prepare_data(data, device, precision)
-        prepared["_implementation"] = implementation
-        return prepared
+        return {
+            "_implementation": implementation,
+            "provider_data": impl.prepare_data(data, device, precision),
+        }
     
-    def _execute_core_operator(self, prepared_data: Dict[str, Any], implementation: str) -> torch.Tensor:
+    def _execute_core_operator(
+        self,
+        prepared_data: Dict[str, Any],
+        implementation: str,
+    ) -> Any:
         """执行核心算子（兼容性方法）"""
         if implementation == "default":
             implementation = prepared_data["_implementation"]
+        provider_data = prepared_data["provider_data"]
         if implementation in self.implementations:
             impl = self.implementations[implementation]
             if implementation == "cuda_sdpa_flash_attention":
                 return impl.execute_core_operator_in_active_context(
-                    prepared_data
+                    provider_data
                 )
-            return impl.execute_core_operator(prepared_data)
+            return impl.execute_core_operator(provider_data)
         else:
             raise ValueError(f"不支持的实现方式: {implementation}")

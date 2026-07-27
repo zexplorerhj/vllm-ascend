@@ -1,3 +1,7 @@
+import gc
+import statistics
+from contextlib import nullcontext
+
 import torch
 try:
     import torch_npu
@@ -11,7 +15,7 @@ import pandas as pd
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Union, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import json
 
@@ -185,6 +189,24 @@ class PerformanceMetrics:
     throughput_ops_per_sec: Optional[float] = None  # 每秒操作数吞吐量
     tops: Optional[float] = None  # TOPS (每秒万亿次操作)
     bandwidth_gb_s: Optional[float] = None  # 内存带宽 (GB/s)
+    framework_api: Optional[str] = None
+    warmup_iterations: int = 0
+    preallocated_input_sets: int = 0
+    independent_storage_sets_verified: int = 0
+    independent_output_storage_sets_verified: int = 0
+    preallocated_output_aliases_verified: int = 0
+    output_storage_policy: Optional[str] = None
+    protocol_version: Optional[str] = None
+    repeats: int = 1
+    repeat_samples_ms: List[float] = field(default_factory=list)
+    aggregation: str = "single_repeat"
+    preallocated_invocations_per_repeat: int = 0
+    input_storage_sets_verified: int = 0
+    input_storage_ptr_count: int = 0
+    output_storage_sets_verified: int = 0
+    output_storage_ptr_count: int = 0
+    input_reuse_within_repeat: bool = False
+    timed_region: Optional[str] = None
     
     def __post_init__(self):
         """初始化后处理，确保throughput_ops_per_sec有值"""
@@ -278,6 +300,90 @@ class OperatorTestFramework:
         self.result_dir = Path(result_dir)
         self.result_dir.mkdir(exist_ok=True)
         self.operators: Dict[str, BaseOperatorTest] = {}
+
+    @staticmethod
+    def _device_storage_ptrs(value: Any, device_type: str) -> set[int]:
+        """Collect device storage identities from a nested prepared payload."""
+        pointers: set[int] = set()
+        if isinstance(value, torch.Tensor):
+            if value.numel() and value.device.type == device_type:
+                try:
+                    pointers.add(value.untyped_storage().data_ptr())
+                except (AttributeError, RuntimeError):
+                    pointers.add(value.data_ptr())
+            return pointers
+        if isinstance(value, dict):
+            for child in value.values():
+                pointers.update(
+                    OperatorTestFramework._device_storage_ptrs(
+                        child, device_type
+                    )
+                )
+            return pointers
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                pointers.update(
+                    OperatorTestFramework._device_storage_ptrs(
+                        child, device_type
+                    )
+                )
+        return pointers
+
+    @classmethod
+    def _verify_independent_storage_sets(
+        cls,
+        values: List[Any],
+        device: str,
+        label: str,
+    ) -> Tuple[int, int]:
+        """Fail when two V2 invocations reuse any device tensor storage."""
+        device_type = "npu" if "npu" in device else (
+            "cuda" if "cuda" in device else "cpu"
+        )
+        seen: set[int] = set()
+        verified = 0
+        for index, value in enumerate(values):
+            current = cls._device_storage_ptrs(value, device_type)
+            if not current:
+                raise RuntimeError(
+                    f"{label} {index} contains no non-empty {device_type} tensors"
+                )
+            overlap = seen.intersection(current)
+            if overlap:
+                raise RuntimeError(
+                    f"{label} reuse device storage at invocation {index}; "
+                    f"overlap_count={len(overlap)}"
+                )
+            seen.update(current)
+            verified += 1
+        return verified, len(seen)
+
+    @staticmethod
+    def performance_provenance(metrics: PerformanceMetrics) -> Dict[str, Any]:
+        """Return the stable, flat protocol fields written to curve CSVs."""
+        return {
+            "framework_api": metrics.framework_api,
+            "protocol_version": metrics.protocol_version,
+            "warmup": metrics.warmup_iterations,
+            "iterations": metrics.iterations,
+            "repeats": metrics.repeats,
+            "repeat_samples_ms": json.dumps(metrics.repeat_samples_ms),
+            "aggregation": metrics.aggregation,
+            "preallocated_invocations_per_repeat": (
+                metrics.preallocated_invocations_per_repeat
+            ),
+            "input_reuse_within_repeat": metrics.input_reuse_within_repeat,
+            "input_storage_sets_verified": (
+                metrics.input_storage_sets_verified
+            ),
+            "input_storage_ptr_count": metrics.input_storage_ptr_count,
+            "output_storage_sets_verified": (
+                metrics.output_storage_sets_verified
+            ),
+            "output_storage_ptr_count": metrics.output_storage_ptr_count,
+            "output_storage_policy": metrics.output_storage_policy,
+            "timed_region": metrics.timed_region,
+        }
     
     def _measure_execution_time(self, func, device: str, num_iterations: int = 1) -> float:
         """使用设备事件精确测量执行时间
@@ -308,9 +414,6 @@ class OperatorTestFramework:
                 for i in range(num_iterations):
                     func()
                 
-                # 确保所有NPU操作完成
-                torch_npu.npu.synchronize()
-                
                 # 记录结束时间
                 end_event.record()
                 
@@ -336,9 +439,6 @@ class OperatorTestFramework:
                 # 执行所有迭代
                 for i in range(num_iterations):
                     func()
-                
-                # 确保所有CUDA操作完成
-                torch.cuda.synchronize()
                 
                 # 记录结束时间
                 end_event.record()
@@ -389,28 +489,27 @@ class OperatorTestFramework:
         try:
             if "npu" in device:
                 # NPU事件计时 - 使用预准备函数列表
-                start_event = torch_npu.npu.Event(enable_timing=True)
-                end_event = torch_npu.npu.Event(enable_timing=True)
-                
-                # 初始同步确保设备就绪
-                torch_npu.npu.synchronize()
-                
-                # 记录开始时间
-                start_event.record()
-                
-                # 执行所有预准备的函数
-                for func in test_functions:
-                    func()
-                
-                # 确保所有NPU操作完成
-                torch_npu.npu.synchronize()
-                
-                # 记录结束时间
-                end_event.record()
-                
-                # 等待结束事件完成并计算总时间
-                end_event.synchronize()
-                total_time = start_event.elapsed_time(end_event)  # 毫秒
+                with torch_npu.npu.device(device):
+                    start_event = torch_npu.npu.Event(enable_timing=True)
+                    end_event = torch_npu.npu.Event(enable_timing=True)
+
+                    # 初始同步确保目标设备就绪
+                    torch_npu.npu.synchronize()
+
+                    # 记录开始时间
+                    start_event.record()
+
+                    # 执行所有预准备的函数
+                    with torch.inference_mode():
+                        for func in test_functions:
+                            func()
+
+                    # 记录结束时间
+                    end_event.record()
+
+                    # 等待结束事件完成并计算总时间
+                    end_event.synchronize()
+                    total_time = start_event.elapsed_time(end_event)  # 毫秒
                 
                 # 计算平均时间
                 avg_time = total_time / num_iterations
@@ -418,28 +517,28 @@ class OperatorTestFramework:
                     
             elif "cuda" in device:
                 # CUDA事件计时 - 使用预准备函数列表
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                
-                # 初始同步确保设备就绪
-                torch.cuda.synchronize()
-                
-                # 记录开始时间
-                start_event.record()
-                
-                # 执行所有预准备的函数
-                for func in test_functions:
-                    func()
-                
-                # 确保所有CUDA操作完成
-                torch.cuda.synchronize()
-                
-                # 记录结束时间
-                end_event.record()
-                
-                # 等待结束事件完成并计算总时间
-                end_event.synchronize()
-                total_time = start_event.elapsed_time(end_event)  # 毫秒
+                cuda_device = torch.device(device)
+                with torch.cuda.device(cuda_device):
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+
+                    # 初始同步确保目标设备就绪
+                    torch.cuda.synchronize(cuda_device)
+
+                    # 记录开始时间
+                    start_event.record()
+
+                    # 执行所有预准备的函数
+                    with torch.inference_mode():
+                        for func in test_functions:
+                            func()
+
+                    # 记录结束时间
+                    end_event.record()
+
+                    # 等待结束事件完成并计算总时间
+                    end_event.synchronize()
+                    total_time = start_event.elapsed_time(end_event)  # 毫秒
                 
                 # 计算平均时间
                 avg_time = total_time / num_iterations
@@ -453,8 +552,9 @@ class OperatorTestFramework:
                 start_time = time_module.perf_counter()
                 
                 # 执行所有预准备的函数
-                for func in test_functions:
-                    func()
+                with torch.inference_mode():
+                    for func in test_functions:
+                        func()
                 
                 # 记录结束时间
                 end_time = time_module.perf_counter()
@@ -771,84 +871,211 @@ class OperatorTestFramework:
         precision: PrecisionType,
         implementation: str = "default",
         num_warmup: int = 10,
-        num_iterations: int = 20
+        num_iterations: int = 20,
+        num_repeats: int = 1,
+        retain_outputs: bool = True,
+        verify_independent_storage: bool = False,
     ) -> PerformanceMetrics:
-        """运行核心算子性能测试 V2版本（预先准备所有数据，避免数据准备开销）
-        
-        这个版本会预先准备 num_warmup + num_iterations 份数据，
-        确保性能测试时不会有任何数据准备的开销，获得更准确的算子性能数据。
-        
-        Args:
-            operator_test: 算子测试实例
-            data: 原始测试数据
-            device: 设备类型
-            precision: 精度类型
-            implementation: 实现方式
-            num_warmup: 预热次数
-            num_iterations: 测试迭代次数
-            
-        Returns:
-            PerformanceMetrics: 性能指标
+        """Measure the core operator with preallocated fresh storage.
+
+        Every repeat independently prepares ``num_warmup + num_iterations``
+        payloads. The reported latency is the median of repeat event means.
         """
-        
-        print(f"  核心算子性能测试 V2: {device} - {precision.name} - {implementation}")
-        
-        # 检查算子是否支持分离的核心算子测试
-        if not hasattr(operator_test, '_prepare_data_for_core_operator') or \
-           not hasattr(operator_test, '_execute_core_operator'):
-            print(f"    ⚠️  算子不支持分离的核心算子测试，使用完整方法")
+        if num_warmup < 0:
+            raise ValueError("num_warmup must be >= 0")
+        if num_iterations <= 0:
+            raise ValueError("num_iterations must be > 0")
+        if num_repeats <= 0:
+            raise ValueError("num_repeats must be > 0")
+
+        print(
+            f"  核心算子性能测试 V2: {device} - {precision.name} - "
+            f"{implementation} - W{num_warmup}/I{num_iterations}/"
+            f"R{num_repeats}"
+        )
+
+        has_prepare = hasattr(
+            operator_test, "_prepare_data_for_core_operator"
+        )
+        has_execute = hasattr(operator_test, "_execute_core_operator")
+        if not has_prepare or not has_execute:
+            if num_repeats != 1 or verify_independent_storage:
+                raise RuntimeError(
+                    "strict Framework V2 requires "
+                    "_prepare_data_for_core_operator and "
+                    "_execute_core_operator"
+                )
+            print("    ⚠️  算子不支持分离的核心算子测试，使用完整方法")
             return self.run_performance_test(
-                operator_test, data, device, precision, implementation, num_warmup, num_iterations
+                operator_test,
+                data,
+                device,
+                precision,
+                implementation,
+                num_warmup,
+                num_iterations,
             )
-        
-        total_runs = num_warmup + num_iterations
-        
-        # 预先准备所有数据（不计入性能测试时间）
-        print(f"    📋 预先准备所有测试数据 ({total_runs} 份)...")
-        prepared_data_list = []
-        
-        for i in range(total_runs):
-            # 为每次运行准备独立的数据副本，避免缓存效应
-            prepared_data = operator_test._prepare_data_for_core_operator(data, device, precision, implementation)
-            prepared_data_list.append(prepared_data)
-            
-            # 每准备10份数据显示一次进度
-            if (i + 1) % 10 == 0 or i == 0:
-                print(f"      进度: {i + 1}/{total_runs}")
-        
-        print(f"    ✅ 数据准备完成，共 {total_runs} 份")
-        
-        # 使用预热数据进行算子预热
-        print(f"    🔥 算子预热 ({num_warmup} 次)...")
-        for i in range(num_warmup):
-            _ = operator_test._execute_core_operator(prepared_data_list[i], implementation)
-            if i == 0:  # 第一次预热后同步一次
+
+        invocations_per_repeat = num_warmup + num_iterations
+        repeat_samples_ms: List[float] = []
+        input_set_counts: List[int] = []
+        input_ptr_counts: List[int] = []
+        output_set_counts: List[int] = []
+        output_ptr_counts: List[int] = []
+        output_alias_counts: List[int] = []
+
+        for repeat_index in range(num_repeats):
+            print(
+                f"    🔁 repeat {repeat_index + 1}/{num_repeats}: "
+                f"预分配 {invocations_per_repeat} 份"
+            )
+            prepared_data_list: List[Any] = []
+            retained_outputs: List[Any] = []
+            test_functions: List[Callable] = []
+
+            try:
+                with torch.inference_mode():
+                    for invocation_index in range(invocations_per_repeat):
+                        prepared_data_list.append(
+                            operator_test._prepare_data_for_core_operator(
+                                data,
+                                device,
+                                precision,
+                                implementation,
+                            )
+                        )
+                        if (
+                            (invocation_index + 1) % 10 == 0
+                            or invocation_index == 0
+                        ):
+                            print(
+                                "      预分配进度: "
+                                f"{invocation_index + 1}/"
+                                f"{invocations_per_repeat}"
+                            )
+
+                verified_input_sets = 0
+                verified_input_ptrs = 0
+                if verify_independent_storage:
+                    (
+                        verified_input_sets,
+                        verified_input_ptrs,
+                    ) = self._verify_independent_storage_sets(
+                        prepared_data_list,
+                        device,
+                        "V2 prepared input sets",
+                    )
+                input_set_counts.append(verified_input_sets)
+                input_ptr_counts.append(verified_input_ptrs)
+
                 if "npu" in device:
-                    torch_npu.npu.synchronize()
+                    device_context = torch_npu.npu.device(device)
                 elif "cuda" in device:
-                    torch.cuda.synchronize()
-        
-        # 最终同步，确保预热完成
-        if "npu" in device:
-            torch_npu.npu.synchronize()
-        elif "cuda" in device:
-            torch.cuda.synchronize()
-        
-        print(f"    ⏱️  开始性能测试 ({num_iterations} 次)...")
-        
-        # 性能测试 - 使用预先准备的数据
-        test_data_list = prepared_data_list[num_warmup:]  # 使用预热后的数据进行测试
-        
-        # 创建测试函数列表
-        test_functions = []
-        for i in range(num_iterations):
-            test_data = test_data_list[i]
-            test_functions.append(lambda data=test_data: operator_test._execute_core_operator(data, implementation))
-        
-        # 使用设备事件计时，测试纯算子执行时间
-        avg_time = self._measure_execution_time_v2(test_functions, device)
-        
-        print(f"    ✅ 核心算子平均时间: {avg_time:.3f}ms (V2版本 - 无数据准备开销)")
+                    device_context = torch.cuda.device(torch.device(device))
+                else:
+                    device_context = nullcontext()
+
+                context_factory = getattr(
+                    operator_test,
+                    "_core_operator_benchmark_context",
+                    None,
+                )
+                provider_context = (
+                    context_factory(device, precision, implementation)
+                    if context_factory is not None
+                    else nullcontext()
+                )
+
+                for prepared_data in prepared_data_list[num_warmup:]:
+
+                    def run_and_retain(payload=prepared_data):
+                        output = operator_test._execute_core_operator(
+                            payload,
+                            implementation,
+                        )
+                        if retain_outputs:
+                            retained_outputs.append(output)
+                        return output
+
+                    test_functions.append(run_and_retain)
+
+                with device_context, provider_context, torch.inference_mode():
+                    for warmup_index in range(num_warmup):
+                        output = operator_test._execute_core_operator(
+                            prepared_data_list[warmup_index],
+                            implementation,
+                        )
+                        if retain_outputs:
+                            retained_outputs.append(output)
+
+                    if "npu" in device:
+                        torch_npu.npu.synchronize()
+                    elif "cuda" in device:
+                        torch.cuda.synchronize(torch.device(device))
+
+                    repeat_time_ms = self._measure_execution_time_v2(
+                        test_functions,
+                        device,
+                    )
+                    if (
+                        not math.isfinite(repeat_time_ms)
+                        or repeat_time_ms <= 0
+                    ):
+                        raise RuntimeError(
+                            f"invalid repeat latency: {repeat_time_ms} ms"
+                        )
+                repeat_samples_ms.append(float(repeat_time_ms))
+
+                verified_output_sets = 0
+                verified_output_ptrs = 0
+                if verify_independent_storage and retain_outputs:
+                    (
+                        verified_output_sets,
+                        verified_output_ptrs,
+                    ) = self._verify_independent_storage_sets(
+                        retained_outputs,
+                        device,
+                        "V2 retained output sets",
+                    )
+                output_set_counts.append(verified_output_sets)
+                output_ptr_counts.append(verified_output_ptrs)
+
+                verified_output_aliases = 0
+                if retain_outputs and hasattr(
+                    operator_test, "_verify_preallocated_output_aliases"
+                ):
+                    verified_output_aliases = (
+                        operator_test._verify_preallocated_output_aliases(
+                            prepared_data_list,
+                            retained_outputs,
+                            implementation,
+                        )
+                    )
+                output_alias_counts.append(verified_output_aliases)
+            finally:
+                test_functions.clear()
+                retained_outputs.clear()
+                prepared_data_list.clear()
+                output = None
+                prepared_data = None
+                run_and_retain = None
+                provider_context = None
+                gc.collect()
+                try:
+                    if "npu" in device:
+                        with torch_npu.npu.device(device):
+                            torch_npu.npu.empty_cache()
+                    elif "cuda" in device:
+                        with torch.cuda.device(torch.device(device)):
+                            torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        avg_time = float(statistics.median(repeat_samples_ms))
+        print(
+            f"    ✅ 核心算子中位延迟: {avg_time:.3f}ms; "
+            f"repeat means={repeat_samples_ms}"
+        )
         
         # 计算吞吐量
         throughput = operator_test.calculate_throughput(data, avg_time)
@@ -877,13 +1104,12 @@ class OperatorTestFramework:
                 print(f"警告: 计算带宽时出错: {e}")
                 pass
         
-        # 清理NPU内存，防止内存泄漏
-        try:
-            if "npu" in device:
-                torch_npu.npu.empty_cache()
-        except Exception:
-            pass  # 忽略清理错误
-        
+        input_sets_verified = min(input_set_counts)
+        input_ptr_count = min(input_ptr_counts)
+        output_sets_verified = min(output_set_counts)
+        output_ptr_count = min(output_ptr_counts)
+        output_aliases_verified = min(output_alias_counts)
+
         return PerformanceMetrics(
             avg_time_ms=avg_time,
             throughput=throughput,
@@ -893,7 +1119,39 @@ class OperatorTestFramework:
             iterations=num_iterations,
             throughput_ops_per_sec=throughput,
             tops=tops,
-            bandwidth_gb_s=bandwidth_gb_s
+            bandwidth_gb_s=bandwidth_gb_s,
+            framework_api=(
+                "OperatorTestFramework.run_core_operator_performance_test_v2"
+            ),
+            warmup_iterations=num_warmup,
+            preallocated_input_sets=invocations_per_repeat,
+            independent_storage_sets_verified=input_sets_verified,
+            independent_output_storage_sets_verified=(
+                output_sets_verified
+            ),
+            preallocated_output_aliases_verified=(
+                output_aliases_verified
+            ),
+            output_storage_policy=(
+                "retained_until_repeat_end"
+                if retain_outputs else "not_retained"
+            ),
+            protocol_version="operator-test-framework-v2-fresh-v1",
+            repeats=num_repeats,
+            repeat_samples_ms=repeat_samples_ms,
+            aggregation=(
+                "median_of_repeat_means"
+                if num_repeats > 1 else "single_repeat_mean"
+            ),
+            preallocated_invocations_per_repeat=invocations_per_repeat,
+            input_storage_sets_verified=input_sets_verified,
+            input_storage_ptr_count=input_ptr_count,
+            output_storage_sets_verified=output_sets_verified,
+            output_storage_ptr_count=output_ptr_count,
+            input_reuse_within_repeat=False,
+            timed_region=(
+                "_execute_core_operator only; prepare excluded"
+            ),
         )
     
     

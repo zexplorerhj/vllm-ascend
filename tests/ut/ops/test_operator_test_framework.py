@@ -736,7 +736,7 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "framework_api": (
             "OperatorTestFramework.run_core_operator_performance_test_v2"
         ),
-        "protocol_version": "operator-test-framework-v2-fresh-v5",
+        "protocol_version": "operator-test-framework-v2-fresh-v6",
         "warmup": 1,
         "iterations": 2,
         "repeats": 2,

@@ -41,7 +41,7 @@ PROVENANCE = {
     "framework_api": (
         "OperatorTestFramework.run_core_operator_performance_test_v2"
     ),
-    "protocol_version": "operator-test-framework-v2-fresh-v5",
+    "protocol_version": "operator-test-framework-v2-fresh-v6",
     "warmup": 1,
     "iterations": 2,
     "repeats": 3,
@@ -572,7 +572,7 @@ def test_paged_attention_two_matrices_make_one_v2_call_per_point(
 
     assert len(framework.calls) == 2
     for call in framework.calls:
-        _assert_formal_call(call, 5, 30, 3, "cuda_flashinfer_fa2")
+        _assert_formal_call(call, 5, 64, 3, "cuda_flashinfer_fa2")
         assert call["data"]["block_size"] == 128
         assert call["data"]["num_heads"] == 8
         assert call["data"]["num_kv_heads"] == 1

@@ -123,7 +123,7 @@ before timing; explicitly designated outputs are audited separately.  The CSV
 reports the median of the measured repeat Event means and retains every
 repeat sample.
 
-Protocol `operator-test-framework-v2-fresh-v5` first runs two complete
+Protocol `operator-test-framework-v2-fresh-v6` first runs two complete
 fresh-storage stabilization repeats, excluded from aggregation, then runs
 five measured repeats by default.  Every stabilization and measured repeat
 independently prepares `W+I` payloads and never reuses an address within that
@@ -152,7 +152,7 @@ The selected count is
 zero before the outer maximum.  The cap is 8192 for Add and 2048 for Linear,
 RMSNorm, and recurrent GDN.  Four GiB is a *soft target*: historical base
 iterations are never reduced, so large shapes can exceed it.  PagedAttention
-uses fixed `W5/I30`; GroupGemm uses fixed `W10/I30`.  CSV rows record the
+uses fixed `W5/I64`; GroupGemm uses fixed `W10/I30`.  CSV rows record the
 requested/base/effective counts, canonical byte estimate, target, estimated
 repeat footprint, overflow flag, and actual Event-window samples.  This is
 stability-depth adaptation; it does not reuse addresses.

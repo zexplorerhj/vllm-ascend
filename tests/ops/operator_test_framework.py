@@ -2032,7 +2032,7 @@ class OperatorTestFramework:
                 "retained_until_repeat_end"
                 if retain_outputs else "not_retained"
             ),
-            protocol_version="operator-test-framework-v2-fresh-v5",
+            protocol_version="operator-test-framework-v2-fresh-v6",
             repeats=num_repeats,
             stabilization_repeats=num_stabilization_repeats,
             stabilization_repeat_samples_ms=(

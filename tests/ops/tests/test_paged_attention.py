@@ -234,7 +234,7 @@ class PagedAttentionTestSuite(BaseTestSuite):
         batch_step: int = 1,
         batch_curve_seq_lens: List[int] = None,
         num_warmup: int = 5,
-        num_iterations: int = 30,
+        num_iterations: int = 64,
         repeats: int = 3,
         num_blocks: int = 10000,
         block_size: int = 128,
@@ -869,7 +869,7 @@ def main():
     )
     parser.add_argument(
         "--iterations", "--num-iterations", dest="num_iterations",
-        type=int, default=30,
+        type=int, default=64,
     )
     parser.add_argument(
         "--repeats",

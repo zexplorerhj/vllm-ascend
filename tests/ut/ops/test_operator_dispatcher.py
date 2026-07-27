@@ -17,6 +17,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 OPS_ROOT = Path(__file__).resolve().parents[2] / "ops"
 DISPATCHER = OPS_ROOT / "run_tests.sh"
@@ -174,6 +176,123 @@ def test_formal_dispatcher_rejects_invalid_shard_without_running_python(
     assert completed.returncode != 0
     assert "shard" in completed.stderr.lower()
     assert "DRY-RUN:" not in completed.stdout
+
+
+def test_formal_dispatcher_unsets_task_queue_by_default(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"${TASK_QUEUE_ENABLE-unset}\" > \"$TQ_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    task_queue_log = tmp_path / "task-queue.log"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+    environment["TQ_LOG"] = str(task_queue_log)
+
+    subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "add",
+            "--device",
+            "npu:0",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--quick",
+        ],
+        check=True,
+        cwd=OPS_ROOT,
+        env=environment,
+    )
+
+    assert task_queue_log.read_text(encoding="utf-8").strip() == "unset"
+
+
+def test_formal_dispatcher_can_explicitly_unset_task_queue(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"${TASK_QUEUE_ENABLE-unset}\" > \"$TQ_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    task_queue_log = tmp_path / "task-queue.log"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+    environment["TQ_LOG"] = str(task_queue_log)
+    environment["TASK_QUEUE_ENABLE"] = "1"
+
+    subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "add",
+            "--device",
+            "npu:0",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--task-queue",
+            "unset",
+            "--quick",
+        ],
+        check=True,
+        cwd=OPS_ROOT,
+        env=environment,
+    )
+
+    assert task_queue_log.read_text(encoding="utf-8").strip() == "unset"
+
+
+@pytest.mark.parametrize("task_queue", ["0", "1", "2"])
+def test_formal_dispatcher_forwards_explicit_task_queue(
+    tmp_path,
+    task_queue,
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"${TASK_QUEUE_ENABLE-unset}\" > \"$TQ_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    task_queue_log = tmp_path / "task-queue.log"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+    environment["TQ_LOG"] = str(task_queue_log)
+
+    subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "add",
+            "--device",
+            "npu:0",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--task-queue",
+            task_queue,
+            "--quick",
+        ],
+        check=True,
+        cwd=OPS_ROOT,
+        env=environment,
+    )
+
+    assert task_queue_log.read_text(encoding="utf-8").strip() == task_queue
 
 
 def test_formal_all_continues_after_independent_entry_failure(tmp_path):

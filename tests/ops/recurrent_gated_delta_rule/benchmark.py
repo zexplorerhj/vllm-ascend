@@ -20,9 +20,11 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from operator_test_framework import (  # noqa: E402
+    FRESH_ITERATION_PLAN_FIELDS,
     PERFORMANCE_PROVENANCE_FIELDS,
     OperatorTestFramework,
     PrecisionType,
+    build_fresh_iteration_plan,
     build_curve_selection_provenance,
     finalize_curve_coverage,
 )
@@ -36,6 +38,7 @@ from recurrent_gated_delta_rule.base import (  # noqa: E402
 
 
 DEFAULT_BATCHES = (1, 4, 8, 16, 32, 64, 128)
+RECURRENT_BASE_ITERATIONS = 20
 CSV_FIELDS = (
     "operator",
     "hardware",
@@ -54,6 +57,7 @@ CSV_FIELDS = (
     "g_dtype",
     "time_ms",
     "recurrent_tokens_per_second",
+    *FRESH_ITERATION_PLAN_FIELDS,
     *PERFORMANCE_PROVENANCE_FIELDS,
     # Historical aliases retained for existing CSV consumers.
     "independent_storage_sets_verified",
@@ -81,6 +85,21 @@ CSV_FIELDS = (
     "selection_covers_full_formal_matrix",
     "coverage_complete",
 )
+
+
+def canonical_recurrent_bytes_per_invocation(
+    mode: str,
+    batch_size: int,
+) -> int:
+    """Cross-provider peak-retained bytes for one recurrent invocation."""
+    tokens_per_sequence = TOKEN_COUNTS[mode]
+    total_tokens = batch_size * tokens_per_sequence
+    return (
+        534_628 * total_tokens
+        + 524_288
+        + 4 * (batch_size + 1)
+        + (4 * batch_size if tokens_per_sequence > 1 else 0)
+    )
 
 
 def parse_csv_strings(value: str) -> list[str]:
@@ -184,7 +203,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--modes", type=parse_csv_strings, default=["decode", "mtp3"])
     parser.add_argument("--batches", type=parse_csv_ints, default=list(DEFAULT_BATCHES))
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help=(
+            "fixed measured iterations; omitted selects deterministic "
+            "fresh-storage adaptive iterations"
+        ),
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
@@ -197,8 +224,15 @@ def main(argv: list[str] | None = None) -> int:
     unknown_modes = sorted(set(args.modes).difference(TOKEN_COUNTS))
     if unknown_modes:
         raise ValueError(f"unsupported modes: {unknown_modes}")
-    if args.warmup < 0 or args.iterations <= 0 or args.repeats <= 0:
-        raise ValueError("warmup >= 0 and iterations/repeats > 0 are required")
+    if (
+        args.warmup < 0
+        or (args.iterations is not None and args.iterations <= 0)
+        or args.repeats <= 0
+    ):
+        raise ValueError(
+            "warmup >= 0, optional iterations > 0, and repeats > 0 "
+            "are required"
+        )
     if not (0 <= args.shard_index < args.num_shards):
         raise ValueError("shard index must satisfy 0 <= index < num_shards")
 
@@ -217,7 +251,14 @@ def main(argv: list[str] | None = None) -> int:
     env = environment(device, device_name, provider)
     env["protocol"] = {
         "warmup": args.warmup,
-        "iterations": args.iterations,
+        "requested_iterations": (
+            args.iterations if args.iterations is not None else "auto"
+        ),
+        "base_iterations": RECURRENT_BASE_ITERATIONS,
+        "iteration_selection": (
+            "deterministic cross-provider fresh-storage adaptive"
+            if args.iterations is None else "explicit fixed"
+        ),
         "repeats": args.repeats,
         "preallocation": "framework V2 prepares W+I independent data/state sets",
         "repeat_aggregation": "median of R framework-V2 averages",
@@ -338,6 +379,20 @@ def main(argv: list[str] | None = None) -> int:
     for point_index, mode, batch_size in selected_points:
         tokens_per_sequence = TOKEN_COUNTS[mode]
         total_tokens = batch_size * tokens_per_sequence
+        iteration_plan = build_fresh_iteration_plan(
+            num_warmup=args.warmup,
+            requested_iterations=args.iterations,
+            base_iterations=RECURRENT_BASE_ITERATIONS,
+            estimated_unique_bytes_per_invocation=(
+                canonical_recurrent_bytes_per_invocation(
+                    mode,
+                    batch_size,
+                )
+            ),
+        )
+        effective_iterations = int(
+            iteration_plan["effective_iterations"]
+        )
         check = checks.get(mode, {})
         row: dict[str, Any] = {
             "operator": operator.operator_name,
@@ -356,8 +411,9 @@ def main(argv: list[str] | None = None) -> int:
             "value_beta_state_dtype": "BF16",
             "g_dtype": "FP32",
             "warmup": args.warmup,
-            "iterations": args.iterations,
+            "iterations": effective_iterations,
             "repeats": args.repeats,
+            **iteration_plan,
             "seed": "",
             "correctness_cosine": check.get("cosine", ""),
             "correctness_max_abs": check.get("max_abs", ""),
@@ -392,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
                 precision=PrecisionType.BF16,
                 implementation=provider,
                 num_warmup=args.warmup,
-                num_iterations=args.iterations,
+                num_iterations=effective_iterations,
                 num_repeats=args.repeats,
                 retain_outputs=True,
                 verify_independent_storage=True,

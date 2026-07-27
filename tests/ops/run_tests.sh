@@ -12,13 +12,12 @@ export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 # 算子测试框架运行脚本
 
-export TASK_QUEUE_ENABLE=2
-
 formal_usage() {
     cat >&2 <<'EOF'
 Usage:
   run_tests.sh --formal --operator OP --device DEVICE --output-dir DIR
       [--warmup W] [--iterations I] [--repeats R]
+      [--task-queue unset|0|1|2]
       [--shard-index N] [--num-shards M] [--quick] [--dry-run]
 
 OP: add | linear | rmsnorm | flashattention | groupgemm |
@@ -167,6 +166,7 @@ if [ "$#" -gt 0 ]; then
     formal_warmup=""
     formal_iterations=""
     formal_repeats=""
+    formal_task_queue=unset
     formal_shard_index=0
     formal_num_shards=1
     formal_quick=0
@@ -174,7 +174,7 @@ if [ "$#" -gt 0 ]; then
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --operator|--device|--output-dir|--warmup|--iterations|--repeats|--shard-index|--num-shards)
+            --operator|--device|--output-dir|--warmup|--iterations|--repeats|--task-queue|--shard-index|--num-shards)
                 [ "$#" -ge 2 ] || formal_error "$1 缺少值"
                 case "$1" in
                     --operator) formal_operator=$2 ;;
@@ -183,6 +183,7 @@ if [ "$#" -gt 0 ]; then
                     --warmup) formal_warmup=$2 ;;
                     --iterations) formal_iterations=$2 ;;
                     --repeats) formal_repeats=$2 ;;
+                    --task-queue) formal_task_queue=$2 ;;
                     --shard-index) formal_shard_index=$2 ;;
                     --num-shards) formal_num_shards=$2 ;;
                 esac
@@ -244,6 +245,17 @@ if [ "$#" -gt 0 ]; then
             esac
         fi
     done
+    case "$formal_task_queue" in
+        unset)
+            unset TASK_QUEUE_ENABLE
+            ;;
+        0|1|2)
+            export TASK_QUEUE_ENABLE=$formal_task_queue
+            ;;
+        *)
+            formal_error "--task-queue 必须是 unset、0、1 或 2"
+            ;;
+    esac
 
     if ! command -v python3 &> /dev/null; then
         formal_error "未找到 python3"
@@ -264,6 +276,10 @@ if [ "$#" -gt 0 ]; then
     fi
     exit "$formal_status"
 fi
+
+# Preserve the historical interactive default while keeping the formal path
+# explicit and recorded in every NPU result row.
+export TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-2}
 
 echo "算子测试框架"
 echo "============"

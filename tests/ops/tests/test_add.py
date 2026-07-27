@@ -12,14 +12,18 @@ import torch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from tests.base_test_suite import BaseTestSuite
 from add.add_operator import AddOperatorTest
 from operator_test_framework import (
+    FRESH_ITERATION_PLAN_FIELDS,
     PERFORMANCE_PROVENANCE_FIELDS,
+    build_fresh_iteration_plan,
     build_curve_selection_provenance,
     finalize_curve_coverage,
 )
+
+ADD_BASE_ITERATIONS = 20
 
 
 class AddTestSuite(BaseTestSuite):
@@ -101,7 +105,7 @@ class AddTestSuite(BaseTestSuite):
         sizes=None,
         device: str = "auto",
         num_warmup: int = 5,
-        num_iterations: int = 20,
+        num_iterations: Optional[int] = None,
         num_repeats: int = 3,
         plot_results: bool = True,
         quick: bool = False,
@@ -182,12 +186,22 @@ class AddTestSuite(BaseTestSuite):
             "selection_covers_full_formal_matrix", "coverage_complete",
             "size", "provider",
             "device", "precision", "avg_time_ms", "bandwidth_gb_s",
-            "status", "error", *provenance_fields,
+            "status", "error", *FRESH_ITERATION_PLAN_FIELDS,
+            *provenance_fields,
         ]
         rows = []
         failures = []
 
         for point_index, size in indexed_sizes:
+            iteration_plan = build_fresh_iteration_plan(
+                num_warmup=num_warmup,
+                requested_iterations=num_iterations,
+                base_iterations=ADD_BASE_ITERATIONS,
+                estimated_unique_bytes_per_invocation=6 * size,
+            )
+            effective_iterations = int(
+                iteration_plan["effective_iterations"]
+            )
             row = {
                 "point_index": point_index,
                 "shard_index": shard_index,
@@ -202,8 +216,9 @@ class AddTestSuite(BaseTestSuite):
                 "status": "pending",
                 "error": "",
                 "warmup": num_warmup,
-                "iterations": num_iterations,
+                "iterations": effective_iterations,
                 "repeats": num_repeats,
+                **iteration_plan,
             }
             try:
                 test_data = self.operator_test.generate_test_data(
@@ -217,7 +232,7 @@ class AddTestSuite(BaseTestSuite):
                         precision=PrecisionType.BF16,
                         implementation=implementation,
                         num_warmup=num_warmup,
-                        num_iterations=num_iterations,
+                        num_iterations=effective_iterations,
                         num_repeats=num_repeats,
                         retain_outputs=True,
                         verify_independent_storage=True,
@@ -313,7 +328,15 @@ def main():
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help=(
+            "fixed measured iterations; omitted selects deterministic "
+            "fresh-storage adaptive iterations"
+        ),
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--sizes", type=int, nargs="+")
     parser.add_argument("--quick", action="store_true")

@@ -122,16 +122,42 @@ prepares `warmup + iterations` independent input-storage sets before timing;
 the CSV reports the median of the repeat event means and retains every repeat
 sample.
 
-Protocol `operator-test-framework-v2-fresh-v3` keeps Python output bookkeeping
-out of the event interval when an operator has an explicit preallocated
-`out=` buffer and declares a phase-invariant output contract.  All `W+I`
-prepared output-buffer addresses are checked for independence, and untimed
-warmup returns probe the declared alias contract; timed Python return objects
-are intentionally discarded and are not claimed as captured evidence.
-Providers without that contract retain every measured return until the repeat
-ends, and their CSV rows explicitly report that return retention occurs inside
-the timed dispatch interval.  Provider-internal workspace allocation remains
-`not_audited`.
+Protocol `operator-test-framework-v2-fresh-v4` dispatches the already prepared
+payloads with one direct Python loop.  It does not run an implicit clock-ramp
+kernel.  Device Event elapsed time still includes any stream-idle gap caused
+by Python/ATen launch dispatch, so the reported number is provider
+service-path latency, not a claim of profiler-isolated kernel duration.
+
+Add, Linear, and recurrent GDN use deterministic adaptive measured iterations
+when the iteration flag is omitted.  All devices use the same
+provider-independent byte formula for a shape:
+
+- Add BF16: `6 * elements`
+- square Linear FP16/BF16: `6 * size^2`
+- recurrent GDN:
+  `534628*T + 524288 + 4*(B+1) + (4*B for MTP3)`
+
+The selected count is
+`max(base_I, min(2048, floor(4 GiB / bytes_per_invocation) - W))`, clamped at
+zero before the outer maximum.  Four GiB is a *soft target*: historical base
+iterations are never reduced, so large shapes can exceed it.  CSV rows record
+the requested/base/effective counts, canonical byte estimate, target,
+estimated repeat footprint, overflow flag, and actual Event-window samples.
+This is stability-depth adaptation; it does not reuse addresses.
+
+When an operator has an explicit preallocated `out=` buffer and declares a
+phase-invariant output contract, all `W+I` output-buffer addresses are checked
+for independence and untimed warmup returns probe the alias contract.  Timed
+Python return objects are then discarded.  Providers without that contract
+retain every return in Event-external preallocated Python list slots until the
+repeat ends; their slot assignment remains part of timed dispatch.
+Provider-internal workspace allocation remains `not_audited`.
+
+Formal NPU runs unset `TASK_QUEUE_ENABLE` unless
+`--task-queue 0|1|2` is supplied.  The selected value is written to each NPU
+result row.  Device-specific tuned curves may choose a different explicit
+mode, but the plot must disclose it; A3/A5 queue modes must not be assumed
+equivalent.
 
 `--quick` only selects the first shape of each canonical sub-curve.  It does
 not change warmup, iteration, or repeat counts, and its rows can never claim

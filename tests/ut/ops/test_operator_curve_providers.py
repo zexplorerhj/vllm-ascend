@@ -64,7 +64,7 @@ import rmsnorm.rmsnorm_operator as rmsnorm_module  # noqa: E402
         (
             LinearOperatorTest,
             {"implementation": LinearOperatorTest.NPU_IMPLEMENTATION},
-            False,
+            True,
         ),
         (
             RMSNormOperatorTest,
@@ -159,7 +159,7 @@ def test_only_phase_invariant_out_providers_declare_direct_timing_contract(
         (
             LinearOperatorTest,
             ["cuda_torch_mm_out"],
-            ["npu_torch_linear"],
+            ["npu_torch_mm_out"],
         ),
         (
             RMSNormOperatorTest,
@@ -906,14 +906,18 @@ def test_add_formal_prepare_owns_fresh_inputs_and_output(monkeypatch):
     ) is first["output"]
 
 
-def test_linear_formal_correctness_uses_bias_free_mm_semantics(monkeypatch):
+@pytest.mark.parametrize("device", ["cuda:0", "npu:0"])
+def test_linear_formal_correctness_uses_bias_free_mm_out_semantics(
+    monkeypatch,
+    device,
+):
     operator = LinearOperatorTest()
     data = {
         "input": torch.arange(8, dtype=torch.float32).reshape(2, 4),
         "weight": torch.arange(12, dtype=torch.float32).reshape(3, 4),
         "bias": torch.full((3,), 1000.0),
     }
-    requested_devices = _fake_accelerator_tensor_to(monkeypatch, "cuda:0")
+    requested_devices = _fake_accelerator_tensor_to(monkeypatch, device)
     mm_calls = []
     original_empty = torch.empty
 
@@ -923,7 +927,7 @@ def test_linear_formal_correctness_uses_bias_free_mm_semantics(monkeypatch):
         return out
 
     def fake_empty(*args, **kwargs):
-        if kwargs.get("device") == "cuda:0":
+        if kwargs.get("device") == device:
             kwargs = {**kwargs, "device": "cpu"}
         return original_empty(*args, **kwargs)
 
@@ -931,13 +935,13 @@ def test_linear_formal_correctness_uses_bias_free_mm_semantics(monkeypatch):
     monkeypatch.setattr(torch, "empty", fake_empty)
     prepared = operator._prepare_data_for_core_operator(
         data,
-        "cuda:0",
+        device,
         SimpleNamespace(value=torch.float32),
         "default",
     )
     result = operator._execute_core_operator(prepared, "default")
 
-    assert requested_devices == ["cuda:0", "cuda:0"]
+    assert requested_devices == [device, device]
     assert len(mm_calls) == 1
     assert mm_calls[0][0] is prepared["input"]
     assert mm_calls[0][1] is prepared["weight_t"]

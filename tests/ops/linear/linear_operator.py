@@ -15,7 +15,7 @@ class LinearOperatorTest(BaseOperatorTest):
     """Linear算子测试实现"""
 
     CUDA_IMPLEMENTATION = "cuda_torch_mm_out"
-    NPU_IMPLEMENTATION = "npu_torch_linear"
+    NPU_IMPLEMENTATION = "npu_torch_mm_out"
     
     def __init__(self):
         super().__init__("Linear")
@@ -139,7 +139,10 @@ class LinearOperatorTest(BaseOperatorTest):
             'weight': weight,
             'implementation': implementation,
         }
-        if implementation == self.CUDA_IMPLEMENTATION:
+        if implementation in (
+            self.CUDA_IMPLEMENTATION,
+            self.NPU_IMPLEMENTATION,
+        ):
             prepared_data['weight_t'] = weight.t()
             prepared_data['output'] = torch.empty(
                 input_tensor.shape[0],
@@ -155,7 +158,10 @@ class LinearOperatorTest(BaseOperatorTest):
         implementation: str = "default",
     ) -> bool:
         impl = prepared_data.get("implementation", implementation)
-        return impl == self.CUDA_IMPLEMENTATION
+        return impl in (
+            self.CUDA_IMPLEMENTATION,
+            self.NPU_IMPLEMENTATION,
+        )
     
     def _execute_core_operator(
         self, 
@@ -172,17 +178,14 @@ class LinearOperatorTest(BaseOperatorTest):
             torch.Tensor: 计算结果
         """
         impl = prepared_data.get('implementation', implementation)
-        if impl == self.CUDA_IMPLEMENTATION:
+        if impl in (
+            self.CUDA_IMPLEMENTATION,
+            self.NPU_IMPLEMENTATION,
+        ):
             return torch.mm(
                 prepared_data['input'],
                 prepared_data['weight_t'],
                 out=prepared_data['output'],
-            )
-        if impl == self.NPU_IMPLEMENTATION:
-            return F.linear(
-                prepared_data['input'],
-                prepared_data['weight'],
-                None,
             )
         raise ValueError(f"不支持的 Linear 实现: {impl}")
     

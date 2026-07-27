@@ -38,11 +38,15 @@ PROVENANCE = {
     "framework_api": (
         "OperatorTestFramework.run_core_operator_performance_test_v2"
     ),
-    "protocol_version": "operator-test-framework-v2-fresh-v3",
+    "protocol_version": "operator-test-framework-v2-fresh-v4",
     "warmup": 1,
     "iterations": 2,
     "repeats": 3,
     "repeat_samples_ms": "[1.5, 1.0, 2.0]",
+    "event_window_samples_ms": "[3.0, 2.0, 4.0]",
+    "event_window_min_ms": 2.0,
+    "event_window_median_ms": 3.0,
+    "event_window_max_ms": 4.0,
     "repeat_min_ms": 1.0,
     "repeat_median_ms": 1.5,
     "repeat_max_ms": 2.0,
@@ -80,9 +84,14 @@ PROVENANCE = {
     "output_verification_replay_invocations_per_repeat": 0,
     "total_operator_calls_per_repeat": 3,
     "workspace_allocation_policy": "not_audited",
+    "dispatch_loop_policy": "python_direct_prepared_payload_loop",
+    "device_stabilization_policy": "none",
+    "device_stabilization_timed": False,
+    "task_queue_enable": "not_applicable",
     "timed_region": (
-        "_execute_core_operator calls only; prepare excluded; "
-        "timed Python returns discarded under declared out contract"
+        "Python direct prepared-payload loop of _execute_core_operator; "
+        "prepare excluded; timed Python returns discarded under declared "
+        "out contract"
     ),
 }
 
@@ -163,6 +172,43 @@ def _assert_success_rows(rows):
         assert row["status"] in ("ok", "success")
         for key, value in PROVENANCE.items():
             assert row[key] == value
+
+
+def _adaptive_provenance(framework):
+    call = framework.calls[-1]
+    warmup = call["num_warmup"]
+    iterations = call["num_iterations"]
+    repeats = call["num_repeats"]
+    repeat_samples = [1.5, 1.0, 2.0][:repeats]
+    provenance = dict(PROVENANCE)
+    provenance.update(
+        warmup=warmup,
+        iterations=iterations,
+        repeats=repeats,
+        repeat_samples_ms=str(repeat_samples),
+        event_window_samples_ms=str([
+            sample * iterations for sample in repeat_samples
+        ]),
+        event_window_min_ms=min(repeat_samples) * iterations,
+        event_window_median_ms=sorted(repeat_samples)[
+            len(repeat_samples) // 2
+        ] * iterations,
+        event_window_max_ms=max(repeat_samples) * iterations,
+        repeat_min_ms=min(repeat_samples),
+        repeat_median_ms=sorted(repeat_samples)[
+            len(repeat_samples) // 2
+        ],
+        repeat_max_ms=max(repeat_samples),
+        preallocated_invocations_per_repeat=warmup + iterations,
+        input_storage_sets_verified=warmup + iterations,
+        output_storage_sets_verified=warmup + iterations,
+        output_tensor_count=warmup + iterations,
+        preallocated_output_contract_invocations_per_repeat=(
+            warmup + iterations
+        ),
+        total_operator_calls_per_repeat=warmup + iterations,
+    )
+    return provenance
 
 
 def _assert_coverage(
@@ -255,6 +301,70 @@ def test_linear_formal_point_is_bias_free_and_uses_one_v2_call(
         selected=1,
         complete=False,
     )
+
+
+def test_add_auto_iterations_match_effective_csv_count(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _FakeFramework(tmp_path)
+    suite = AddTestSuite()
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["cuda_torch_add_out"])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        framework,
+        "performance_provenance",
+        lambda metrics: _adaptive_provenance(framework),
+    )
+
+    result = suite.run_bandwidth_test(
+        sizes=[4096],
+        device="cuda:0",
+        num_warmup=5,
+        num_iterations=None,
+        num_repeats=3,
+        plot_results=False,
+    )
+
+    row = result["rows"][0]
+    assert framework.calls[0]["num_iterations"] == 2048
+    assert row["iteration_selection_policy"] == (
+        "adaptive_unique_storage_soft_target"
+    )
+    assert row["iterations"] == row["effective_iterations"] == 2048
+    assert row["estimated_unique_bytes_per_invocation"] == 6 * 4096
+
+
+def test_linear_auto_iterations_preserve_large_shape_base(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _FakeFramework(tmp_path)
+    suite = LinearTestSuite(precision="bf16")
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["cuda_torch_mm_out"])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        framework,
+        "performance_provenance",
+        lambda metrics: _adaptive_provenance(framework),
+    )
+
+    result = suite.run_tflops_test(
+        sizes=[4096],
+        device="cuda:0",
+        num_warmup=10,
+        num_iterations=None,
+        num_repeats=3,
+        plot_results=False,
+    )
+
+    row = result["rows"][0]
+    assert framework.calls[0]["num_iterations"] == 50
+    assert row["iterations"] == row["effective_iterations"] == 50
+    assert row["fresh_storage_soft_target_overflow"] is True
+    assert row["estimated_unique_bytes_per_invocation"] == 6 * 4096**2
 
 
 def test_rmsnorm_each_formal_point_uses_one_v2_call(
@@ -507,6 +617,74 @@ def test_recurrent_point_uses_one_v2_call_and_framework_provenance(
     assert rows[0]["selection_covers_full_formal_matrix"] == "False"
     assert rows[0]["coverage_complete"] == "False"
     assert rows[0]["status"] == "ok"
+
+
+def test_recurrent_canonical_bytes_use_cross_provider_worst_case():
+    assert (
+        recurrent_benchmark.canonical_recurrent_bytes_per_invocation(
+            "decode",
+            1,
+        )
+        == 1_058_924
+    )
+    assert (
+        recurrent_benchmark.canonical_recurrent_bytes_per_invocation(
+            "mtp3",
+            128,
+        )
+        == 274_254_852
+    )
+
+
+def test_recurrent_auto_iterations_match_effective_csv_count(
+    monkeypatch,
+    tmp_path,
+):
+    output = tmp_path / "recurrent-auto.csv"
+    framework = _FakeFramework(tmp_path)
+    operator = _FakeOperator(["cuda_vllm_fla_direct_out"])
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "resolve_device",
+        lambda requested: ("cuda:0", "fake"),
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "RecurrentGatedDeltaRuleOperatorTest",
+        lambda: operator,
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "OperatorTestFramework",
+        lambda result_dir: framework,
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "environment",
+        lambda *args: {},
+    )
+    monkeypatch.setattr(
+        framework,
+        "performance_provenance",
+        lambda metrics: _adaptive_provenance(framework),
+    )
+
+    exit_code = recurrent_benchmark.main([
+        "--device", "cuda:0",
+        "--modes", "decode",
+        "--batches", "1",
+        "--warmup", "5",
+        "--repeats", "3",
+        "--output", str(output),
+        "--skip-correctness",
+    ])
+
+    assert exit_code == 0
+    assert framework.calls[0]["num_iterations"] == 2048
+    with output.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["iterations"] == row["effective_iterations"] == "2048"
+    assert row["estimated_unique_bytes_per_invocation"] == "1058924"
 
 
 @pytest.mark.parametrize("failure_kind", ["returned_failure", "exception"])

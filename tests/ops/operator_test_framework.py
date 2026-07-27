@@ -217,6 +217,10 @@ class PerformanceMetrics:
     output_verification_replay_invocations_per_repeat: int = 0
     total_operator_calls_per_repeat: int = 0
     workspace_allocation_policy: Optional[str] = None
+    dispatch_loop_policy: Optional[str] = None
+    device_stabilization_policy: Optional[str] = None
+    device_stabilization_timed: bool = False
+    task_queue_enable: Optional[str] = None
     timed_region: Optional[str] = None
     
     def __post_init__(self):
@@ -247,6 +251,10 @@ PERFORMANCE_PROVENANCE_FIELDS = (
     "iterations",
     "repeats",
     "repeat_samples_ms",
+    "event_window_samples_ms",
+    "event_window_min_ms",
+    "event_window_median_ms",
+    "event_window_max_ms",
     "repeat_min_ms",
     "repeat_median_ms",
     "repeat_max_ms",
@@ -275,8 +283,133 @@ PERFORMANCE_PROVENANCE_FIELDS = (
     "output_verification_replay_invocations_per_repeat",
     "total_operator_calls_per_repeat",
     "workspace_allocation_policy",
+    "dispatch_loop_policy",
+    "device_stabilization_policy",
+    "device_stabilization_timed",
+    "task_queue_enable",
     "timed_region",
 )
+
+FRESH_ITERATION_PLAN_FIELDS = (
+    "iteration_selection_policy",
+    "requested_iterations",
+    "base_iterations",
+    "effective_iterations",
+    "adaptive_capacity_iterations",
+    "adaptive_iterations_cap",
+    "estimated_unique_bytes_per_invocation",
+    "fresh_storage_soft_target_bytes",
+    "estimated_fresh_storage_bytes_per_repeat",
+    "fresh_storage_soft_target_overflow",
+)
+
+DEFAULT_FRESH_STORAGE_SOFT_TARGET_BYTES = 4 * 1024**3
+DEFAULT_ADAPTIVE_ITERATIONS_CAP = 2048
+
+
+def build_fresh_iteration_plan(
+    *,
+    num_warmup: int,
+    requested_iterations: Optional[int],
+    base_iterations: int,
+    estimated_unique_bytes_per_invocation: int,
+    fresh_storage_soft_target_bytes: int = (
+        DEFAULT_FRESH_STORAGE_SOFT_TARGET_BYTES
+    ),
+    adaptive_iterations_cap: int = DEFAULT_ADAPTIVE_ITERATIONS_CAP,
+) -> Dict[str, Any]:
+    """Choose one cross-provider fresh-address iteration count.
+
+    The storage target is deliberately soft: the historical base iteration
+    count is never reduced, even when that base footprint exceeds the target.
+    Callers must use a provider-independent peak-retained byte estimate so the
+    same shape receives the same iteration count on every device.
+    """
+    integer_arguments = {
+        "num_warmup": (num_warmup, 0),
+        "base_iterations": (base_iterations, 1),
+        "estimated_unique_bytes_per_invocation": (
+            estimated_unique_bytes_per_invocation,
+            1,
+        ),
+        "fresh_storage_soft_target_bytes": (
+            fresh_storage_soft_target_bytes,
+            1,
+        ),
+        "adaptive_iterations_cap": (adaptive_iterations_cap, 1),
+    }
+    for name, (value, minimum) in integer_arguments.items():
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be a non-bool int")
+        if value < minimum:
+            comparator = ">=" if minimum == 0 else ">"
+            threshold = minimum if minimum == 0 else minimum - 1
+            raise ValueError(f"{name} must be {comparator} {threshold}")
+    if adaptive_iterations_cap < base_iterations:
+        raise ValueError(
+            "adaptive_iterations_cap must be >= base_iterations"
+        )
+    if requested_iterations is not None:
+        if (
+            not isinstance(requested_iterations, int)
+            or isinstance(requested_iterations, bool)
+            or requested_iterations <= 0
+        ):
+            raise ValueError(
+                "requested_iterations must be None or a positive non-bool int"
+            )
+        effective_iterations = requested_iterations
+        selection_policy = "explicit_fixed"
+    else:
+        capacity_sets = (
+            fresh_storage_soft_target_bytes
+            // estimated_unique_bytes_per_invocation
+        )
+        adaptive_capacity_iterations = max(
+            0,
+            capacity_sets - num_warmup,
+        )
+        effective_iterations = max(
+            base_iterations,
+            min(
+                adaptive_iterations_cap,
+                adaptive_capacity_iterations,
+            ),
+        )
+        selection_policy = "adaptive_unique_storage_soft_target"
+
+    capacity_sets = (
+        fresh_storage_soft_target_bytes
+        // estimated_unique_bytes_per_invocation
+    )
+    adaptive_capacity_iterations = max(0, capacity_sets - num_warmup)
+    estimated_total_bytes = (
+        num_warmup + effective_iterations
+    ) * estimated_unique_bytes_per_invocation
+    return {
+        "iteration_selection_policy": selection_policy,
+        "requested_iterations": (
+            requested_iterations
+            if requested_iterations is not None
+            else "auto"
+        ),
+        "base_iterations": base_iterations,
+        "effective_iterations": effective_iterations,
+        "adaptive_capacity_iterations": adaptive_capacity_iterations,
+        "adaptive_iterations_cap": adaptive_iterations_cap,
+        "estimated_unique_bytes_per_invocation": (
+            estimated_unique_bytes_per_invocation
+        ),
+        "fresh_storage_soft_target_bytes": (
+            fresh_storage_soft_target_bytes
+        ),
+        "estimated_fresh_storage_bytes_per_repeat": (
+            estimated_total_bytes
+        ),
+        "fresh_storage_soft_target_overflow": (
+            estimated_total_bytes > fresh_storage_soft_target_bytes
+        ),
+    }
 
 
 def build_curve_selection_provenance(
@@ -603,6 +736,22 @@ class OperatorTestFramework:
             max(metrics.repeat_samples_ms)
             if metrics.repeat_samples_ms else None
         )
+        event_window_samples_ms = [
+            sample * metrics.iterations
+            for sample in metrics.repeat_samples_ms
+        ]
+        event_window_min_ms = (
+            min(event_window_samples_ms)
+            if event_window_samples_ms else None
+        )
+        event_window_median_ms = (
+            statistics.median(event_window_samples_ms)
+            if event_window_samples_ms else None
+        )
+        event_window_max_ms = (
+            max(event_window_samples_ms)
+            if event_window_samples_ms else None
+        )
         repeat_spread_pct = (
             (repeat_max_ms / repeat_min_ms - 1.0) * 100.0
             if repeat_min_ms is not None
@@ -633,6 +782,12 @@ class OperatorTestFramework:
             "iterations": metrics.iterations,
             "repeats": metrics.repeats,
             "repeat_samples_ms": json.dumps(metrics.repeat_samples_ms),
+            "event_window_samples_ms": json.dumps(
+                event_window_samples_ms
+            ),
+            "event_window_min_ms": event_window_min_ms,
+            "event_window_median_ms": event_window_median_ms,
+            "event_window_max_ms": event_window_max_ms,
             "repeat_min_ms": repeat_min_ms,
             "repeat_median_ms": repeat_median_ms,
             "repeat_max_ms": repeat_max_ms,
@@ -688,6 +843,14 @@ class OperatorTestFramework:
             "workspace_allocation_policy": (
                 metrics.workspace_allocation_policy
             ),
+            "dispatch_loop_policy": metrics.dispatch_loop_policy,
+            "device_stabilization_policy": (
+                metrics.device_stabilization_policy
+            ),
+            "device_stabilization_timed": (
+                metrics.device_stabilization_timed
+            ),
+            "task_queue_enable": metrics.task_queue_enable,
             "timed_region": metrics.timed_region,
         }
     
@@ -780,96 +943,87 @@ class OperatorTestFramework:
             print(f"    ❌ 计时过程中发生错误: {str(e)}")
             raise
     
-    def _measure_execution_time_v2(self, test_functions: List[Callable], device: str) -> float:
-        """测量执行时间 V2版本（使用预先准备的函数列表）
-        
-        Args:
-            test_functions: 预先准备的测试函数列表，每个函数对应一次迭代
-            device: 设备类型
-            
-        Returns:
-            float: 平均执行时间（毫秒）
-        """
-        num_iterations = len(test_functions)
-        
+    @staticmethod
+    def _dispatch_prepared_payloads(
+        prepared_payloads: List[Any],
+        execute_core_operator: Callable[[Any, str], Any],
+        implementation: str,
+        retained_outputs: Optional[List[Any]],
+    ) -> None:
+        """Launch prepared payloads without one Python closure per payload."""
+        if retained_outputs is None:
+            for payload in prepared_payloads:
+                execute_core_operator(payload, implementation)
+            return
+        output_slot_offset = (
+            len(retained_outputs) - len(prepared_payloads)
+        )
+        if output_slot_offset < 0:
+            raise RuntimeError(
+                "retained output slots must be preallocated before timing"
+            )
+        for output_index, payload in enumerate(prepared_payloads):
+            retained_outputs[output_slot_offset + output_index] = (
+                execute_core_operator(payload, implementation)
+            )
+
+    def _measure_execution_time_v2(
+        self,
+        prepared_payloads: List[Any],
+        execute_core_operator: Callable[[Any, str], Any],
+        implementation: str,
+        device: str,
+        retained_outputs: Optional[List[Any]] = None,
+    ) -> float:
+        """Measure one direct loop over already-prepared payloads."""
+        num_iterations = len(prepared_payloads)
+        if num_iterations <= 0:
+            raise ValueError("prepared_payloads must not be empty")
+
         try:
             if "npu" in device:
-                # NPU事件计时 - 使用预准备函数列表
                 with torch_npu.npu.device(device):
                     start_event = torch_npu.npu.Event(enable_timing=True)
                     end_event = torch_npu.npu.Event(enable_timing=True)
-
-                    # 初始同步确保目标设备就绪
                     torch_npu.npu.synchronize()
-
-                    # 记录开始时间
                     start_event.record()
-
-                    # 执行所有预准备的函数
-                    with torch.inference_mode():
-                        for func in test_functions:
-                            func()
-
-                    # 记录结束时间
+                    self._dispatch_prepared_payloads(
+                        prepared_payloads,
+                        execute_core_operator,
+                        implementation,
+                        retained_outputs,
+                    )
                     end_event.record()
-
-                    # 等待结束事件完成并计算总时间
                     end_event.synchronize()
-                    total_time = start_event.elapsed_time(end_event)  # 毫秒
-                
-                # 计算平均时间
-                avg_time = total_time / num_iterations
-                return avg_time
-                    
-            elif "cuda" in device:
-                # CUDA事件计时 - 使用预准备函数列表
+                    total_time = start_event.elapsed_time(end_event)
+                return total_time / num_iterations
+
+            if "cuda" in device:
                 cuda_device = torch.device(device)
                 with torch.cuda.device(cuda_device):
                     start_event = torch.cuda.Event(enable_timing=True)
                     end_event = torch.cuda.Event(enable_timing=True)
-
-                    # 初始同步确保目标设备就绪
                     torch.cuda.synchronize(cuda_device)
-
-                    # 记录开始时间
                     start_event.record()
-
-                    # 执行所有预准备的函数
-                    with torch.inference_mode():
-                        for func in test_functions:
-                            func()
-
-                    # 记录结束时间
+                    self._dispatch_prepared_payloads(
+                        prepared_payloads,
+                        execute_core_operator,
+                        implementation,
+                        retained_outputs,
+                    )
                     end_event.record()
-
-                    # 等待结束事件完成并计算总时间
                     end_event.synchronize()
-                    total_time = start_event.elapsed_time(end_event)  # 毫秒
-                
-                # 计算平均时间
-                avg_time = total_time / num_iterations
-                return avg_time
-                    
-            else:
-                # CPU计时 - 使用预准备函数列表
-                import time as time_module
-                
-                # 记录开始时间
-                start_time = time_module.perf_counter()
-                
-                # 执行所有预准备的函数
-                with torch.inference_mode():
-                    for func in test_functions:
-                        func()
-                
-                # 记录结束时间
-                end_time = time_module.perf_counter()
-                
-                # 计算总时间和平均时间
-                total_time = (end_time - start_time) * 1000  # 转换为毫秒
-                avg_time = total_time / num_iterations
-                return avg_time
-                        
+                    total_time = start_event.elapsed_time(end_event)
+                return total_time / num_iterations
+
+            start_time = time.perf_counter()
+            self._dispatch_prepared_payloads(
+                prepared_payloads,
+                execute_core_operator,
+                implementation,
+                retained_outputs,
+            )
+            return (time.perf_counter() - start_time) * 1000 / num_iterations
         except Exception as e:
             print(f"    ❌ V2计时过程中发生错误: {str(e)}")
             raise
@@ -1187,7 +1341,6 @@ class OperatorTestFramework:
         invocations_per_repeat = num_warmup + num_iterations
         prepared_data_list: List[Any] = []
         retained_outputs: List[Any] = []
-        test_functions: List[Callable] = []
         result: Optional[
             Tuple[
                 float, int, int, int, int, int, int, str, str, str
@@ -1195,8 +1348,7 @@ class OperatorTestFramework:
         ] = None
         prepared_data = None
         output = None
-        run_and_retain = None
-        run_without_retain = None
+        execute_core_operator = None
         provider_context = None
         device_context = None
         timed_output_capture_policy = "not_retained"
@@ -1323,32 +1475,10 @@ class OperatorTestFramework:
                     "warmup_and_measured_returns"
                 )
 
-            for prepared_data in prepared_data_list[num_warmup:]:
-                if direct_preallocated_timing:
-
-                    def run_without_retain(payload=prepared_data):
-                        return operator_test._execute_core_operator(
-                            payload,
-                            implementation,
-                        )
-
-                    test_functions.append(run_without_retain)
-                else:
-
-                    def run_and_retain(payload=prepared_data):
-                        output = operator_test._execute_core_operator(
-                            payload,
-                            implementation,
-                        )
-                        if retain_outputs:
-                            retained_outputs.append(output)
-                        return output
-
-                    test_functions.append(run_and_retain)
-
+            execute_core_operator = operator_test._execute_core_operator
             with device_context, provider_context, torch.inference_mode():
                 for warmup_index in range(num_warmup):
-                    output = operator_test._execute_core_operator(
+                    output = execute_core_operator(
                         prepared_data_list[warmup_index],
                         implementation,
                     )
@@ -1360,9 +1490,16 @@ class OperatorTestFramework:
                 elif "cuda" in device:
                     torch.cuda.synchronize(torch.device(device))
 
+                timed_retained_outputs = None
+                if not direct_preallocated_timing and retain_outputs:
+                    retained_outputs.extend([None] * num_iterations)
+                    timed_retained_outputs = retained_outputs
                 repeat_time_ms = self._measure_execution_time_v2(
-                    test_functions,
+                    prepared_data_list[num_warmup:],
+                    execute_core_operator,
+                    implementation,
                     device,
+                    timed_retained_outputs,
                 )
                 if (
                     not math.isfinite(repeat_time_ms)
@@ -1469,13 +1606,11 @@ class OperatorTestFramework:
                 output_alias_verification_scope,
             )
         finally:
-            test_functions.clear()
             retained_outputs.clear()
             prepared_data_list.clear()
             output = None
             prepared_data = None
-            run_and_retain = None
-            run_without_retain = None
+            execute_core_operator = None
             provider_context = None
             device_context = None
             gc.collect()
@@ -1710,7 +1845,7 @@ class OperatorTestFramework:
                 "retained_until_repeat_end"
                 if retain_outputs else "not_retained"
             ),
-            protocol_version="operator-test-framework-v2-fresh-v3",
+            protocol_version="operator-test-framework-v2-fresh-v4",
             repeats=num_repeats,
             repeat_samples_ms=repeat_samples_ms,
             aggregation=(
@@ -1754,22 +1889,35 @@ class OperatorTestFramework:
                 invocations_per_repeat
             ),
             workspace_allocation_policy="not_audited",
+            dispatch_loop_policy="python_direct_prepared_payload_loop",
+            device_stabilization_policy="none",
+            device_stabilization_timed=False,
+            task_queue_enable=(
+                os.environ.get("TASK_QUEUE_ENABLE", "unset")
+                if "npu" in device
+                else "not_applicable"
+            ),
             timed_region=(
                 (
-                    "_execute_core_operator calls only; prepare excluded; "
-                    "timed Python returns discarded under declared out contract"
+                    "Python direct prepared-payload loop of "
+                    "_execute_core_operator; prepare excluded; timed Python "
+                    "returns discarded under declared out contract"
                 )
                 if timed_output_capture_policy == (
                     "preallocated_output_contract_no_timed_return_capture"
                 )
                 else (
-                    "_execute_core_operator plus return retention; "
+                    "Python direct prepared-payload loop of "
+                    "_execute_core_operator plus return slot assignment; "
                     "prepare excluded"
                 )
                 if timed_output_capture_policy == (
                     "retained_return_inside_timed_region"
                 )
-                else "_execute_core_operator calls only; prepare excluded"
+                else (
+                    "Python direct prepared-payload loop of "
+                    "_execute_core_operator; prepare excluded"
+                )
             ),
         )
     

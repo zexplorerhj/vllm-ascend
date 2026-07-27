@@ -30,6 +30,7 @@ from operator_test_framework import (  # noqa: E402
     OperatorTestFramework,
     PrecisionType,
     build_curve_selection_provenance,
+    build_fresh_iteration_plan,
     finalize_curve_coverage,
 )
 
@@ -224,14 +225,90 @@ def _framework(tmp_path):
     return OperatorTestFramework(result_dir=str(tmp_path / "results"))
 
 
+def _execute_measurement_payloads(
+    payloads,
+    execute_core_operator,
+    implementation,
+    device,
+    retained_outputs=None,
+):
+    del device
+    OperatorTestFramework._dispatch_prepared_payloads(
+        payloads,
+        execute_core_operator,
+        implementation,
+        retained_outputs,
+    )
+
+
+def test_fresh_iteration_plan_uses_soft_target_without_lowering_base():
+    small = build_fresh_iteration_plan(
+        num_warmup=5,
+        requested_iterations=None,
+        base_iterations=20,
+        estimated_unique_bytes_per_invocation=6 * 4096,
+    )
+    assert small["effective_iterations"] == 2048
+    assert small["fresh_storage_soft_target_overflow"] is False
+
+    large = build_fresh_iteration_plan(
+        num_warmup=5,
+        requested_iterations=None,
+        base_iterations=20,
+        estimated_unique_bytes_per_invocation=6 * 2**27,
+    )
+    assert large["adaptive_capacity_iterations"] == 0
+    assert large["effective_iterations"] == 20
+    assert large["fresh_storage_soft_target_overflow"] is True
+    assert large["estimated_fresh_storage_bytes_per_repeat"] == (
+        25 * 6 * 2**27
+    )
+
+
+def test_fresh_iteration_plan_honors_explicit_count():
+    plan = build_fresh_iteration_plan(
+        num_warmup=5,
+        requested_iterations=7,
+        base_iterations=20,
+        estimated_unique_bytes_per_invocation=1024,
+    )
+    assert plan["iteration_selection_policy"] == "explicit_fixed"
+    assert plan["requested_iterations"] == 7
+    assert plan["effective_iterations"] == 7
+
+
+def test_dispatch_writes_preallocated_output_slots_without_growth():
+    retained_outputs = ["warmup", None, None]
+
+    OperatorTestFramework._dispatch_prepared_payloads(
+        [2, 3],
+        lambda value, implementation: value * 10,
+        "default",
+        retained_outputs,
+    )
+
+    assert retained_outputs == ["warmup", 20, 30]
+
+
 def test_v2_preallocates_each_repeat_and_uses_median(monkeypatch, tmp_path):
     framework = _framework(tmp_path)
     operator = _FreshCpuOperator()
     repeat_means = iter([3.0, 1.0, 2.0])
 
-    def measure(functions, device):
-        for function in functions:
-            function()
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
         return next(repeat_means)
 
     monkeypatch.setattr(
@@ -372,9 +449,20 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
     framework = _framework(tmp_path)
     operator = _FreshCpuOperator()
 
-    def measure(functions, device):
-        for function in functions:
-            function()
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
         return 0.25
 
     monkeypatch.setattr(
@@ -400,11 +488,15 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "framework_api": (
             "OperatorTestFramework.run_core_operator_performance_test_v2"
         ),
-        "protocol_version": "operator-test-framework-v2-fresh-v3",
+        "protocol_version": "operator-test-framework-v2-fresh-v4",
         "warmup": 1,
         "iterations": 2,
         "repeats": 2,
         "repeat_samples_ms": "[0.25, 0.25]",
+        "event_window_samples_ms": "[0.5, 0.5]",
+        "event_window_min_ms": 0.5,
+        "event_window_median_ms": 0.5,
+        "event_window_max_ms": 0.5,
         "repeat_min_ms": 0.25,
         "repeat_median_ms": 0.25,
         "repeat_max_ms": 0.25,
@@ -441,8 +533,14 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "output_verification_replay_invocations_per_repeat": 0,
         "total_operator_calls_per_repeat": 3,
         "workspace_allocation_policy": "not_audited",
+        "dispatch_loop_policy": "python_direct_prepared_payload_loop",
+        "device_stabilization_policy": "none",
+        "device_stabilization_timed": False,
+        "task_queue_enable": "not_applicable",
         "timed_region": (
-            "_execute_core_operator plus return retention; prepare excluded"
+            "Python direct prepared-payload loop of "
+            "_execute_core_operator plus return slot assignment; "
+            "prepare excluded"
         ),
     }
 
@@ -451,10 +549,21 @@ def test_v2_proves_preallocated_output_aliases(monkeypatch, tmp_path):
     framework = _framework(tmp_path)
     operator = _PreallocatedOutputOperator()
 
-    def measure(functions, device):
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
         assert operator.execute_calls == 1
-        for function in functions:
-            function()
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
         assert operator.execute_calls == 3
         return 0.25
 
@@ -499,8 +608,9 @@ def test_v2_proves_preallocated_output_aliases(monkeypatch, tmp_path):
     ] == 0
     assert provenance["total_operator_calls_per_repeat"] == 3
     assert provenance["timed_region"] == (
-        "_execute_core_operator calls only; prepare excluded; "
-        "timed Python returns discarded under declared out contract"
+        "Python direct prepared-payload loop of _execute_core_operator; "
+        "prepare excluded; timed Python returns discarded under declared "
+        "out contract"
     )
 
 
@@ -511,9 +621,20 @@ def test_v2_does_not_mislabel_in_place_input_as_preallocated_output(
     framework = _framework(tmp_path)
     operator = _InPlaceInputAliasOperator()
 
-    def measure(functions, device):
-        for function in functions:
-            function()
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
         return 0.25
 
     monkeypatch.setattr(
@@ -545,9 +666,20 @@ def test_v2_rejects_direct_path_when_prepared_output_is_ignored(
     framework = _framework(tmp_path)
     operator = _IgnoredPreallocatedOutputOperator()
 
-    def measure(functions, device):
-        for function in functions:
-            function()
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
         return 0.25
 
     monkeypatch.setattr(
@@ -578,9 +710,20 @@ def test_v2_reports_declared_contract_when_zero_warmup_disables_direct_path(
     framework = _framework(tmp_path)
     operator = _PreallocatedOutputOperator()
 
-    def measure(functions, device):
-        for function in functions:
-            function()
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
         return 0.25
 
     monkeypatch.setattr(
@@ -687,9 +830,20 @@ def test_v2_keeps_single_repeat_compatibility(monkeypatch, tmp_path):
     framework = _framework(tmp_path)
     operator = _FreshCpuOperator()
 
-    def measure(functions, device):
-        for function in functions:
-            function()
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
         return 0.5
 
     monkeypatch.setattr(

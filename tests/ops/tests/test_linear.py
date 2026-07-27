@@ -7,15 +7,20 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from tests.base_test_suite import BaseTestSuite
 from operator_test_framework import (
+    FRESH_ITERATION_PLAN_FIELDS,
     PERFORMANCE_PROVENANCE_FIELDS,
     PrecisionType,
+    build_fresh_iteration_plan,
     build_curve_selection_provenance,
     finalize_curve_coverage,
 )
 from linear.linear_operator import LinearOperatorTest
+
+LINEAR_BASE_ITERATIONS = 50
+
 
 class LinearTestSuite(BaseTestSuite):
     """Linear算子测试套件 - 基于torch.nn.functional.linear"""
@@ -250,7 +255,7 @@ class LinearTestSuite(BaseTestSuite):
         sizes=None,
         device="auto",
         num_warmup=10,
-        num_iterations=50,
+        num_iterations: Optional[int] = None,
         num_repeats=3,
         plot_results=True,
         quick=False,
@@ -349,11 +354,21 @@ class LinearTestSuite(BaseTestSuite):
             "M", "N", "K",
             "bias", "provider", "device", "precision", "avg_time_ms",
             "TFLOPS", "status", "error",
+            *FRESH_ITERATION_PLAN_FIELDS,
             *provenance_fields,
         ]
         rows = []
         failures = []
         for point_index, size in indexed_sizes:
+            iteration_plan = build_fresh_iteration_plan(
+                num_warmup=num_warmup,
+                requested_iterations=num_iterations,
+                base_iterations=LINEAR_BASE_ITERATIONS,
+                estimated_unique_bytes_per_invocation=6 * size * size,
+            )
+            effective_iterations = int(
+                iteration_plan["effective_iterations"]
+            )
             row = {
                 "point_index": point_index,
                 "shard_index": shard_index,
@@ -371,8 +386,9 @@ class LinearTestSuite(BaseTestSuite):
                 "status": "pending",
                 "error": "",
                 "warmup": num_warmup,
-                "iterations": num_iterations,
+                "iterations": effective_iterations,
                 "repeats": num_repeats,
+                **iteration_plan,
             }
             try:
                 test_data = self.operator_test.generate_test_data(
@@ -389,7 +405,7 @@ class LinearTestSuite(BaseTestSuite):
                         precision=precision_type,
                         implementation=implementation,
                         num_warmup=num_warmup,
-                        num_iterations=num_iterations,
+                        num_iterations=effective_iterations,
                         num_repeats=num_repeats,
                         retain_outputs=True,
                         verify_independent_storage=True,
@@ -486,7 +502,15 @@ def main():
     parser.add_argument('--tflops-step', type=int, default=128, help='TFLOPS测试步长')
     parser.add_argument('--tflops-sizes', type=int, nargs='+')
     parser.add_argument('--tflops-warmup', type=int, default=10)
-    parser.add_argument('--tflops-iterations', type=int, default=50)
+    parser.add_argument(
+        '--tflops-iterations',
+        type=int,
+        default=None,
+        help=(
+            'fixed measured iterations; omitted selects deterministic '
+            'fresh-storage adaptive iterations'
+        ),
+    )
     parser.add_argument('--tflops-repeats', type=int, default=3)
     parser.add_argument('--result-dir', default='test_results')
     parser.add_argument('--quick', action='store_true')

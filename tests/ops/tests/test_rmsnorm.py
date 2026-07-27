@@ -108,192 +108,216 @@ class RMSNormTestSuite(BaseTestSuite):
                             import traceback
                             traceback.print_exc()
 
-    def run_bandwidth_test(self):
-        """运行带宽测试并绘制曲线"""
-        try:
-            import matplotlib.pyplot as plt
-            import csv
-            import time
-        except ImportError:
-            print("❌ 未找到matplotlib，无法绘制曲线。请安装matplotlib: pip install matplotlib")
-            return
-
+    def run_bandwidth_test(
+        self,
+        *,
+        sizes=None,
+        hidden_sizes=None,
+        target_total_elements=64 * 1024 * 1024,
+        device="auto",
+        num_warmup=10,
+        num_iterations=50,
+        num_repeats=3,
+        plot_results=True,
+    ):
+        """Run both formal BF16 RMSNorm bandwidth matrices."""
+        import csv
+        import math
+        import time
         import torch
-        try:
-            import torch_npu
-        except ImportError:
-            pass
-        
-        from operator_test_framework import PrecisionType, DeviceType
+        from operator_test_framework import PrecisionType
 
-        # 确定设备
-        device = None
-        npu_available = False
-        try:
-            import torch_npu
-            npu_available = True
-        except ImportError:
-            pass
+        sizes = list(sizes) if sizes is not None else [
+            2**i for i in range(12, 28)
+        ]
+        hidden_sizes = (
+            list(hidden_sizes) if hidden_sizes is not None
+            else [1024 * index for index in range(1, 17)]
+        )
+        if (
+            not sizes
+            or not hidden_sizes
+            or any(value <= 0 for value in sizes + hidden_sizes)
+            or target_total_elements <= 0
+        ):
+            raise ValueError("RMSNorm curve dimensions must be positive")
+        if device == "auto":
+            try:
+                import torch_npu
+                if torch_npu.npu.is_available():
+                    device = "npu:0"
+            except (ImportError, AttributeError, RuntimeError):
+                pass
+            if device == "auto" and torch.cuda.is_available():
+                device = "cuda:0"
+        elif device == "cuda":
+            device = "cuda:0"
+        elif device == "npu":
+            device = "npu:0"
+        if device == "auto":
+            raise RuntimeError("formal RMSNorm curve requires CUDA or NPU")
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested but unavailable: {device}")
 
-        for dt in self.operator_test.supported_devices:
-             if dt == DeviceType.NPU and npu_available:
-                 device = "npu:0"
-                 break
-        
-        if device is None:
-             # Fallback to cuda if available
-             if torch.cuda.is_available():
-                 device = "cuda:0"
-             elif torch.backends.mps.is_available():
-                 device = "mps"
-             else:
-                 device = "cpu"
-
-        print(f"\n{'='*80}")
-        print(f"RMSNorm算子带宽测试 ({device})")
-        print(f"{'='*80}")
-        
-        # Ensure test_results directory exists
-        os.makedirs("test_results", exist_ok=True)
+        implementations = self.operator_test.get_formal_implementations(device)
+        if len(implementations) != 1:
+            raise RuntimeError(
+                f"expected one formal RMSNorm provider for {device}, got "
+                f"{implementations}"
+            )
+        implementation = implementations[0]
+        result_dir = self.framework.result_dir
+        result_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        
-        # Test 1: Varying Total Size (Fixed Hidden=4096)
-        print("\n--- 测试 1: Varying Total Size (Fixed Hidden=4096) ---")
-        sizes = [2**i for i in range(12, 28)] # 4K to 134M elements
-        hidden_size = 4096
-        bandwidths_size = []
-        results_size = []
-        
+        device_tag = device.replace(":", "_")
+        size_csv = result_dir / (
+            f"rmsnorm_bandwidth_size_{device_tag}_{timestamp}.csv"
+        )
+        hidden_csv = result_dir / (
+            f"rmsnorm_bandwidth_hidden_{device_tag}_{timestamp}.csv"
+        )
+        plot_file = result_dir / (
+            f"rmsnorm_bandwidth_curve_{device_tag}_{timestamp}.png"
+        )
+        provenance_fields = [
+            "framework_api", "protocol_version", "warmup", "iterations",
+            "repeats", "repeat_samples_ms", "aggregation",
+            "preallocated_invocations_per_repeat",
+            "input_reuse_within_repeat", "input_storage_sets_verified",
+            "input_storage_ptr_count", "output_storage_sets_verified",
+            "output_storage_ptr_count", "output_storage_policy",
+            "timed_region",
+        ]
+        fieldnames = [
+            "curve", "total_elements", "hidden_size", "provider", "device",
+            "precision", "avg_time_ms", "bandwidth_gb_s", "status", "error",
+            *provenance_fields,
+        ]
+        size_rows = []
+        hidden_rows = []
+        failures = []
+
+        def measure_point(curve, total_elements, hidden_size):
+            row = {
+                "curve": curve,
+                "total_elements": total_elements,
+                "hidden_size": hidden_size,
+                "provider": implementation,
+                "device": device,
+                "precision": "BF16",
+                "avg_time_ms": "",
+                "bandwidth_gb_s": "",
+                "status": "pending",
+                "error": "",
+                "warmup": num_warmup,
+                "iterations": num_iterations,
+                "repeats": num_repeats,
+            }
+            try:
+                data = self.operator_test.generate_test_data(
+                    shape=(total_elements // hidden_size, hidden_size)
+                )
+                metrics = (
+                    self.framework.run_core_operator_performance_test_v2(
+                        operator_test=self.operator_test,
+                        data=data,
+                        device=device,
+                        precision=PrecisionType.BF16,
+                        implementation=implementation,
+                        num_warmup=num_warmup,
+                        num_iterations=num_iterations,
+                        num_repeats=num_repeats,
+                        retain_outputs=True,
+                        verify_independent_storage=True,
+                    )
+                )
+                bandwidth = metrics.bandwidth_gb_s
+                if (
+                    bandwidth is None
+                    or not math.isfinite(bandwidth)
+                    or bandwidth <= 0
+                ):
+                    raise RuntimeError(
+                        f"invalid bandwidth result: {bandwidth}"
+                    )
+                row.update(self.framework.performance_provenance(metrics))
+                row.update(
+                    avg_time_ms=metrics.avg_time_ms,
+                    bandwidth_gb_s=bandwidth,
+                    status="ok",
+                )
+            except Exception as exc:
+                failures.append((curve, total_elements, hidden_size, exc))
+                row.update(
+                    status="error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            return row
+
         for size in sizes:
-            # Ensure size is at least hidden_size and divisible
-            if size < hidden_size:
-                effective_size = hidden_size
-            else:
-                effective_size = (size // hidden_size) * hidden_size
-            
-            rows = effective_size // hidden_size
-            shape = (rows, hidden_size)
-            
-            print(f"测试大小: {effective_size} (Shape: {shape})")
-            try:
-                test_data = self.operator_test.generate_test_data(shape=shape)
-                
-                result = self.framework.run_core_operator_performance_test_v2(
-                    operator_test=self.operator_test,
-                    data=test_data,
-                    device=device,
-                    precision=PrecisionType.BF16, 
-                    implementation="default",
-                    num_warmup=10,
-                    num_iterations=50
-                )
-                
-                bw = result.bandwidth_gb_s
-                if bw is None:
-                    bw = 0.0
-                
-                bandwidths_size.append(bw)
-                results_size.append([effective_size, hidden_size, bw])
-                print(f"  带宽: {bw:.4f} GB/s")
-                
-            except Exception as e:
-                print(f"  测试失败: {e}")
-                bandwidths_size.append(0.0)
-                results_size.append([effective_size, hidden_size, 0.0])
+            effective_size = max(4096, (size // 4096) * 4096)
+            size_rows.append(measure_point("total_size", effective_size, 4096))
+            with size_csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(size_rows)
 
-        # Test 2: Varying Hidden Size (Fixed Total Size ~ 64M elements)
-        print("\n--- 测试 2: Varying Hidden Size (Fixed Total Size ~ 64M) ---")
-        hidden_sizes = [1024 * i for i in range(1, 17)] # 1024 to 16384
-        target_total_elements = 64 * 1024 * 1024 # 64M
-        bandwidths_hidden = []
-        results_hidden = []
-        
-        for h in hidden_sizes:
-            rows = target_total_elements // h
-            shape = (rows, h)
-            total_elements = rows * h
-            
-            print(f"测试 Hidden Size: {h} (Shape: {shape}, Total: {total_elements})")
-            try:
-                test_data = self.operator_test.generate_test_data(shape=shape)
-                
-                result = self.framework.run_core_operator_performance_test_v2(
-                    operator_test=self.operator_test,
-                    data=test_data,
-                    device=device,
-                    precision=PrecisionType.BF16, 
-                    implementation="default",
-                    num_warmup=10,
-                    num_iterations=50
-                )
-                
-                bw = result.bandwidth_gb_s
-                if bw is None:
-                    bw = 0.0
-                
-                bandwidths_hidden.append(bw)
-                results_hidden.append([total_elements, h, bw])
-                print(f"  带宽: {bw:.4f} GB/s")
-                
-            except Exception as e:
-                print(f"  测试失败: {e}")
-                bandwidths_hidden.append(0.0)
-                results_hidden.append([total_elements, h, 0.0])
+        for hidden_size in hidden_sizes:
+            total_elements = (
+                target_total_elements // hidden_size
+            ) * hidden_size
+            hidden_rows.append(
+                measure_point("hidden_size", total_elements, hidden_size)
+            )
+            with hidden_csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(hidden_rows)
 
-        # Save results to CSV
-        csv_file_size = f"test_results/rmsnorm_bandwidth_size_{device.replace(':', '_')}_{timestamp}.csv"
-        csv_file_hidden = f"test_results/rmsnorm_bandwidth_hidden_{device.replace(':', '_')}_{timestamp}.csv"
-        
-        try:
-            with open(csv_file_size, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['TotalElements', 'HiddenSize', 'Bandwidth_GB_s'])
-                writer.writerows(results_size)
-            print(f"\n✅ 带宽测试数据(Size)已保存至 {csv_file_size}")
-            
-            with open(csv_file_hidden, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['TotalElements', 'HiddenSize', 'Bandwidth_GB_s'])
-                writer.writerows(results_hidden)
-            print(f"✅ 带宽测试数据(Hidden)已保存至 {csv_file_hidden}")
-        except Exception as e:
-            print(f"❌ 保存CSV失败: {e}")
+        successful_size = [
+            row for row in size_rows if row["status"] == "ok"
+        ]
+        successful_hidden = [
+            row for row in hidden_rows if row["status"] == "ok"
+        ]
+        if plot_results and (successful_size or successful_hidden):
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
 
-        # 绘制曲线
-        try:
-            plt.figure(figsize=(20, 8))
-            
-            # Subplot 1: Bandwidth vs Total Size
-            plt.subplot(1, 2, 1)
-            plt.plot(sizes, bandwidths_size, 'bo-', linewidth=2, markersize=6)
-            plt.xscale('log')
-            plt.xlabel('Total Elements (log scale)')
-            plt.ylabel('Bandwidth (GB/s)')
-            plt.title(f'Bandwidth vs Total Size (Hidden=4096)')
-            plt.grid(True, which="both", ls="-", alpha=0.5)
-            for i, (size, bw) in enumerate(zip(sizes, bandwidths_size)):
-                if i % 2 == 0 or i == len(sizes) - 1:
-                    plt.annotate(f'{bw:.0f}', (size, bw), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8)
-
-            # Subplot 2: Bandwidth vs Hidden Size
-            plt.subplot(1, 2, 2)
-            plt.plot(hidden_sizes, bandwidths_hidden, 'ro-', linewidth=2, markersize=6)
-            plt.xlabel('Hidden Size (N)')
-            plt.ylabel('Bandwidth (GB/s)')
-            plt.title(f'Bandwidth vs Hidden Size (Total~64M)')
-            plt.grid(True, which="both", ls="-", alpha=0.5)
-            # Add user reference lines if needed, but let's stick to measured data first
-            for i, (h, bw) in enumerate(zip(hidden_sizes, bandwidths_hidden)):
-                 plt.annotate(f'{bw:.0f}', (h, bw), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8)
-            
+            _, axes = plt.subplots(1, 2, figsize=(20, 8))
+            axes[0].plot(
+                [row["total_elements"] for row in successful_size],
+                [row["bandwidth_gb_s"] for row in successful_size],
+                "bo-",
+            )
+            axes[0].set_xscale("log")
+            axes[0].set_title("Bandwidth vs Total Size (Hidden=4096)")
+            axes[1].plot(
+                [row["hidden_size"] for row in successful_hidden],
+                [row["bandwidth_gb_s"] for row in successful_hidden],
+                "ro-",
+            )
+            axes[1].set_title("Bandwidth vs Hidden Size")
+            for axis in axes:
+                axis.set_ylabel("Bandwidth (GB/s)")
+                axis.grid(True, alpha=0.5)
             plt.tight_layout()
-            output_file = f'test_results/rmsnorm_bandwidth_curve_{device.replace(":", "_")}_{timestamp}.png'
-            plt.savefig(output_file)
-            print(f"\n✅ 带宽曲线已保存至 {output_file}")
+            plt.savefig(plot_file, dpi=160)
             plt.close()
-            
-        except Exception as e:
-             print(f"❌ 绘图失败: {e}")
+
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} formal RMSNorm point(s) failed; "
+                f"checkpoints retained at {size_csv} and {hidden_csv}"
+            )
+        return {
+            "size_csv": str(size_csv),
+            "hidden_csv": str(hidden_csv),
+            "plot_file": str(plot_file) if plot_results else None,
+            "size_rows": size_rows,
+            "hidden_rows": hidden_rows,
+        }
 
 def main():
     """主函数 - 支持独立运行RMSNorm算子测试"""
@@ -313,6 +337,18 @@ def main():
         default="test_results",
         help="测试结果保存目录 (默认: test_results)"
     )
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--sizes", type=int, nargs="+")
+    parser.add_argument("--hidden-sizes", type=int, nargs="+")
+    parser.add_argument(
+        "--target-total-elements",
+        type=int,
+        default=64 * 1024 * 1024,
+    )
+    parser.add_argument("--no-plot", action="store_true")
     
     args = parser.parse_args()
     
@@ -339,7 +375,17 @@ def main():
         suite.run_accuracy_test(cases)
         suite.run_performance_test(cases)
     elif args.mode == "bandwidth":
-        suite.run_bandwidth_test()
+        suite.run_bandwidth_test(
+            sizes=args.sizes,
+            hidden_sizes=args.hidden_sizes,
+            target_total_elements=args.target_total_elements,
+            device=args.device,
+            num_warmup=args.warmup,
+            num_iterations=args.iterations,
+            num_repeats=args.repeats,
+            plot_results=not args.no_plot,
+        )
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

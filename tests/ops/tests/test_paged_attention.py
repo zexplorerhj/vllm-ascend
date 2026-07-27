@@ -5,6 +5,8 @@ PagedAttention算子测试套件
 import sys
 import os
 import random
+import math
+import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing import Dict, Any, List
@@ -217,190 +219,458 @@ class PagedAttentionTestSuite(BaseTestSuite):
 
     def run_latency_plot_test(
         self,
+        device: str = "auto",
         seqlen_start: int = 1024,
         seqlen_end: int = 32768,
         seqlen_step: int = 1024,
+        seqlen_batch_size: int = 128,
         batch_min: int = 1,
         batch_max: int = 128,
+        batch_step: int = 1,
+        batch_curve_seq_lens: List[int] = None,
         num_warmup: int = 5,
-        num_iterations: int = 20
+        num_iterations: int = 20,
+        repeats: int = 3,
+        num_blocks: int = 10000,
+        block_size: int = 128,
+        seed: int = 0,
+        allow_fallback: bool = False,
+        providers: List[str] = None,
+        plot_results: bool = True,
     ):
-        try:
-            import matplotlib.pyplot as plt
-            import csv
-            import time
-        except ImportError:
-            print("❌ 未找到matplotlib，无法绘制曲线。请安装matplotlib: pip install matplotlib")
-            return
+        import csv
+        import time
+
+        plt = None
+        if plot_results:
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+            except ImportError as exc:
+                raise RuntimeError(
+                    "未找到 matplotlib，无法生成延迟曲线；"
+                    "可传 --no-plot 仅生成 CSV"
+                ) from exc
 
         from operator_test_framework import PrecisionType
 
-        device = "npu:0"
-        precision_type = PrecisionType.BF16
-        implementations = self.operator_test.get_available_implementations(device)
-        if not implementations:
-            print("❌ 未找到可用的 PagedAttention 实现")
-            return
+        if seqlen_start <= 0 or seqlen_end < seqlen_start:
+            raise ValueError("seqlen range must satisfy 0 < start <= end")
+        if seqlen_step <= 0:
+            raise ValueError("seqlen_step must be positive")
+        if seqlen_batch_size <= 0:
+            raise ValueError("seqlen_batch_size must be positive")
+        if batch_min <= 0 or batch_max < batch_min or batch_step <= 0:
+            raise ValueError(
+                "batch range must satisfy 0 < min <= max and step > 0"
+            )
+        if num_warmup < 0 or num_iterations <= 0 or repeats <= 0:
+            raise ValueError(
+                "num_warmup must be >= 0 and num_iterations/repeats > 0"
+            )
+        if num_blocks != 10000:
+            raise ValueError(
+                "formal PagedAttention curve requires num_blocks=10000"
+            )
+        if block_size != 128:
+            raise ValueError(
+                "formal PagedAttention curve requires block_size=128"
+            )
+        if allow_fallback:
+            raise ValueError(
+                "formal PagedAttention curve does not allow fallback providers"
+            )
 
-        os.makedirs("test_results", exist_ok=True)
+        if device == "auto":
+            try:
+                import torch_npu
+                if torch_npu.npu.is_available():
+                    device = "npu:0"
+            except (ImportError, AttributeError):
+                pass
+            if device == "auto" and torch.cuda.is_available():
+                device = "cuda:0"
+            if device == "auto":
+                raise RuntimeError("No available NPU or CUDA device was found")
+        elif device == "cuda":
+            device = "cuda:0"
+        elif device == "npu":
+            device = "npu:0"
+
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested but unavailable: {device}")
+        if batch_curve_seq_lens is None:
+            batch_curve_seq_lens = [10000, 30000]
+        if not batch_curve_seq_lens or any(x <= 0 for x in batch_curve_seq_lens):
+            raise ValueError("batch_curve_seq_lens must contain positive values")
+
+        precision_type = PrecisionType.BF16
+        formal_implementations = (
+            self.operator_test.get_formal_implementations(device)
+        )
+        if not formal_implementations:
+            raise RuntimeError(
+                f"设备 {device} 上未找到 formal PagedAttention provider"
+            )
+
+        requested_providers = providers or ["preferred"]
+        if requested_providers == ["preferred"]:
+            implementations = formal_implementations
+        elif requested_providers == ["all"]:
+            implementations = formal_implementations
+        else:
+            unknown = sorted(
+                set(requested_providers) - set(formal_implementations)
+            )
+            if unknown:
+                raise ValueError(
+                    f"设备 {device} 不支持 formal provider {unknown}; "
+                    f"formal={formal_implementations}"
+                )
+            implementations = requested_providers
+
+        result_dir = self.framework.result_dir
+        result_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
+        device_tag = device.replace(":", "_")
+        seqlen_csv = result_dir / (
+            f"paged_attention_latency_vs_seqlen_{device_tag}_{timestamp}.csv"
+        )
+        batch_csv = result_dir / (
+            f"paged_attention_latency_vs_batch_{device_tag}_{timestamp}.csv"
+        )
+        seqlen_plot = result_dir / (
+            f"paged_attention_latency_vs_seqlen_{device_tag}_{timestamp}.png"
+        )
+        batch_plot = result_dir / (
+            f"paged_attention_latency_vs_batch_{device_tag}_{timestamp}.png"
+        )
+        if device.startswith("cuda"):
+            device_name = torch.cuda.get_device_name(torch.device(device))
+        else:
+            try:
+                import torch_npu
+                device_index = int(device.split(":", 1)[1])
+                device_name = torch_npu.npu.get_device_name(device_index)
+            except (ImportError, AttributeError, IndexError, ValueError):
+                device_name = device
+        if device.startswith("cuda"):
+            try:
+                import flashinfer
+                provider_version = getattr(flashinfer, "__version__", "unknown")
+            except (ImportError, OSError, RuntimeError):
+                provider_version = "unavailable"
+        else:
+            try:
+                import torch_npu
+                provider_version = getattr(torch_npu, "__version__", "unknown")
+            except (ImportError, OSError, RuntimeError):
+                provider_version = "unavailable"
 
         seqlens = list(range(seqlen_start, seqlen_end + 1, seqlen_step))
         if seqlens[-1] != seqlen_end:
             seqlens.append(seqlen_end)
+        batch_sizes = list(range(batch_min, batch_max + 1, batch_step))
+        if batch_sizes[-1] != batch_max:
+            batch_sizes.append(batch_max)
 
         print(f"\n{'='*80}")
         print("PagedAttention 延迟画图测试")
-        print(f"设备: {device}, 实现: {', '.join(implementations)}, 精度: {precision_type.name}")
+        print(
+            f"设备: {device}, provider: {', '.join(implementations)}, "
+            f"精度: {precision_type.name}, block_size: {block_size}, "
+            f"num_blocks: {'auto' if num_blocks == 0 else num_blocks}, seed: {seed}, "
+            f"W{num_warmup}/I{num_iterations}/R{repeats}"
+        )
         print(f"{'='*80}")
 
         seqlen_latency_ms = {impl: [] for impl in implementations}
         seqlen_rows = []
 
-        print("\n📈 曲线1: batch=128, seqlen=1024..32768")
+        def measure_one(data, implementation):
+            metrics = self.framework.run_core_operator_performance_test_v2(
+                operator_test=self.operator_test,
+                data=data,
+                device=device,
+                precision=precision_type,
+                implementation=implementation,
+                num_warmup=num_warmup,
+                num_iterations=num_iterations,
+                num_repeats=repeats,
+                retain_outputs=True,
+                verify_independent_storage=True,
+            )
+            latency = float(metrics.avg_time_ms)
+            if not math.isfinite(latency) or latency <= 0:
+                raise RuntimeError(f"invalid device latency: {latency} ms")
+            return metrics, self.framework.performance_provenance(metrics)
+
+        print(
+            f"\n📈 曲线1: batch={seqlen_batch_size}, "
+            f"seqlen={seqlen_start}..{seqlen_end}"
+        )
+        provenance_fields = [
+            "framework_api", "protocol_version", "warmup", "iterations",
+            "repeats", "repeat_samples_ms", "aggregation",
+            "preallocated_invocations_per_repeat",
+            "input_reuse_within_repeat", "input_storage_sets_verified",
+            "input_storage_ptr_count", "output_storage_sets_verified",
+            "output_storage_ptr_count", "output_storage_policy",
+            "timed_region",
+        ]
+        common_fields = [
+            "provider", "device", "device_name", "torch_version",
+            "provider_version", "precision", "num_heads", "num_kv_heads",
+            "head_size", "batch_size", "block_size", "num_blocks",
+            "page_pool_policy", "seed", "latency_ms", "status", "error",
+        ]
+        seqlen_fields = [
+            *common_fields[:9], "seq_len", *common_fields[9:],
+            *provenance_fields,
+        ]
+        failures = []
         for impl in implementations:
-            print(f"\n  实现: {impl}")
+            print(f"\n  provider: {impl}")
             for seq_len in seqlens:
+                row = {
+                    "provider": impl,
+                    "device": device,
+                    "device_name": device_name,
+                    "torch_version": torch.__version__,
+                    "provider_version": provider_version,
+                    "precision": precision_type.name,
+                    "num_heads": 8,
+                    "num_kv_heads": 1,
+                    "head_size": 128,
+                    "batch_size": seqlen_batch_size,
+                    "seq_len": seq_len,
+                    "block_size": block_size,
+                    "num_blocks": num_blocks,
+                    "page_pool_policy": "",
+                    "seed": seed,
+                    "latency_ms": "",
+                    "status": "pending",
+                    "error": "",
+                    "warmup": num_warmup,
+                    "iterations": num_iterations,
+                    "repeats": repeats,
+                }
                 try:
-                    test_data = self.operator_test.generate_test_data(
-                        batch_size=128,
+                    test_data = self.operator_test.generate_latency_test_data(
+                        batch_size=seqlen_batch_size,
                         num_heads=8,
                         num_kv_heads=1,
                         head_size=128,
                         max_seq_len=seq_len,
-                        num_blocks=10000,
-                        block_size=128,
+                        num_blocks=num_blocks,
+                        block_size=block_size,
+                        seed=seed,
+                        storage_device="cpu",
                     )
-                    result = self.framework.run_core_operator_performance_test_v2(
-                        operator_test=self.operator_test,
-                        data=test_data,
-                        device=device,
-                        precision=precision_type,
-                        implementation=impl,
-                        num_warmup=num_warmup,
-                        num_iterations=num_iterations
+                    metrics, provenance = measure_one(test_data, impl)
+                    latency = float(metrics.avg_time_ms)
+                    row.update(provenance)
+                    row.update(
+                        num_blocks=test_data["metadata"]["num_blocks"],
+                        page_pool_policy=test_data["metadata"][
+                            "page_pool_policy"
+                        ],
+                        latency_ms=latency,
+                        status="ok",
                     )
-                    latency = result.avg_time_ms
-                except Exception as e:
-                    print(f"  ❌ {impl} seqlen={seq_len} 测试失败: {e}")
-                    latency = 0.0
-                seqlen_latency_ms[impl].append(latency)
-                seqlen_rows.append([impl, seq_len, latency])
-                print(f"  {impl} seqlen={seq_len:5d}, latency={latency:.4f} ms")
+                    seqlen_latency_ms[impl].append(latency)
+                except Exception as exc:
+                    failures.append(("seqlen", impl, seq_len, exc))
+                    row.update(
+                        status="error",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    seqlen_latency_ms[impl].append(float("nan"))
+                seqlen_rows.append(row)
+                with seqlen_csv.open(
+                    "w", newline="", encoding="utf-8"
+                ) as file_obj:
+                    writer = csv.DictWriter(
+                        file_obj, fieldnames=seqlen_fields
+                    )
+                    writer.writeheader()
+                    writer.writerows(seqlen_rows)
+                if row["status"] == "ok":
+                    print(
+                        f"  {impl} seqlen={seq_len:5d}, "
+                        f"latency={row['latency_ms']:.4f} ms"
+                    )
+                else:
+                    print(
+                        f"  {impl} seqlen={seq_len:5d} failed: "
+                        f"{row['error']}"
+                    )
 
-        batch_sizes = list(range(batch_min, batch_max + 1))
-        batch_curve_seq_lens = [10000, 30000]
         batch_latency_ms = {
             impl: {fixed_seq: [] for fixed_seq in batch_curve_seq_lens}
             for impl in implementations
         }
         batch_rows = []
+        batch_fields = [
+            *common_fields[:9], "seq_len_fixed", *common_fields[9:],
+            *provenance_fields,
+        ]
 
-        print("\n📈 曲线2: batch=1..128, seqlen固定10k/30k")
+        print(
+            f"\n📈 曲线2: batch={batch_min}..{batch_max}, "
+            f"seqlen固定 {batch_curve_seq_lens}"
+        )
         for impl in implementations:
-            print(f"\n  实现: {impl}")
+            print(f"\n  provider: {impl}")
             for fixed_seq in batch_curve_seq_lens:
                 print(f"\n  固定 seqlen={fixed_seq}")
                 for batch_size in batch_sizes:
+                    row = {
+                        "provider": impl,
+                        "device": device,
+                        "device_name": device_name,
+                        "torch_version": torch.__version__,
+                        "provider_version": provider_version,
+                        "precision": precision_type.name,
+                        "num_heads": 8,
+                        "num_kv_heads": 1,
+                        "head_size": 128,
+                        "seq_len_fixed": fixed_seq,
+                        "batch_size": batch_size,
+                        "block_size": block_size,
+                        "num_blocks": num_blocks,
+                        "page_pool_policy": "",
+                        "seed": seed,
+                        "latency_ms": "",
+                        "status": "pending",
+                        "error": "",
+                        "warmup": num_warmup,
+                        "iterations": num_iterations,
+                        "repeats": repeats,
+                    }
                     try:
-                        test_data = self.operator_test.generate_test_data(
+                        test_data = self.operator_test.generate_latency_test_data(
                             batch_size=batch_size,
                             num_heads=8,
                             num_kv_heads=1,
                             head_size=128,
                             max_seq_len=fixed_seq,
-                            num_blocks=10000,
-                            block_size=128,
+                            num_blocks=num_blocks,
+                            block_size=block_size,
+                            seed=seed,
+                            storage_device="cpu",
                         )
-                        result = self.framework.run_core_operator_performance_test_v2(
-                            operator_test=self.operator_test,
-                            data=test_data,
-                            device=device,
-                            precision=precision_type,
-                            implementation=impl,
-                            num_warmup=num_warmup,
-                            num_iterations=num_iterations
+                        metrics, provenance = measure_one(test_data, impl)
+                        latency = float(metrics.avg_time_ms)
+                        row.update(provenance)
+                        row.update(
+                            num_blocks=test_data["metadata"]["num_blocks"],
+                            page_pool_policy=test_data["metadata"][
+                                "page_pool_policy"
+                            ],
+                            latency_ms=latency,
+                            status="ok",
                         )
-                        latency = result.avg_time_ms
-                    except Exception as e:
-                        print(f"    ❌ {impl} batch={batch_size} 测试失败: {e}")
-                        latency = 0.0
-                    batch_latency_ms[impl][fixed_seq].append(latency)
-                    batch_rows.append([impl, fixed_seq, batch_size, latency])
-                    print(f"    {impl} batch={batch_size:3d}, latency={latency:.4f} ms")
+                        batch_latency_ms[impl][fixed_seq].append(latency)
+                    except Exception as exc:
+                        failures.append(("batch", impl, fixed_seq, batch_size, exc))
+                        row.update(
+                            status="error",
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                        batch_latency_ms[impl][fixed_seq].append(float("nan"))
+                    batch_rows.append(row)
+                    with batch_csv.open(
+                        "w", newline="", encoding="utf-8"
+                    ) as file_obj:
+                        writer = csv.DictWriter(
+                            file_obj, fieldnames=batch_fields
+                        )
+                        writer.writeheader()
+                        writer.writerows(batch_rows)
+                    if row["status"] == "ok":
+                        print(
+                            f"    {impl} batch={batch_size:3d}, "
+                            f"latency={row['latency_ms']:.4f} ms"
+                        )
+                    else:
+                        print(
+                            f"    {impl} batch={batch_size:3d} failed: "
+                            f"{row['error']}"
+                        )
 
-        seqlen_csv = f"test_results/paged_attention_latency_vs_seqlen_{device.replace(':', '_')}_{timestamp}.csv"
-        batch_csv = f"test_results/paged_attention_latency_vs_batch_{device.replace(':', '_')}_{timestamp}.csv"
-        seqlen_plot = f"test_results/paged_attention_latency_vs_seqlen_{device.replace(':', '_')}_{timestamp}.png"
-        batch_plot = f"test_results/paged_attention_latency_vs_batch_{device.replace(':', '_')}_{timestamp}.png"
+        print(f"\n✅ seqlen曲线数据已保存: {seqlen_csv}")
 
-        try:
-            with open(seqlen_csv, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['implementation', 'seq_len', 'latency_ms'])
-                writer.writerows(seqlen_rows)
-            print(f"\n✅ seqlen曲线数据已保存: {seqlen_csv}")
-        except Exception as e:
-            print(f"❌ 保存seqlen CSV失败: {e}")
+        print(f"✅ batch曲线数据已保存: {batch_csv}")
 
-        try:
-            with open(batch_csv, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['implementation', 'seq_len_fixed', 'batch_size', 'latency_ms'])
-                writer.writerows(batch_rows)
-            print(f"✅ batch曲线数据已保存: {batch_csv}")
-        except Exception as e:
-            print(f"❌ 保存batch CSV失败: {e}")
-
-        try:
+        if plot_results:
             plt.figure(figsize=(12, 7))
             markers = ['o', 's', '^', 'd', 'x', '*']
             for idx, impl in enumerate(implementations):
                 marker = markers[idx % len(markers)]
-                plt.plot(seqlens, seqlen_latency_ms[impl], marker=marker, linewidth=2, markersize=4, label=impl)
+                plt.plot(
+                    seqlens,
+                    seqlen_latency_ms[impl],
+                    marker=marker,
+                    linewidth=2,
+                    markersize=4,
+                    label=impl,
+                )
             plt.xlabel('Sequence Length')
             plt.ylabel('Latency (ms)')
-            plt.title(f'PagedAttention Latency vs Sequence Length (batch=128, {device}, all implementations)')
+            plt.title(
+                f'PagedAttention Latency vs Sequence Length '
+                f'(batch={seqlen_batch_size}, {device})'
+            )
             plt.grid(True, which="both", ls="-", alpha=0.5)
             plt.legend()
-            plt.savefig(seqlen_plot)
+            plt.tight_layout()
+            plt.savefig(seqlen_plot, dpi=160)
             plt.close()
             print(f"✅ seqlen曲线图已保存: {seqlen_plot}")
-        except Exception as e:
-            print(f"❌ 绘制seqlen曲线失败: {e}")
 
-        try:
             plt.figure(figsize=(12, 7))
-            markers = ['o', 's', '^', 'd', 'x', '*']
-            for idx, impl in enumerate(implementations):
-                marker = markers[idx % len(markers)]
-                plt.plot(
-                    batch_sizes,
-                    batch_latency_ms[impl][10000],
-                    marker=marker,
-                    linewidth=2,
-                    markersize=4,
-                    label=f'{impl}, seqlen=10k'
-                )
-                plt.plot(
-                    batch_sizes,
-                    batch_latency_ms[impl][30000],
-                    marker=marker,
-                    linestyle='--',
-                    linewidth=2,
-                    markersize=4,
-                    label=f'{impl}, seqlen=30k'
-                )
+            line_styles = ['-', '--', '-.', ':']
+            for impl_idx, impl in enumerate(implementations):
+                marker = markers[impl_idx % len(markers)]
+                for seq_idx, fixed_seq in enumerate(batch_curve_seq_lens):
+                    plt.plot(
+                        batch_sizes,
+                        batch_latency_ms[impl][fixed_seq],
+                        marker=marker,
+                        linestyle=line_styles[seq_idx % len(line_styles)],
+                        linewidth=2,
+                        markersize=4,
+                        label=f'{impl}, seqlen={fixed_seq}',
+                    )
             plt.xlabel('Batch Size')
             plt.ylabel('Latency (ms)')
-            plt.title(f'PagedAttention Latency vs Batch Size ({device}, all implementations)')
+            plt.title(f'PagedAttention Latency vs Batch Size ({device})')
             plt.grid(True, which="both", ls="-", alpha=0.5)
             plt.legend()
-            plt.savefig(batch_plot)
+            plt.tight_layout()
+            plt.savefig(batch_plot, dpi=160)
             plt.close()
             print(f"✅ batch曲线图已保存: {batch_plot}")
-        except Exception as e:
-            print(f"❌ 绘制batch曲线失败: {e}")
+        else:
+            print("ℹ️  --no-plot: 已跳过远端绘图，CSV 数据保持完整")
+
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} formal PagedAttention point(s) failed; "
+                f"checkpoints retained at {seqlen_csv} and {batch_csv}"
+            )
+        return {
+            "device": device,
+            "providers": implementations,
+            "seqlen_csv": str(seqlen_csv),
+            "batch_csv": str(batch_csv),
+            "seqlen_plot": str(seqlen_plot),
+            "batch_plot": str(batch_plot),
+            "seqlen_rows": seqlen_rows,
+            "batch_rows": batch_rows,
+        }
 
 def main():
     """主函数 - 支持独立运行PagedAttention算子测试"""
@@ -433,6 +703,70 @@ def main():
         default=50,
         help="fulltest模式下生成的随机测试案例数量 (默认: 50)"
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="latency 模式设备: auto, npu[:index], cuda[:index]",
+    )
+    parser.add_argument("--seqlen-start", type=int, default=1024)
+    parser.add_argument("--seqlen-end", type=int, default=32768)
+    parser.add_argument("--seqlen-step", type=int, default=1024)
+    parser.add_argument("--seqlen-batch-size", type=int, default=128)
+    parser.add_argument("--batch-min", type=int, default=1)
+    parser.add_argument("--batch-max", type=int, default=128)
+    parser.add_argument("--batch-step", type=int, default=1)
+    parser.add_argument(
+        "--batch-seq-lens",
+        type=lambda value: [int(item) for item in value.split(",") if item],
+        default=[10000, 30000],
+        help="batch 曲线的固定 seqlen，逗号分隔 (默认: 10000,30000)",
+    )
+    parser.add_argument(
+        "--warmup", "--num-warmup", dest="num_warmup", type=int, default=5
+    )
+    parser.add_argument(
+        "--iterations", "--num-iterations", dest="num_iterations",
+        type=int, default=20,
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Framework V2 内部 repeat 数 (默认: 3)",
+    )
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=10000,
+        help="formal 物理 KV blocks 数，必须为 10000",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=128,
+        help="formal KV page size，必须为 128",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--allow-fallback",
+        action="store_true",
+        help="允许非融合 PyTorch SDPA 语义 fallback（仅调试，非默认性能曲线）",
+    )
+    parser.add_argument(
+        "--providers",
+        type=lambda value: [item for item in value.split(",") if item],
+        default=["preferred"],
+        help=(
+            "PA provider，逗号分隔；preferred 表示 CUDA FlashInfer / "
+            "NPU fused_infer_attention_score，all 表示设备全部实现"
+        ),
+    )
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="仅生成 CSV；适用于没有 matplotlib 的远端运行环境",
+    )
     
     args = parser.parse_args()
     
@@ -459,10 +793,30 @@ def main():
         pa_suite.print_test_cases_summary(full_test_cases)
         results = pa_suite.run_accuracy_test(full_test_cases)
     elif args.mode == "latency":
-        results = pa_suite.run_latency_plot_test()
+        results = pa_suite.run_latency_plot_test(
+            device=args.device,
+            seqlen_start=args.seqlen_start,
+            seqlen_end=args.seqlen_end,
+            seqlen_step=args.seqlen_step,
+            seqlen_batch_size=args.seqlen_batch_size,
+            batch_min=args.batch_min,
+            batch_max=args.batch_max,
+            batch_step=args.batch_step,
+            batch_curve_seq_lens=args.batch_seq_lens,
+            num_warmup=args.num_warmup,
+            num_iterations=args.num_iterations,
+            repeats=args.repeats,
+            num_blocks=args.num_blocks,
+            block_size=args.block_size,
+            seed=args.seed,
+            allow_fallback=args.allow_fallback,
+            providers=args.providers,
+            plot_results=not args.no_plot,
+        )
     
     print(f"\n✓ PagedAttention算子测试完成，结果已保存到 {args.result_dir}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

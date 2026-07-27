@@ -118,29 +118,25 @@ class GroupGemmTestSuite(BaseTestSuite):
             },
         ]
     
-    def run_tflops_test(self, seq_lens=None, num_experts=None, hidden_dim=None, out_channel=None):
-        """运行TFLOPS测试并绘制曲线
-
-        参考 Triton grouped_gemm tutorial 的 benchmark shape:
-        - 固定 num_experts(group_size), K(hidden_dim), N(out_channel)
-        - 变化 total_M(seq_len): 每个 expert 分到 seq_len/num_experts 个 token
-        - FLOPS = seq_len * hidden_dim * out_channel * 2
-        """
-        try:
-            import matplotlib.pyplot as plt
-            import csv
-            import time
-        except ImportError:
-            print("未找到matplotlib，无法绘制曲线。请安装matplotlib: pip install matplotlib")
-            return
+    def run_tflops_test(
+        self,
+        seq_lens=None,
+        num_experts=None,
+        hidden_dim=None,
+        out_channel=None,
+        device="auto",
+        num_warmup=10,
+        num_iterations=30,
+        num_repeats=3,
+        plot_results=True,
+    ):
+        """Run the formal pure-GEMM throughput curve with Framework V2."""
+        import csv
+        import math
+        import time
 
         import torch
-        try:
-            import torch_npu
-        except ImportError:
-            pass
-
-        from operator_test_framework import PrecisionType, DeviceType
+        from operator_test_framework import PrecisionType
 
         # 参数默认值
         if num_experts is None:
@@ -149,27 +145,56 @@ class GroupGemmTestSuite(BaseTestSuite):
             hidden_dim = self.hidden_dim
         if out_channel is None:
             out_channel = self.out_channel
-
-        # 参考 Triton grouped_gemm tutorial 的 benchmark shape
-        # 总 M (seq_len) 从小到大变化，模拟不同 batch 下 MoE 的负载
-        if seq_lens is None:
-            seq_lens = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-
-        # 确定设备
-        device = None
+        if num_experts <= 0 or hidden_dim <= 0 or out_channel <= 0:
+            raise ValueError(
+                "num_experts, hidden_dim 和 out_channel 必须都大于 0"
+            )
+        if (
+            num_warmup < 0
+            or num_iterations <= 0
+            or num_repeats <= 0
+        ):
+            raise ValueError("W >= 0 and I/R > 0 are required")
         npu_available = False
         try:
             import torch_npu
-            npu_available = True
+            npu_api = getattr(torch, "npu", getattr(torch_npu, "npu", None))
+            npu_available = bool(npu_api and npu_api.is_available())
         except ImportError:
             pass
 
-        if npu_available:
-            device = "npu:0"
-        elif torch.cuda.is_available():
-            device = "cuda:0"
+        if device in (None, "auto"):
+            if npu_available:
+                device = "npu:0"
+            elif torch.cuda.is_available():
+                device = "cuda:0"
+            else:
+                raise RuntimeError("GroupGemm TFLOPS 测试需要 NPU 或 CUDA GPU")
+        elif device.startswith("npu") and not npu_available:
+            raise RuntimeError(f"请求了 {device}，但 NPU 不可用")
+        elif device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"请求了 {device}，但 CUDA 不可用")
+        elif not (device.startswith("npu") or device.startswith("cuda")):
+            raise ValueError(f"GroupGemm TFLOPS 测试不支持设备 {device}")
+
+        implementations = self.operator_test.get_formal_implementations(device)
+        if len(implementations) != 1:
+            raise RuntimeError(
+                f"expected one formal {self.precision.upper()} GroupGemm "
+                f"provider for {device}, got {implementations}"
+            )
+        implementation = implementations[0]
+
+        if seq_lens is None:
+            seq_lens = [
+                64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
+            ]
         else:
-            device = "cpu"
+            seq_lens = list(seq_lens)
+        if not seq_lens or any(value <= 0 for value in seq_lens):
+            raise ValueError(f"seq_lens 必须是非空正整数列表: {seq_lens}")
+
+        metric_name = "INT8_TOPS" if self.precision == "int8" else "BF16_TFLOPS"
 
         # 确定精度类型
         precision_map = {
@@ -178,77 +203,154 @@ class GroupGemmTestSuite(BaseTestSuite):
         }
         precision_type = precision_map.get(self.precision, PrecisionType.BF16)
 
-        print(f"\n{'='*80}")
-        print(f"GroupGemm TFLOPS 测试 ({device}) - Precision: {self.precision.upper()}")
-        print(f"  num_experts={num_experts}, K(hidden_dim)={hidden_dim}, N(out_channel)={out_channel}")
-        print(f"{'='*80}")
-
         results = []
-        tflops_list = []
-
-        print(f"{'seq_len':>10} {'num_experts':>12} {'K(hidden)':>10} {'N(out)':>10} {'TFLOPS':>15}")
-
-        # Ensure test_results directory exists
-        os.makedirs("test_results", exist_ok=True)
+        failures = []
+        result_dir = self.framework.result_dir
+        result_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        csv_file = f"test_results/groupgemm_tflops_{self.precision}_{device.replace(':', '_')}_{timestamp}.csv"
+        csv_file = result_dir / (
+            f"groupgemm_tflops_{self.precision}_"
+            f"{device.replace(':', '_')}_{timestamp}.csv"
+        )
+        plot_file = result_dir / (
+            f"groupgemm_tflops_curve_{self.precision}_"
+            f"{device.replace(':', '_')}_{timestamp}.png"
+        )
+        provenance_fields = [
+            "framework_api", "protocol_version", "warmup", "iterations",
+            "repeats", "repeat_samples_ms", "aggregation",
+            "preallocated_invocations_per_repeat",
+            "input_reuse_within_repeat", "input_storage_sets_verified",
+            "input_storage_ptr_count", "output_storage_sets_verified",
+            "output_storage_ptr_count", "output_storage_policy",
+            "timed_region",
+        ]
+        fieldnames = [
+            "seq_len", "num_experts", "hidden_dim", "out_channel",
+            "implementation", "kernel", "output_semantics",
+            "avg_time_ms", "metric", "throughput_trillion_ops_s",
+            "status", "error", *provenance_fields,
+        ]
 
         for seq_len in seq_lens:
+            kernel = ""
+            output_semantics = ""
+            row = {
+                "seq_len": seq_len,
+                "num_experts": num_experts,
+                "hidden_dim": hidden_dim,
+                "out_channel": out_channel,
+                "implementation": implementation,
+                "kernel": kernel,
+                "output_semantics": output_semantics,
+                "avg_time_ms": "",
+                "metric": metric_name,
+                "throughput_trillion_ops_s": "",
+                "status": "pending",
+                "error": "",
+                "warmup": num_warmup,
+                "iterations": num_iterations,
+                "repeats": num_repeats,
+            }
             try:
-                # 生成测试数据
                 test_data = self.operator_test.generate_test_data(
                     seq_len=seq_len,
                     num_experts=num_experts,
                     hidden_dim=hidden_dim,
                     out_channel=out_channel
                 )
+                test_data["benchmark_implementation"] = implementation
 
-                # 运行性能测试
-                result = self.framework.run_core_operator_performance_test_v2(
+                if implementation == self.operator_test.CUDA_BF16_IMPLEMENTATION:
+                    group_rows = test_data["group_list"].tolist()
+                    kernel = (
+                        "torch_bmm_cublas" if len(set(group_rows)) == 1
+                        else "torch_grouped_mm_cutlass"
+                    )
+                    output_semantics = "BF16xBF16->BF16,no_bias"
+                elif implementation == self.operator_test.CUDA_INT8_IMPLEMENTATION:
+                    kernel = "vllm_cutlass_scaled_mm"
+                    output_semantics = (
+                        "INT8xINT8,per-token*per-channel-scale->BF16"
+                    )
+                else:
+                    kernel = "npu_grouped_matmul"
+                    output_semantics = (
+                        "INT8xINT8,scaled->BF16,no_bias"
+                        if self.precision == "int8"
+                        else "BF16xBF16->BF16,no_bias"
+                    )
+                row.update(
+                    kernel=kernel,
+                    output_semantics=output_semantics,
+                )
+                metrics = self.framework.run_core_operator_performance_test_v2(
                     operator_test=self.operator_test,
                     data=test_data,
                     device=device,
                     precision=precision_type,
-                    implementation="npu_grouped_matmul",
-                    num_warmup=10,
-                    num_iterations=50
+                    implementation=implementation,
+                    num_warmup=num_warmup,
+                    num_iterations=num_iterations,
+                    num_repeats=num_repeats,
+                    retain_outputs=True,
+                    verify_independent_storage=True,
                 )
+                trillion_ops = (
+                    metrics.throughput / 1000.0
+                    if metrics.throughput is not None else None
+                )
+                if (trillion_ops is None or not math.isfinite(trillion_ops)
+                        or trillion_ops <= 0):
+                    raise RuntimeError(
+                        f"得到无效 {metric_name}: {trillion_ops}"
+                    )
 
-                # 计算 TFLOPS
-                # throughput 是 GFLOPS -> / 1000 = TFLOPS
-                tflops = result.throughput / 1000.0 if result.throughput else 0.0
-
-                tflops_list.append(tflops)
-                results.append((seq_len, num_experts, hidden_dim, out_channel, tflops))
-
-                print(f"{seq_len:>10} {num_experts:>12} {hidden_dim:>10} {out_channel:>10} {tflops:15.4f}")
-
-            except Exception as e:
-                print(f"  测试失败 seq_len={seq_len}: {e}")
-                tflops_list.append(0.0)
-                results.append((seq_len, num_experts, hidden_dim, out_channel, 0.0))
-
-        # Save results to CSV
-        try:
-            with open(csv_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['seq_len', 'num_experts', 'hidden_dim', 'out_channel', 'TFLOPS'])
+                row.update(
+                    self.framework.performance_provenance(metrics)
+                )
+                row.update(
+                    avg_time_ms=metrics.avg_time_ms,
+                    throughput_trillion_ops_s=trillion_ops,
+                    status="success",
+                )
+            except Exception as exc:
+                failures.append((seq_len, exc))
+                row.update(
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            results.append(row)
+            with csv_file.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
                 writer.writerows(results)
-            print(f"\n  测试结果已保存至 {csv_file}")
-        except Exception as e:
-            print(f"  保存CSV失败: {e}")
 
-        # 绘制曲线
-        try:
-            fig, ax = plt.subplots(figsize=(12, 7))
+        successful_rows = [
+            row for row in results if row["status"] == "success"
+        ]
+        if plot_results and successful_rows:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
 
-            ax.plot(seq_lens, tflops_list, 'bo-', linewidth=2, markersize=6,
-                    label=f'GroupGemm ({self.precision.upper()})')
+            _, ax = plt.subplots(figsize=(12, 7))
+            ax.plot(
+                [row["seq_len"] for row in successful_rows],
+                [
+                    row["throughput_trillion_ops_s"]
+                    for row in successful_rows
+                ],
+                'bo-',
+                linewidth=2,
+                markersize=6,
+                label=f'GroupGemm ({self.precision.upper()}, {implementation})',
+            )
 
             ax.set_xlabel('Total Tokens (seq_len = sum of M per expert)', fontsize=12)
-            ax.set_ylabel('TFLOPS', fontsize=12)
+            ax.set_ylabel(metric_name, fontsize=12)
             ax.set_title(
-                f'GroupGemm TFLOPS vs seq_len ({device}) - {self.precision.upper()}\n'
+                f'GroupGemm {metric_name} vs seq_len ({device})\n'
                 f'num_experts={num_experts}, K={hidden_dim}, N={out_channel}',
                 fontsize=13
             )
@@ -256,19 +358,22 @@ class GroupGemmTestSuite(BaseTestSuite):
             ax.grid(True, which="both", ls="-", alpha=0.5)
             ax.legend(fontsize=11)
 
-            # 添加数值标注
-            for i, (sl, tf) in enumerate(zip(seq_lens, tflops_list)):
-                ax.annotate(f'{tf:.2f}', (sl, tf), textcoords="offset points",
-                           xytext=(0, 12), ha='center', fontsize=8)
-
             plt.tight_layout()
-            plot_file = f'test_results/groupgemm_tflops_curve_{self.precision}_{device.replace(":", "_")}_{timestamp}.png'
             plt.savefig(plot_file, dpi=150)
-            print(f"  TFLOPS曲线已保存至 {plot_file}")
             plt.close()
 
-        except Exception as e:
-            print(f"  绘图失败: {e}")
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} formal GroupGemm point(s) failed; "
+                f"checkpoint retained at {csv_file}"
+            )
+        return {
+            "device": device,
+            "implementation": implementation,
+            "csv_file": str(csv_file),
+            "plot_file": str(plot_file) if plot_results else None,
+            "results": results,
+        }
 
     def run_profile_test(self, test_cases: List[Dict[str, Any]] = None, num_iterations: int = 10):
         """运行 GroupGemm Profile 测试（使用基类增强版本）"""
@@ -278,7 +383,7 @@ class GroupGemmTestSuite(BaseTestSuite):
         # 显示 GroupGemm 特有信息
         precision_display = self.precision.upper()
         data_types = {
-            "int8": "x=INT8, weight=INT8, bias=FP32, output=FP32",
+            "int8": "x=INT8, weight=INT8, scales=FP32/BF16, output=BF16",
             "bf16": "x=BF16, weight=BF16, bias=FP32, output=BF16"
         }
         
@@ -310,8 +415,20 @@ def main():
     parser.add_argument('--num-experts', type=int, default=8, help='专家数量')
     parser.add_argument('--hidden-dim', type=int, default=7168, help='隐藏维度')
     parser.add_argument('--out-channel', type=int, default=4096, help='输出通道')
-    parser.add_argument('--device', default='npu:0', help='测试设备')
+    parser.add_argument(
+        '--device',
+        default='auto',
+        help='TFLOPS 测试设备 (auto, npu:0, cuda:0)',
+    )
     parser.add_argument('--iterations', type=int, default=10, help='迭代次数')
+    parser.add_argument(
+        '--tflops-warmup', type=int, default=10, help='TFLOPS 测试预热次数'
+    )
+    parser.add_argument(
+        '--tflops-iterations', type=int, default=30, help='TFLOPS 测试计时次数'
+    )
+    parser.add_argument('--tflops-repeats', type=int, default=3)
+    parser.add_argument('--no-plot', action='store_true')
     parser.add_argument('--use-nz-format', action='store_true', help='使用NZ格式（仅对INT8有效）')
     parser.add_argument(
         '--mode',
@@ -340,11 +457,20 @@ def main():
     test_suite.setup(framework)
     
     if args.precision == 'bf16':
-        print(f"🔧 使用 BF16 精度测试 (x=BF16, weight=BF16, bias=FP32, output=BF16)")
+        print(
+            "🔧 使用 BF16 精度测试 "
+            "(NPU grouped_matmul 与 CUDA balanced bmm 均为 no-bias "
+            "pure-GEMM 语义)"
+        )
     else:
         nz_info = " + NZ格式" if args.use_nz_format else ""
-        print(f"🔧 使用 INT8 精度测试{nz_info} (x=INT8, weight=INT8, scale=BF16, per_token_scale=FP32, output=BF16)")
+        print(
+            f"🔧 使用 INT8 精度测试{nz_info} "
+            "(NPU 路径含缩放；CUDA 优先 vLLM CUTLASS scaled-mm，"
+            "输出 BF16)"
+        )
     
+    exit_code = 0
     try:
         # 创建自定义测试案例（如果指定了序列长度）
         test_cases = None
@@ -405,37 +531,46 @@ def main():
                 seq_lens=custom_seq_lens,
                 num_experts=args.num_experts,
                 hidden_dim=args.hidden_dim,
-                out_channel=args.out_channel
+                out_channel=args.out_channel,
+                device=args.device,
+                num_warmup=args.tflops_warmup,
+                num_iterations=args.tflops_iterations,
+                num_repeats=args.tflops_repeats,
+                plot_results=not args.no_plot,
             )
         
     except Exception as e:
         print(f"❌ 测试过程中发生错误: {str(e)}")
         import traceback
         traceback.print_exc()
+        exit_code = 1
     
     finally:
-        # 强制清理NPU资源，防止Segmentation fault
+        # 清理当前可用的 accelerator 资源。
         try:
-            import torch_npu
             import gc
-            import sys
-            
-            # 清空NPU缓存
-            torch_npu.npu.empty_cache()
-            
-            # 强制垃圾回收
+            import torch
+
             gc.collect()
-            
-            # 同步NPU
-            torch_npu.npu.synchronize()
-            
-            print("🧹 NPU资源清理完成")
-            
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                print("🧹 CUDA 资源清理完成")
+
+            try:
+                import torch_npu
+                npu_api = getattr(torch, "npu", getattr(torch_npu, "npu", None))
+                if npu_api and npu_api.is_available():
+                    npu_api.synchronize()
+                    npu_api.empty_cache()
+                    print("🧹 NPU 资源清理完成")
+            except ImportError:
+                pass
         except Exception as cleanup_error:
             print(f"⚠️ 资源清理时出错: {cleanup_error}")
-        
-        # 显式退出，避免资源释放时的问题
-        sys.exit(0)
+
+    # 不再用 finally 中的 sys.exit(0) 覆盖性能测试失败。
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

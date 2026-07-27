@@ -1,10 +1,15 @@
-"""
-Add算子测试套件
-"""
+"""Add operator tests and formal bandwidth curve entry point."""
 
-import sys
+import argparse
+import csv
+import math
 import os
 import random
+import sys
+import time
+
+import torch
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing import Dict, Any, List
@@ -86,127 +91,165 @@ class AddTestSuite(BaseTestSuite):
             })
         return test_cases
 
-    def run_bandwidth_test(self):
-        """运行带宽测试并绘制曲线"""
-        try:
-            import matplotlib.pyplot as plt
-            import csv
-            import time
-        except ImportError:
-            print("❌ 未找到matplotlib，无法绘制曲线。请安装matplotlib: pip install matplotlib")
-            return
-
-        import torch
-        try:
-            import torch_npu
-        except ImportError:
-            pass
-
-        # 2^12 到 2^27
-        sizes = [2**i for i in range(12, 28)]
-        bandwidths = []
-        
-        print(f"\n{'='*80}")
-        print("Add算子带宽测试 (2^12 - 2^27)")
-        print(f"{'='*80}")
-        
-        # 确定设备
-        device = "npu:0" if hasattr(torch, "npu") and torch.npu.is_available() else "cpu"
-        if device == "cpu" and torch.cuda.is_available():
-            device = "cuda:0"
-        elif device == "cpu" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-            
-        print(f"使用设备: {device}")
-
+    def run_bandwidth_test(
+        self,
+        sizes=None,
+        device: str = "auto",
+        num_warmup: int = 5,
+        num_iterations: int = 20,
+        num_repeats: int = 3,
+        plot_results: bool = True,
+    ):
+        """Run the formal BF16 bandwidth curve with Framework V2."""
         from operator_test_framework import PrecisionType
-        
-        # Ensure test_results directory exists
-        os.makedirs("test_results", exist_ok=True)
+
+        if sizes is None:
+            sizes = [2**i for i in range(12, 28)]
+        sizes = list(sizes)
+        if not sizes or any(size <= 0 for size in sizes):
+            raise ValueError("sizes must contain positive integers")
+        if device == "auto":
+            try:
+                import torch_npu
+                if torch_npu.npu.is_available():
+                    device = "npu:0"
+            except (ImportError, AttributeError, RuntimeError):
+                pass
+            if device == "auto" and torch.cuda.is_available():
+                device = "cuda:0"
+        elif device == "cuda":
+            device = "cuda:0"
+        elif device == "npu":
+            device = "npu:0"
+        if device == "auto":
+            raise RuntimeError("formal Add curve requires CUDA or NPU")
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested but unavailable: {device}")
+
+        implementations = self.operator_test.get_formal_implementations(device)
+        if len(implementations) != 1:
+            raise RuntimeError(
+                f"expected one formal Add provider for {device}, got "
+                f"{implementations}"
+            )
+        implementation = implementations[0]
+        result_dir = self.framework.result_dir
+        result_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        csv_file = f"test_results/add_bandwidth_{device.replace(':', '_')}_{timestamp}.csv"
-        
-        results_data = []
+        csv_file = result_dir / (
+            f"add_bandwidth_{device.replace(':', '_')}_{timestamp}.csv"
+        )
+        plot_file = result_dir / (
+            f"add_bandwidth_curve_{device.replace(':', '_')}_{timestamp}.png"
+        )
+        provenance_fields = [
+            "framework_api", "protocol_version", "warmup", "iterations",
+            "repeats", "repeat_samples_ms", "aggregation",
+            "preallocated_invocations_per_repeat",
+            "input_reuse_within_repeat", "input_storage_sets_verified",
+            "input_storage_ptr_count", "output_storage_sets_verified",
+            "output_storage_ptr_count", "output_storage_policy",
+            "timed_region",
+        ]
+        fieldnames = [
+            "size", "provider", "device", "precision", "avg_time_ms",
+            "bandwidth_gb_s", "status", "error", *provenance_fields,
+        ]
+        rows = []
+        failures = []
 
         for size in sizes:
-            print(f"测试大小: {size}")
+            row = {
+                "size": size,
+                "provider": implementation,
+                "device": device,
+                "precision": "BF16",
+                "avg_time_ms": "",
+                "bandwidth_gb_s": "",
+                "status": "pending",
+                "error": "",
+                "warmup": num_warmup,
+                "iterations": num_iterations,
+                "repeats": num_repeats,
+            }
             try:
-                # 生成测试数据 - 使用1D tensor
-                shape = (size,)
-                test_data = self.operator_test.generate_test_data(shape=shape)
-                
-                # 运行性能测试
-                result = self.framework.run_core_operator_performance_test_v2(
-                    operator_test=self.operator_test,
-                    data=test_data,
-                    device=device,
-                    precision=PrecisionType.BF16, # 默认使用BF16
-                    implementation="default",
-                    num_warmup=5,
-                    num_iterations=20
+                test_data = self.operator_test.generate_test_data(
+                    shape=(size,)
                 )
-                
-                bw = result.bandwidth_gb_s
-                if bw is None:
-                    bw = 0.0
-                
-                bandwidths.append(bw)
-                results_data.append([size, bw])
-                print(f"  带宽: {bw:.4f} GB/s")
-                
-            except Exception as e:
-                print(f"  测试失败: {e}")
-                bandwidths.append(0.0)
-                results_data.append([size, 0.0])
-                import traceback
-                traceback.print_exc()
+                metrics = (
+                    self.framework.run_core_operator_performance_test_v2(
+                        operator_test=self.operator_test,
+                        data=test_data,
+                        device=device,
+                        precision=PrecisionType.BF16,
+                        implementation=implementation,
+                        num_warmup=num_warmup,
+                        num_iterations=num_iterations,
+                        num_repeats=num_repeats,
+                        retain_outputs=True,
+                        verify_independent_storage=True,
+                    )
+                )
+                bandwidth = metrics.bandwidth_gb_s
+                if (
+                    bandwidth is None
+                    or not math.isfinite(bandwidth)
+                    or bandwidth <= 0
+                ):
+                    raise RuntimeError(
+                        f"invalid bandwidth result: {bandwidth}"
+                    )
+                row.update(self.framework.performance_provenance(metrics))
+                row.update(
+                    avg_time_ms=metrics.avg_time_ms,
+                    bandwidth_gb_s=bandwidth,
+                    status="ok",
+                )
+            except Exception as exc:
+                failures.append((size, exc))
+                row.update(
+                    status="error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            rows.append(row)
+            with csv_file.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
 
-        # Save results to CSV
-        try:
-            with open(csv_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['Size', 'Bandwidth_GB_s'])
-                writer.writerows(results_data)
-            print(f"\n✅ 带宽测试数据已保存至 {csv_file}")
-        except Exception as e:
-            print(f"❌ 保存CSV失败: {e}")
+        successful_rows = [row for row in rows if row["status"] == "ok"]
+        if plot_results and successful_rows:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
 
-        # 绘制曲线
-        try:
-            plt.figure(figsize=(12, 7))  # 稍微加大一点画布
-            plt.plot(sizes, bandwidths, 'bo-', linewidth=2, markersize=6)
-            plt.xscale('log')
-            plt.xlabel('Tensor Size (elements)')
-            plt.ylabel('Bandwidth (GB/s)')
-            plt.title(f'Add Operator Bandwidth vs Tensor Size ({device})')
-            plt.grid(True, which="both", ls="-", alpha=0.5)
-            
-            # 设置横坐标刻度显示为 10^x 格式，虽然点是 2^x 分布的
-            # matplotlib log scale默认会自动处理好刻度，这里不需要额外强制设置，
-            # 除非为了完全符合"1e4, 1e5"的视觉要求，可以不做特殊处理，默认的log显示通常就是10^x
-            
-            # 添加数值标注 (隔几个点标注一下，避免太密集)
-            for i, (size, bw) in enumerate(zip(sizes, bandwidths)):
-                # 只标注部分点，或者全部标注但字体小一点
-                if i % 2 == 0 or i == len(sizes) - 1:
-                    plt.annotate(f'{bw:.1f}', (size, bw), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8)
-
-            output_file = f'test_results/add_bandwidth_curve_{device.replace(":", "_")}_{timestamp}.png'
-            plt.savefig(output_file)
-            print(f"✅ 带宽曲线已保存至 {output_file}")
+            plt.figure(figsize=(12, 7))
+            plt.plot(
+                [row["size"] for row in successful_rows],
+                [row["bandwidth_gb_s"] for row in successful_rows],
+                "bo-",
+            )
+            plt.xscale("log")
+            plt.xlabel("Tensor Size (elements)")
+            plt.ylabel("Bandwidth (GB/s)")
+            plt.title(f"Add Operator Bandwidth ({device})")
+            plt.grid(True, which="both", alpha=0.5)
+            plt.savefig(plot_file, dpi=160)
             plt.close()
-        except Exception as e:
-             print(f"❌ 绘图失败: {e}")
+
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} formal Add point(s) failed; "
+                f"checkpoint retained at {csv_file}"
+            )
+        return {
+            "csv_file": str(csv_file),
+            "plot_file": str(plot_file) if plot_results else None,
+            "rows": rows,
+        }
 
 def main():
     """主函数 - 支持独立运行Add算子测试"""
-    import argparse
-    import sys
-    import os
-    
-    # 添加父目录到Python路径
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    
     from operator_test_framework import OperatorTestFramework
     
     parser = argparse.ArgumentParser(description="Add算子测试")
@@ -229,6 +272,12 @@ def main():
         default=50,
         help="fulltest模式下生成的随机测试案例数量 (默认: 50)"
     )
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--sizes", type=int, nargs="+")
+    parser.add_argument("--no-plot", action="store_true")
     
     args = parser.parse_args()
     
@@ -257,7 +306,14 @@ def main():
             results = add_suite.run_comprehensive_test(full_test_cases)
         elif args.mode == "bandwidth":
             print("📈 运行 Add 算子带宽测试...")
-            results = add_suite.run_bandwidth_test()
+            results = add_suite.run_bandwidth_test(
+                sizes=args.sizes,
+                device=args.device,
+                num_warmup=args.warmup,
+                num_iterations=args.iterations,
+                num_repeats=args.repeats,
+                plot_results=not args.no_plot,
+            )
         else:
             print(f"❌ 不支持的测试模式: {args.mode}")
             print("支持的模式: accuracy, performance, comprehensive, fulltest, bandwidth")
@@ -273,4 +329,4 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

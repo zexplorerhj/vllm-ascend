@@ -236,143 +236,189 @@ class LinearTestSuite(BaseTestSuite):
             num_iterations=num_iterations
         )
 
-    def run_tflops_test(self, start=256, end=4096, step=128):
-        """运行TFLOPS测试并绘制曲线"""
-        try:
-            import matplotlib.pyplot as plt
-            import csv
-            import time
-        except ImportError:
-            print("❌ 未找到matplotlib，无法绘制曲线。请安装matplotlib: pip install matplotlib")
-            return
-
+    def run_tflops_test(
+        self,
+        start=256,
+        end=4096,
+        step=128,
+        *,
+        sizes=None,
+        device="auto",
+        num_warmup=10,
+        num_iterations=50,
+        num_repeats=3,
+        plot_results=True,
+    ):
+        """Run the bias-free formal GEMM curve with Framework V2."""
+        import csv
+        import math
+        import time
         import torch
-        try:
-            import torch_npu
-        except ImportError:
-            pass
-        
-        from operator_test_framework import PrecisionType, DeviceType
 
-        # 确定设备
-        device = None
-        npu_available = False
-        try:
-            import torch_npu
-            npu_available = True
-        except ImportError:
-            pass
+        if sizes is None:
+            if start <= 0 or end < start or step <= 0:
+                raise ValueError("require 0 < start <= end and step > 0")
+            sizes = list(range(start, end + 1, step))
+            if sizes[-1] != end:
+                sizes.append(end)
+        else:
+            sizes = list(sizes)
+        if not sizes or any(size <= 0 for size in sizes):
+            raise ValueError("sizes must contain positive integers")
 
-        for dt in self.operator_test.supported_devices:
-             if dt == DeviceType.NPU and npu_available:
-                 device = "npu:0"
-                 break
-        
-        if device is None:
-             # Fallback to cuda if available
-             if torch.cuda.is_available():
-                 device = "cuda:0"
-             elif torch.backends.mps.is_available():
-                 device = "mps"
-             else:
-                 device = "cpu"
-        
-        # 确定精度类型
-        precision_map = {
+        if device == "auto":
+            try:
+                import torch_npu
+                if torch_npu.npu.is_available():
+                    device = "npu:0"
+            except (ImportError, AttributeError, RuntimeError):
+                pass
+            if device == "auto" and torch.cuda.is_available():
+                device = "cuda:0"
+        elif device == "cuda":
+            device = "cuda:0"
+        elif device == "npu":
+            device = "npu:0"
+        if device == "auto":
+            raise RuntimeError("formal Linear curve requires CUDA or NPU")
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested but unavailable: {device}")
+
+        implementations = self.operator_test.get_formal_implementations(device)
+        if len(implementations) != 1:
+            raise RuntimeError(
+                f"expected one formal Linear provider for {device}, got "
+                f"{implementations}"
+            )
+        implementation = implementations[0]
+        precision_type = {
             "fp16": PrecisionType.FP16,
             "bf16": PrecisionType.BF16,
-        }
-        precision_type = precision_map.get(self.precision, PrecisionType.BF16)
-
-        print(f"\n{'='*80}")
-        print(f"Linear算子 TFLOPS 测试 ({device}) - Precision: {self.precision.upper()}")
-        print(f"{'='*80}")
-
-        # Sizes from start to end with step
-        sizes = list(range(start, end + step, step))
-        
-        results = []
-        print(f"{'M':>6} {'N':>6} {'K':>6} {'TFLOPS':>15}")
-        
-        tflops_list = []
-        
-        # Ensure test_results directory exists
-        os.makedirs("test_results", exist_ok=True)
+        }[self.precision]
+        result_dir = self.framework.result_dir
+        result_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        csv_file = f"test_results/linear_tflops_{self.precision}_{device.replace(':', '_')}_{timestamp}.csv"
-
+        csv_file = result_dir / (
+            f"linear_tflops_{self.precision}_"
+            f"{device.replace(':', '_')}_{timestamp}.csv"
+        )
+        plot_file = result_dir / (
+            f"linear_tflops_curve_{self.precision}_"
+            f"{device.replace(':', '_')}_{timestamp}.png"
+        )
+        provenance_fields = [
+            "framework_api", "protocol_version", "warmup", "iterations",
+            "repeats", "repeat_samples_ms", "aggregation",
+            "preallocated_invocations_per_repeat",
+            "input_reuse_within_repeat", "input_storage_sets_verified",
+            "input_storage_ptr_count", "output_storage_sets_verified",
+            "output_storage_ptr_count", "output_storage_policy",
+            "timed_region",
+        ]
+        fieldnames = [
+            "M", "N", "K", "bias", "provider", "device", "precision",
+            "avg_time_ms", "TFLOPS", "status", "error",
+            *provenance_fields,
+        ]
+        rows = []
+        failures = []
         for size in sizes:
-            m = n = k = size
+            row = {
+                "M": size,
+                "N": size,
+                "K": size,
+                "bias": False,
+                "provider": implementation,
+                "device": device,
+                "precision": self.precision.upper(),
+                "avg_time_ms": "",
+                "TFLOPS": "",
+                "status": "pending",
+                "error": "",
+                "warmup": num_warmup,
+                "iterations": num_iterations,
+                "repeats": num_repeats,
+            }
             try:
-                # Generate test data
-                # Linear: input=(Batch, In), Weight=(Out, In)
-                # M=Batch, K=In, N=Out
                 test_data = self.operator_test.generate_test_data(
-                    batch_size=m,
-                    input_dim=k,
-                    output_dim=n,
-                    bias=False
+                    batch_size=size,
+                    input_dim=size,
+                    output_dim=size,
+                    bias=False,
                 )
-                
-                # Run performance test
-                # Use run_core_operator_performance_test_v2 directly
-                result = self.framework.run_core_operator_performance_test_v2(
-                    operator_test=self.operator_test,
-                    data=test_data,
-                    device=device,
-                    precision=precision_type, 
-                    implementation="default",
-                    num_warmup=10,
-                    num_iterations=50
+                metrics = (
+                    self.framework.run_core_operator_performance_test_v2(
+                        operator_test=self.operator_test,
+                        data=test_data,
+                        device=device,
+                        precision=precision_type,
+                        implementation=implementation,
+                        num_warmup=num_warmup,
+                        num_iterations=num_iterations,
+                        num_repeats=num_repeats,
+                        retain_outputs=True,
+                        verify_independent_storage=True,
+                    )
                 )
-                
-                # Calculate TFLOPS
-                # result.throughput is in GFLOPS
-                tflops = result.throughput / 1000.0 if result.throughput else 0.0
-                
-                tflops_list.append(tflops)
-                results.append((m, n, k, tflops))
-                
-                print(f"{m:6.1f} {n:6.1f} {k:6.1f} {tflops:15.6f}")
-                
-            except Exception as e:
-                print(f"  测试失败 size {size}: {e}")
-                tflops_list.append(0.0)
-                results.append((m, n, k, 0.0))
+                tflops = (
+                    metrics.throughput / 1000.0
+                    if metrics.throughput is not None else None
+                )
+                if (
+                    tflops is None
+                    or not math.isfinite(tflops)
+                    or tflops <= 0
+                ):
+                    raise RuntimeError(f"invalid TFLOPS result: {tflops}")
+                row.update(self.framework.performance_provenance(metrics))
+                row.update(
+                    avg_time_ms=metrics.avg_time_ms,
+                    TFLOPS=tflops,
+                    status="ok",
+                )
+            except Exception as exc:
+                failures.append((size, exc))
+                row.update(
+                    status="error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            rows.append(row)
+            with csv_file.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
 
-        # Save results to CSV
-        try:
-            with open(csv_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['M', 'N', 'K', 'TFLOPS'])
-                writer.writerows(results)
-            print(f"\n✅ 测试结果已保存至 {csv_file}")
-        except Exception as e:
-            print(f"❌ 保存CSV失败: {e}")
+        successful_rows = [row for row in rows if row["status"] == "ok"]
+        if plot_results and successful_rows:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
 
-        # 绘制曲线
-        try:
             plt.figure(figsize=(10, 6))
-            plt.plot(sizes, tflops_list, 'bo-', linewidth=2, markersize=6, label=f'PyTorch ({self.precision.upper()})')
-            plt.xlabel('Matrix Size (M=N=K)')
-            plt.ylabel('TFLOPS')
-            plt.title(f'Linear Operator TFLOPS vs Matrix Size ({device}) - {self.precision.upper()}')
-            plt.grid(True, which="both", ls="-", alpha=0.5)
-            plt.legend()
-            
-            # 添加数值标注 (every 2 points to avoid clutter)
-            for i, (size, tflops) in enumerate(zip(sizes, tflops_list)):
-                if i % 2 == 0 or i == len(sizes) - 1:
-                    plt.annotate(f'{tflops:.1f}', (size, tflops), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8)
-
-            plot_file = f'test_results/linear_tflops_curve_{self.precision}_{device.replace(":", "_")}_{timestamp}.png'
-            plt.savefig(plot_file)
-            print(f"✅ TFLOPS曲线已保存至 {plot_file}")
-            # close plot to free memory
+            plt.plot(
+                [row["M"] for row in successful_rows],
+                [row["TFLOPS"] for row in successful_rows],
+                "bo-",
+            )
+            plt.xlabel("Matrix Size (M=N=K)")
+            plt.ylabel("TFLOPS")
+            plt.title(
+                f"Linear TFLOPS ({device}, {self.precision.upper()})"
+            )
+            plt.grid(True, alpha=0.5)
+            plt.savefig(plot_file, dpi=160)
             plt.close()
-            
-        except Exception as e:
-             print(f"❌ 绘图失败: {e}")
+
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} formal Linear point(s) failed; "
+                f"checkpoint retained at {csv_file}"
+            )
+        return {
+            "csv_file": str(csv_file),
+            "plot_file": str(plot_file) if plot_results else None,
+            "rows": rows,
+        }
 
 def main():
     """主函数 - 支持独立运行Linear算子Profile测试"""
@@ -397,6 +443,11 @@ def main():
     parser.add_argument('--tflops-start', type=int, default=256, help='TFLOPS测试起始大小')
     parser.add_argument('--tflops-end', type=int, default=4096, help='TFLOPS测试结束大小')
     parser.add_argument('--tflops-step', type=int, default=128, help='TFLOPS测试步长')
+    parser.add_argument('--tflops-sizes', type=int, nargs='+')
+    parser.add_argument('--tflops-warmup', type=int, default=10)
+    parser.add_argument('--tflops-iterations', type=int, default=50)
+    parser.add_argument('--tflops-repeats', type=int, default=3)
+    parser.add_argument('--no-plot', action='store_true')
 
     parser.add_argument('--custom-dims', type=str, help='自定义维度列表，格式: batch,input,output (例如: 64,512,2048)')
     
@@ -484,15 +535,20 @@ def main():
             test_suite.run_tflops_test(
                 start=args.tflops_start,
                 end=args.tflops_end,
-                step=args.tflops_step
+                step=args.tflops_step,
+                sizes=args.tflops_sizes,
+                device=args.device,
+                num_warmup=args.tflops_warmup,
+                num_iterations=args.tflops_iterations,
+                num_repeats=args.tflops_repeats,
+                plot_results=not args.no_plot,
             )
-
-
-        
+        return 0
     except Exception as e:
         print(f"❌ 测试过程中发生错误: {str(e)}")
         import traceback
         traceback.print_exc()
+        return 1
     
     finally:
         # 强制清理NPU资源，防止Segmentation fault
@@ -516,10 +572,5 @@ def main():
         except Exception as cleanup_error:
             print(f"⚠️ 资源清理时出错: {cleanup_error}")
         
-        # 显式退出，避免资源释放时的问题
-        import sys
-        sys.exit(0)
-
-
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

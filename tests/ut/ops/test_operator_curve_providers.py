@@ -478,6 +478,53 @@ def test_flashattention_cuda_execute_receives_only_nested_provider_data(
     assert result is provider_data["query"]
 
 
+def test_flashattention_execute_rejects_provider_mismatch_before_dispatch():
+    operator = FlashAttentionOperatorTest()
+    provider_data = {
+        "query": torch.tensor([1.0]),
+        "key": torch.tensor([2.0]),
+        "value": torch.tensor([3.0]),
+        "is_causal": False,
+        "scale": None,
+    }
+    provider_calls = []
+    operator.implementations["cuda_sdpa_flash_attention"] = SimpleNamespace(
+        prepare_data=lambda data, device, precision: provider_data,
+        execute_core_operator_in_active_context=lambda prepared: (
+            provider_calls.append(("cuda_sdpa_flash_attention", prepared))
+        ),
+    )
+    operator.implementations["cuda_flash_attn_func"] = SimpleNamespace(
+        execute_core_operator=lambda prepared: provider_calls.append(
+            ("cuda_flash_attn_func", prepared)
+        ),
+    )
+    prepared = operator._prepare_data_for_core_operator(
+        {},
+        "cuda:0",
+        SimpleNamespace(value=torch.float16),
+        "cuda_sdpa_flash_attention",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "cuda_sdpa_flash_attention.*"
+            "cuda_flash_attn_func"
+        ),
+    ):
+        operator._execute_core_operator(
+            prepared,
+            "cuda_flash_attn_func",
+        )
+
+    assert prepared == {
+        "_implementation": "cuda_sdpa_flash_attention",
+        "provider_data": provider_data,
+    }
+    assert provider_calls == []
+
+
 def test_flashattention_nested_provider_data_remains_visible_to_storage_audit():
     prepared_sets = [
         {

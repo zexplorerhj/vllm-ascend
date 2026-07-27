@@ -361,8 +361,17 @@ class FlashAttentionOperatorTest(BaseOperatorTest):
         implementation: str,
     ) -> Any:
         """执行核心算子（兼容性方法）"""
-        if implementation == "default":
-            implementation = prepared_data["_implementation"]
+        stored_implementation = prepared_data["_implementation"]
+        if (
+            implementation != "default"
+            and implementation != stored_implementation
+        ):
+            raise ValueError(
+                "FlashAttention prepared data provenance mismatch: "
+                f"prepared for {stored_implementation!r}, but execution "
+                f"requested {implementation!r}"
+            )
+        implementation = stored_implementation
         provider_data = prepared_data["provider_data"]
         if implementation in self.implementations:
             impl = self.implementations[implementation]

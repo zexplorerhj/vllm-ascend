@@ -39,6 +39,116 @@ import rmsnorm.rmsnorm_operator as rmsnorm_module  # noqa: E402
 
 
 @pytest.mark.parametrize(
+    ("operator_factory", "prepared", "expected"),
+    [
+        (
+            AddOperatorTest,
+            {"implementation": AddOperatorTest.CUDA_IMPLEMENTATION},
+            True,
+        ),
+        (
+            AddOperatorTest,
+            {"implementation": AddOperatorTest.NPU_IMPLEMENTATION},
+            True,
+        ),
+        (
+            AddOperatorTest,
+            {"implementation": "torch_add"},
+            False,
+        ),
+        (
+            LinearOperatorTest,
+            {"implementation": LinearOperatorTest.CUDA_IMPLEMENTATION},
+            True,
+        ),
+        (
+            LinearOperatorTest,
+            {"implementation": LinearOperatorTest.NPU_IMPLEMENTATION},
+            False,
+        ),
+        (
+            RMSNormOperatorTest,
+            {"implementation": RMSNormOperatorTest.CUDA_IMPLEMENTATION},
+            True,
+        ),
+        (
+            RMSNormOperatorTest,
+            {"implementation": RMSNormOperatorTest.NPU_IMPLEMENTATION},
+            False,
+        ),
+        (
+            GroupGemmBF16OperatorTest,
+            {
+                "_implementation": (
+                    GroupGemmBF16OperatorTest.CUDA_BF16_IMPLEMENTATION
+                )
+            },
+            True,
+        ),
+        (
+            GroupGemmBF16OperatorTest,
+            {
+                "_implementation": (
+                    GroupGemmBF16OperatorTest.CUDA_INT8_IMPLEMENTATION
+                )
+            },
+            True,
+        ),
+        (
+            GroupGemmBF16OperatorTest,
+            {"_implementation": "npu_grouped_matmul"},
+            False,
+        ),
+        (
+            FlashAttentionOperatorTest,
+            {"_implementation": "npu_flash_attention"},
+            True,
+        ),
+        (
+            FlashAttentionOperatorTest,
+            {"_implementation": "cuda_sdpa_flash_attention"},
+            False,
+        ),
+        (
+            PagedAttentionOperatorTest,
+            {"_implementation": "cuda_flashinfer_fa2"},
+            True,
+        ),
+        (
+            PagedAttentionOperatorTest,
+            {"_implementation": "npu_fused_infer_attention_score"},
+            True,
+        ),
+        (
+            PagedAttentionOperatorTest,
+            {"_implementation": "npu_original"},
+            True,
+        ),
+        (
+            RecurrentGatedDeltaRuleOperatorTest,
+            {"_implementation": "cuda_vllm_fla_direct_out"},
+            True,
+        ),
+        (
+            RecurrentGatedDeltaRuleOperatorTest,
+            {"_implementation": "npu_cann_builtin"},
+            False,
+        ),
+    ],
+)
+def test_only_phase_invariant_out_providers_declare_direct_timing_contract(
+    operator_factory,
+    prepared,
+    expected,
+):
+    operator = operator_factory()
+    assert operator._declares_preallocated_output_contract(
+        prepared,
+        "default",
+    ) is expected
+
+
+@pytest.mark.parametrize(
     ("factory", "cuda_names", "npu_names"),
     [
         (

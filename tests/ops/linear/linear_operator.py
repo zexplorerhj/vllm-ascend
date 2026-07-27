@@ -148,6 +148,14 @@ class LinearOperatorTest(BaseOperatorTest):
                 device=device,
             )
         return prepared_data
+
+    def _declares_preallocated_output_contract(
+        self,
+        prepared_data: Dict[str, Any],
+        implementation: str = "default",
+    ) -> bool:
+        impl = prepared_data.get("implementation", implementation)
+        return impl == self.CUDA_IMPLEMENTATION
     
     def _execute_core_operator(
         self, 

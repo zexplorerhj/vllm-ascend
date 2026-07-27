@@ -354,6 +354,14 @@ class FlashAttentionOperatorTest(BaseOperatorTest):
             "_implementation": implementation,
             "provider_data": impl.prepare_data(data, device, precision),
         }
+
+    def _declares_preallocated_output_contract(
+        self,
+        prepared_data: Dict[str, Any],
+        implementation: str = "default",
+    ) -> bool:
+        resolved = prepared_data.get("_implementation", implementation)
+        return resolved == "npu_flash_attention"
     
     def _execute_core_operator(
         self,

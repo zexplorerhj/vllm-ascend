@@ -152,6 +152,14 @@ class RecurrentGatedDeltaRuleOperatorTest(BaseOperatorTest):
         prepared["_implementation"] = resolved
         return prepared
 
+    def _declares_preallocated_output_contract(
+        self,
+        prepared_data: dict[str, Any],
+        implementation: str = "default",
+    ) -> bool:
+        resolved = prepared_data.get("_implementation", implementation)
+        return resolved == CudaFlaDirectOutRecurrentImpl.name
+
     def _execute_core_operator(
         self, prepared_data: dict[str, Any], implementation: str = "default"
     ) -> torch.Tensor:

@@ -127,6 +127,14 @@ class _PreallocatedOutputOperator(_FreshCpuOperator):
         )
         return prepared_data["output"]
 
+    def _declares_preallocated_output_contract(
+        self,
+        prepared_data,
+        implementation="default",
+    ):
+        del prepared_data, implementation
+        return True
+
 
 class _InPlaceInputAliasOperator(_FreshCpuOperator):
 
@@ -134,6 +142,13 @@ class _InPlaceInputAliasOperator(_FreshCpuOperator):
         self.execute_calls += 1
         prepared_data["x"].add_(1)
         return prepared_data["x"]
+
+
+class _IgnoredPreallocatedOutputOperator(_PreallocatedOutputOperator):
+
+    def _execute_core_operator(self, prepared_data, implementation="default"):
+        self.execute_calls += 1
+        return prepared_data["x"] + 1
 
 
 class _ContextOperator(_FreshCpuOperator):
@@ -385,7 +400,7 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "framework_api": (
             "OperatorTestFramework.run_core_operator_performance_test_v2"
         ),
-        "protocol_version": "operator-test-framework-v2-fresh-v2",
+        "protocol_version": "operator-test-framework-v2-fresh-v3",
         "warmup": 1,
         "iterations": 2,
         "repeats": 2,
@@ -415,9 +430,19 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "output_storage_policy": "retained_until_repeat_end",
         "timing_method": "host_perf_counter",
         "timing_semantics": "host wall-clock elapsed time",
+        "timed_output_capture_policy": (
+            "retained_return_inside_timed_region"
+        ),
+        "preallocated_output_contract": "not_declared",
+        "output_alias_verification_scope": (
+            "warmup_and_measured_returns"
+        ),
+        "preallocated_output_contract_invocations_per_repeat": 0,
+        "output_verification_replay_invocations_per_repeat": 0,
+        "total_operator_calls_per_repeat": 3,
         "workspace_allocation_policy": "not_audited",
         "timed_region": (
-            "_execute_core_operator calls only; prepare excluded"
+            "_execute_core_operator plus return retention; prepare excluded"
         ),
     }
 
@@ -427,8 +452,10 @@ def test_v2_proves_preallocated_output_aliases(monkeypatch, tmp_path):
     operator = _PreallocatedOutputOperator()
 
     def measure(functions, device):
+        assert operator.execute_calls == 1
         for function in functions:
             function()
+        assert operator.execute_calls == 3
         return 0.25
 
     monkeypatch.setattr(
@@ -448,13 +475,33 @@ def test_v2_proves_preallocated_output_aliases(monkeypatch, tmp_path):
         verify_independent_storage=True,
     )
 
-    assert metrics.preallocated_output_aliases_verified == 3
+    assert metrics.preallocated_output_aliases_verified == 1
+    assert operator.execute_calls == 3
     assert metrics.output_allocation_mode == (
-        "preallocated_output_buffers_verified"
+        "preallocated_output_contract_with_warmup_alias_probe"
     )
-    assert framework.performance_provenance(metrics)[
-        "preallocated_output_aliases_verified"
+    provenance = framework.performance_provenance(metrics)
+    assert provenance["preallocated_output_aliases_verified"] == 1
+    assert provenance["timed_output_capture_policy"] == (
+        "preallocated_output_contract_no_timed_return_capture"
+    )
+    assert provenance["preallocated_output_contract"] == (
+        "declared_phase_invariant_out"
+    )
+    assert provenance["output_alias_verification_scope"] == (
+        "warmup_returns_only"
+    )
+    assert provenance[
+        "preallocated_output_contract_invocations_per_repeat"
     ] == 3
+    assert provenance[
+        "output_verification_replay_invocations_per_repeat"
+    ] == 0
+    assert provenance["total_operator_calls_per_repeat"] == 3
+    assert provenance["timed_region"] == (
+        "_execute_core_operator calls only; prepare excluded; "
+        "timed Python returns discarded under declared out contract"
+    )
 
 
 def test_v2_does_not_mislabel_in_place_input_as_preallocated_output(
@@ -489,6 +536,84 @@ def test_v2_does_not_mislabel_in_place_input_as_preallocated_output(
     assert metrics.output_allocation_mode == (
         "no_preallocated_output_buffer_verified"
     )
+
+
+def test_v2_rejects_direct_path_when_prepared_output_is_ignored(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _IgnoredPreallocatedOutputOperator()
+
+    def measure(functions, device):
+        for function in functions:
+            function()
+        return 0.25
+
+    monkeypatch.setattr(
+        framework,
+        "_measure_execution_time_v2",
+        measure,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="direct preallocated timing contract failed its warmup",
+    ):
+        framework.run_core_operator_performance_test_v2(
+            operator_test=operator,
+            data=operator.generate_test_data(),
+            device="cpu",
+            precision=PrecisionType.FP32,
+            num_warmup=1,
+            num_iterations=2,
+            retain_outputs=True,
+            verify_independent_storage=True,
+        )
+
+
+def test_v2_reports_declared_contract_when_zero_warmup_disables_direct_path(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _PreallocatedOutputOperator()
+
+    def measure(functions, device):
+        for function in functions:
+            function()
+        return 0.25
+
+    monkeypatch.setattr(
+        framework,
+        "_measure_execution_time_v2",
+        measure,
+    )
+    metrics = framework.run_core_operator_performance_test_v2(
+        operator_test=operator,
+        data=operator.generate_test_data(),
+        device="cpu",
+        precision=PrecisionType.FP32,
+        num_warmup=0,
+        num_iterations=2,
+        retain_outputs=True,
+        verify_independent_storage=True,
+    )
+
+    provenance = framework.performance_provenance(metrics)
+    assert provenance["preallocated_output_contract"] == (
+        "declared_phase_invariant_out"
+    )
+    assert provenance["timed_output_capture_policy"] == (
+        "retained_return_inside_timed_region"
+    )
+    assert provenance["output_alias_verification_scope"] == (
+        "warmup_and_measured_returns"
+    )
+    assert provenance[
+        "preallocated_output_contract_invocations_per_repeat"
+    ] == 2
+    assert provenance["preallocated_output_aliases_verified"] == 2
+    assert provenance["total_operator_calls_per_repeat"] == 2
 
 
 def test_curve_selection_never_labels_custom_or_quick_as_full():

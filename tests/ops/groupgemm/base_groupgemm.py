@@ -508,6 +508,17 @@ class BaseGroupGemmOperatorTest(BaseOperatorTest, ABC):
         if self.get_precision_config().get("input_dtype") == torch.bfloat16:
             kwargs["bias"] = None
         return {"_implementation": implementation, "kwargs": kwargs}
+
+    def _declares_preallocated_output_contract(
+        self,
+        prepared_data: Dict[str, Any],
+        implementation: str = "default",
+    ) -> bool:
+        impl = prepared_data.get("_implementation", implementation)
+        return impl in {
+            self.CUDA_BF16_IMPLEMENTATION,
+            self.CUDA_INT8_IMPLEMENTATION,
+        }
     
     def _execute_core_operator(
         self, 

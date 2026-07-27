@@ -113,3 +113,26 @@ python3 tests/test_linear.py --mode accuracy
 - **JSON格式**: 详细的测试数据和指标
 - **CSV格式**: 便于分析的表格数据
 - **Profiler输出**: 性能分析文件（如果启用）
+
+## Formal curve protocol
+
+`run_tests.sh --formal` dispatches the canonical curve entries through
+`OperatorTestFramework.run_core_operator_performance_test_v2`.  Each repeat
+prepares `warmup + iterations` independent input-storage sets before timing;
+the CSV reports the median of the repeat event means and retains every repeat
+sample.
+
+Protocol `operator-test-framework-v2-fresh-v3` keeps Python output bookkeeping
+out of the event interval when an operator has an explicit preallocated
+`out=` buffer and declares a phase-invariant output contract.  All `W+I`
+prepared output-buffer addresses are checked for independence, and untimed
+warmup returns probe the declared alias contract; timed Python return objects
+are intentionally discarded and are not claimed as captured evidence.
+Providers without that contract retain every measured return until the repeat
+ends, and their CSV rows explicitly report that return retention occurs inside
+the timed dispatch interval.  Provider-internal workspace allocation remains
+`not_audited`.
+
+`--quick` only selects the first shape of each canonical sub-curve.  It does
+not change warmup, iteration, or repeat counts, and its rows can never claim
+full formal coverage.

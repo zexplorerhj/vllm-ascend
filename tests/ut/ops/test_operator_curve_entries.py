@@ -38,7 +38,7 @@ PROVENANCE = {
     "framework_api": (
         "OperatorTestFramework.run_core_operator_performance_test_v2"
     ),
-    "protocol_version": "operator-test-framework-v2-fresh-v2",
+    "protocol_version": "operator-test-framework-v2-fresh-v3",
     "warmup": 1,
     "iterations": 2,
     "repeats": 3,
@@ -56,19 +56,34 @@ PROVENANCE = {
     "output_storage_ptr_count": 3,
     "output_tensor_count": 3,
     "output_unique_storages_per_set": 1,
-    "preallocated_output_aliases_verified": 3,
-    "preallocated_output_sets_verified": 3,
+    "preallocated_output_aliases_verified": 1,
+    "preallocated_output_sets_verified": 1,
     "output_tensors_per_set": 1,
-    "output_allocation_mode": "preallocated_output_buffers_verified",
-    "output_allocation_policy": "preallocated_output_buffers_verified",
+    "output_allocation_mode": (
+        "preallocated_output_contract_with_warmup_alias_probe"
+    ),
+    "output_allocation_policy": (
+        "preallocated_output_contract_with_warmup_alias_probe"
+    ),
     "output_storage_policy": "retained_until_repeat_end",
     "timing_method": "device_event",
     "timing_semantics": (
         "device elapsed time; includes stream-idle gaps between start/end "
         "events caused by host dispatch"
     ),
+    "timed_output_capture_policy": (
+        "preallocated_output_contract_no_timed_return_capture"
+    ),
+    "preallocated_output_contract": "declared_phase_invariant_out",
+    "output_alias_verification_scope": "warmup_returns_only",
+    "preallocated_output_contract_invocations_per_repeat": 3,
+    "output_verification_replay_invocations_per_repeat": 0,
+    "total_operator_calls_per_repeat": 3,
     "workspace_allocation_policy": "not_audited",
-    "timed_region": "_execute_core_operator calls only; prepare excluded",
+    "timed_region": (
+        "_execute_core_operator calls only; prepare excluded; "
+        "timed Python returns discarded under declared out contract"
+    ),
 }
 
 
@@ -471,14 +486,14 @@ def test_recurrent_point_uses_one_v2_call_and_framework_provenance(
     with output.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert rows[0]["protocol_version"] == PROVENANCE["protocol_version"]
-    assert rows[0]["preallocated_output_aliases_verified"] == "3"
-    assert rows[0]["preallocated_output_sets_verified"] == "3"
+    assert rows[0]["preallocated_output_aliases_verified"] == "1"
+    assert rows[0]["preallocated_output_sets_verified"] == "1"
     assert rows[0]["output_tensors_per_set"] == "1"
     assert rows[0]["output_allocation_mode"] == (
-        "preallocated_output_buffers_verified"
+        "preallocated_output_contract_with_warmup_alias_probe"
     )
     assert rows[0]["output_allocation_policy"] == (
-        "preallocated_output_buffers_verified"
+        "preallocated_output_contract_with_warmup_alias_probe"
     )
     assert rows[0]["repeat_min_ms"] == "1.0"
     assert rows[0]["repeat_median_ms"] == "1.5"

@@ -489,6 +489,18 @@ class PagedAttentionOperatorTest(BaseOperatorTest):
             return prepared_data
         else:
             raise ValueError(f"不支持的实现方式: {implementation}")
+
+    def _declares_preallocated_output_contract(
+        self,
+        prepared_data: Dict[str, Any],
+        implementation: str = "default",
+    ) -> bool:
+        resolved = prepared_data.get("_implementation", implementation)
+        return resolved in {
+            "cuda_flashinfer_fa2",
+            "npu_fused_infer_attention_score",
+            "npu_original",
+        }
     
     def _execute_core_operator(self, prepared_data: Dict[str, Any], implementation: str) -> Any:
         """执行核心算子（兼容性方法）"""

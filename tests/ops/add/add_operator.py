@@ -166,6 +166,14 @@ class AddOperatorTest(BaseOperatorTest):
             'output': output,
             'implementation': implementation
         }
+
+    def _declares_preallocated_output_contract(
+        self,
+        prepared_data: Dict[str, Any],
+        implementation: str = "default",
+    ) -> bool:
+        impl = prepared_data.get("implementation", implementation)
+        return impl in (self.CUDA_IMPLEMENTATION, self.NPU_IMPLEMENTATION)
     
     def _execute_core_operator(self, prepared_data: Dict[str, Any], implementation: str = "default") -> torch.Tensor:
         """执行核心算子（只测量核心计算，不包括数据移动）"""

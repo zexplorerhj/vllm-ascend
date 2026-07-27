@@ -210,6 +210,12 @@ class PerformanceMetrics:
     input_reuse_within_repeat: bool = False
     timing_method: Optional[str] = None
     timing_semantics: Optional[str] = None
+    timed_output_capture_policy: Optional[str] = None
+    preallocated_output_contract: Optional[str] = None
+    output_alias_verification_scope: Optional[str] = None
+    preallocated_output_contract_invocations_per_repeat: int = 0
+    output_verification_replay_invocations_per_repeat: int = 0
+    total_operator_calls_per_repeat: int = 0
     workspace_allocation_policy: Optional[str] = None
     timed_region: Optional[str] = None
     
@@ -262,6 +268,12 @@ PERFORMANCE_PROVENANCE_FIELDS = (
     "output_storage_policy",
     "timing_method",
     "timing_semantics",
+    "timed_output_capture_policy",
+    "preallocated_output_contract",
+    "output_alias_verification_scope",
+    "preallocated_output_contract_invocations_per_repeat",
+    "output_verification_replay_invocations_per_repeat",
+    "total_operator_calls_per_repeat",
     "workspace_allocation_policy",
     "timed_region",
 )
@@ -386,7 +398,22 @@ class BaseOperatorTest(ABC):
         来只执行核心算子操作，排除数据预处理和后处理的时间开销
         """
         return self.run_device_implementation(data, device, precision, implementation)
-    
+
+    def _declares_preallocated_output_contract(
+        self,
+        prepared_data: Dict[str, Any],
+        implementation: str = "default",
+    ) -> bool:
+        """Declare a phase-invariant ``out=`` contract for direct timing.
+
+        Subclasses may return ``True`` only when every invocation of
+        ``_execute_core_operator`` with this prepared payload writes to and
+        returns the explicitly designated output buffers.  The framework may
+        then discard timed Python return objects and verify actual aliases on
+        untimed warmup calls.
+        """
+        del prepared_data, implementation
+        return False
 
     
     def calculate_throughput(self, data: Dict[str, Any], time_ms: float) -> Optional[float]:
@@ -461,12 +488,11 @@ class OperatorTestFramework:
         return 0
 
     @classmethod
-    def _prepared_output_storage_ptrs(
+    def _prepared_output_values(
         cls,
         prepared: Any,
-        device_type: str,
-    ) -> set[int]:
-        """Collect only buffers explicitly designated as prepared outputs."""
+    ) -> List[Any]:
+        """Collect values explicitly designated as prepared outputs."""
         output_keys = {
             "out",
             "output",
@@ -474,16 +500,28 @@ class OperatorTestFramework:
             "output_buffers",
             "expert_outputs",
         }
-        pointers: set[int] = set()
+        outputs: List[Any] = []
         if not isinstance(prepared, dict):
-            return pointers
+            return outputs
         for key, value in prepared.items():
             if key in output_keys:
-                pointers.update(cls._device_storage_ptrs(value, device_type))
+                outputs.append(value)
             elif isinstance(value, dict):
-                pointers.update(
-                    cls._prepared_output_storage_ptrs(value, device_type)
+                outputs.extend(
+                    cls._prepared_output_values(value)
                 )
+        return outputs
+
+    @classmethod
+    def _prepared_output_storage_ptrs(
+        cls,
+        prepared: Any,
+        device_type: str,
+    ) -> set[int]:
+        """Collect only buffers explicitly designated as prepared outputs."""
+        pointers: set[int] = set()
+        for value in cls._prepared_output_values(prepared):
+            pointers.update(cls._device_storage_ptrs(value, device_type))
         return pointers
 
     @classmethod
@@ -628,6 +666,25 @@ class OperatorTestFramework:
             "output_storage_policy": metrics.output_storage_policy,
             "timing_method": metrics.timing_method,
             "timing_semantics": metrics.timing_semantics,
+            "timed_output_capture_policy": (
+                metrics.timed_output_capture_policy
+            ),
+            "preallocated_output_contract": (
+                metrics.preallocated_output_contract
+            ),
+            "output_alias_verification_scope": (
+                metrics.output_alias_verification_scope
+            ),
+            "preallocated_output_contract_invocations_per_repeat": (
+                metrics
+                .preallocated_output_contract_invocations_per_repeat
+            ),
+            "output_verification_replay_invocations_per_repeat": (
+                metrics.output_verification_replay_invocations_per_repeat
+            ),
+            "total_operator_calls_per_repeat": (
+                metrics.total_operator_calls_per_repeat
+            ),
             "workspace_allocation_policy": (
                 metrics.workspace_allocation_policy
             ),
@@ -1123,20 +1180,28 @@ class OperatorTestFramework:
         num_iterations: int,
         retain_outputs: bool,
         verify_independent_storage: bool,
-    ) -> Tuple[float, int, int, int, int, int, int]:
+    ) -> Tuple[
+        float, int, int, int, int, int, int, str, str, str
+    ]:
         """Run one fresh-storage V2 repeat and return only scalar results."""
         invocations_per_repeat = num_warmup + num_iterations
         prepared_data_list: List[Any] = []
         retained_outputs: List[Any] = []
         test_functions: List[Callable] = []
         result: Optional[
-            Tuple[float, int, int, int, int, int, int]
+            Tuple[
+                float, int, int, int, int, int, int, str, str, str
+            ]
         ] = None
         prepared_data = None
         output = None
         run_and_retain = None
+        run_without_retain = None
         provider_context = None
         device_context = None
+        timed_output_capture_policy = "not_retained"
+        preallocated_output_contract = "not_declared"
+        output_alias_verification_scope = "not_retained"
 
         try:
             with torch.inference_mode():
@@ -1189,18 +1254,97 @@ class OperatorTestFramework:
                 else nullcontext()
             )
 
-            for prepared_data in prepared_data_list[num_warmup:]:
-
-                def run_and_retain(payload=prepared_data):
-                    output = operator_test._execute_core_operator(
-                        payload,
+            device_type = "npu" if "npu" in device else (
+                "cuda" if "cuda" in device else "cpu"
+            )
+            prepared_output_presence = [
+                bool(self._prepared_output_storage_ptrs(
+                    prepared_value,
+                    device_type,
+                ))
+                for prepared_value in prepared_data_list
+            ]
+            if any(prepared_output_presence) and not all(
+                prepared_output_presence
+            ):
+                raise RuntimeError(
+                    "prepared output buffers must be present for either "
+                    "every invocation or none"
+                )
+            has_preallocated_outputs = bool(
+                prepared_output_presence
+                and all(prepared_output_presence)
+            )
+            contract_presence = [
+                bool(
+                    operator_test._declares_preallocated_output_contract(
+                        prepared_value,
                         implementation,
                     )
-                    if retain_outputs:
-                        retained_outputs.append(output)
-                    return output
+                )
+                for prepared_value in prepared_data_list
+            ]
+            if any(contract_presence) and not all(contract_presence):
+                raise RuntimeError(
+                    "preallocated output contract must be declared for "
+                    "either every invocation or none"
+                )
+            has_preallocated_output_contract = bool(
+                contract_presence and all(contract_presence)
+            )
+            if (
+                has_preallocated_output_contract
+                and not has_preallocated_outputs
+            ):
+                raise RuntimeError(
+                    "preallocated output contract was declared without "
+                    "explicit prepared output buffers"
+                )
+            direct_preallocated_timing = (
+                retain_outputs
+                and has_preallocated_outputs
+                and has_preallocated_output_contract
+                and num_warmup > 0
+            )
+            if has_preallocated_output_contract:
+                preallocated_output_contract = (
+                    "declared_phase_invariant_out"
+                )
+            if direct_preallocated_timing:
+                timed_output_capture_policy = (
+                    "preallocated_output_contract_no_timed_return_capture"
+                )
+                output_alias_verification_scope = "warmup_returns_only"
+            elif retain_outputs:
+                timed_output_capture_policy = (
+                    "retained_return_inside_timed_region"
+                )
+                output_alias_verification_scope = (
+                    "warmup_and_measured_returns"
+                )
 
-                test_functions.append(run_and_retain)
+            for prepared_data in prepared_data_list[num_warmup:]:
+                if direct_preallocated_timing:
+
+                    def run_without_retain(payload=prepared_data):
+                        return operator_test._execute_core_operator(
+                            payload,
+                            implementation,
+                        )
+
+                    test_functions.append(run_without_retain)
+                else:
+
+                    def run_and_retain(payload=prepared_data):
+                        output = operator_test._execute_core_operator(
+                            payload,
+                            implementation,
+                        )
+                        if retain_outputs:
+                            retained_outputs.append(output)
+                        return output
+
+                    test_functions.append(run_and_retain)
 
             with device_context, provider_context, torch.inference_mode():
                 for warmup_index in range(num_warmup):
@@ -1231,15 +1375,38 @@ class OperatorTestFramework:
             verified_output_sets = 0
             verified_output_ptrs = 0
             verified_output_tensors = 0
-            if retain_outputs:
-                device_type = "npu" if "npu" in device else (
-                    "cuda" if "cuda" in device else "cpu"
+            alias_prepared_data = prepared_data_list
+            alias_outputs = retained_outputs
+            if direct_preallocated_timing:
+                prepared_output_values = [
+                    tuple(self._prepared_output_values(prepared_value))
+                    for prepared_value in prepared_data_list
+                ]
+                verified_output_tensors = sum(
+                    self._device_tensor_count(value, device_type)
+                    for value in prepared_output_values
                 )
+                if verify_independent_storage:
+                    (
+                        verified_output_sets,
+                        verified_output_ptrs,
+                    ) = self._verify_independent_storage_sets(
+                        prepared_output_values,
+                        device,
+                        "V2 prepared output sets",
+                    )
+                alias_prepared_data = prepared_data_list[:num_warmup]
+                alias_outputs = retained_outputs
+            elif retain_outputs:
                 verified_output_tensors = sum(
                     self._device_tensor_count(value, device_type)
                     for value in retained_outputs
                 )
-            if verify_independent_storage and retain_outputs:
+            if (
+                verify_independent_storage
+                and retain_outputs
+                and not direct_preallocated_timing
+            ):
                 (
                     verified_output_sets,
                     verified_output_ptrs,
@@ -1253,18 +1420,27 @@ class OperatorTestFramework:
             if retain_outputs:
                 verified_output_aliases = (
                     self._count_preallocated_output_aliases(
-                        prepared_data_list,
-                        retained_outputs,
+                        alias_prepared_data,
+                        alias_outputs,
                         device,
                     )
+                )
+            if (
+                direct_preallocated_timing
+                and verified_output_aliases != num_warmup
+            ):
+                raise RuntimeError(
+                    "direct preallocated timing contract failed its warmup "
+                    "return-alias probe; got "
+                    f"{verified_output_aliases}/{num_warmup}"
                 )
             if retain_outputs and hasattr(
                 operator_test, "_verify_preallocated_output_aliases"
             ):
                 provider_verified_aliases = (
                     operator_test._verify_preallocated_output_aliases(
-                        prepared_data_list,
-                        retained_outputs,
+                        alias_prepared_data,
+                        alias_outputs,
                         implementation,
                     )
                 )
@@ -1288,6 +1464,9 @@ class OperatorTestFramework:
                 verified_output_ptrs,
                 verified_output_tensors,
                 verified_output_aliases,
+                timed_output_capture_policy,
+                preallocated_output_contract,
+                output_alias_verification_scope,
             )
         finally:
             test_functions.clear()
@@ -1296,6 +1475,7 @@ class OperatorTestFramework:
             output = None
             prepared_data = None
             run_and_retain = None
+            run_without_retain = None
             provider_context = None
             device_context = None
             gc.collect()
@@ -1382,6 +1562,9 @@ class OperatorTestFramework:
         output_ptr_counts: List[int] = []
         output_tensor_counts: List[int] = []
         output_alias_counts: List[int] = []
+        output_capture_policies: List[str] = []
+        output_contracts: List[str] = []
+        output_alias_scopes: List[str] = []
 
         for repeat_index in range(num_repeats):
             print(
@@ -1396,6 +1579,9 @@ class OperatorTestFramework:
                 verified_output_ptrs,
                 verified_output_tensors,
                 verified_output_aliases,
+                timed_output_capture_policy,
+                preallocated_output_contract,
+                output_alias_verification_scope,
             ) = self._run_core_operator_performance_repeat_v2(
                 operator_test,
                 data,
@@ -1414,6 +1600,9 @@ class OperatorTestFramework:
             output_ptr_counts.append(verified_output_ptrs)
             output_tensor_counts.append(verified_output_tensors)
             output_alias_counts.append(verified_output_aliases)
+            output_capture_policies.append(timed_output_capture_policy)
+            output_contracts.append(preallocated_output_contract)
+            output_alias_scopes.append(output_alias_verification_scope)
 
         avg_time = float(statistics.median(repeat_samples_ms))
         print(
@@ -1454,11 +1643,35 @@ class OperatorTestFramework:
         output_ptr_count = min(output_ptr_counts)
         output_tensor_count = min(output_tensor_counts)
         output_aliases_verified = min(output_alias_counts)
+        if len(set(output_capture_policies)) != 1:
+            raise RuntimeError(
+                "timed output capture policy changed across repeats: "
+                f"{output_capture_policies}"
+            )
+        timed_output_capture_policy = output_capture_policies[0]
+        if len(set(output_contracts)) != 1:
+            raise RuntimeError(
+                "preallocated output contract changed across repeats: "
+                f"{output_contracts}"
+            )
+        preallocated_output_contract = output_contracts[0]
+        if len(set(output_alias_scopes)) != 1:
+            raise RuntimeError(
+                "output alias verification scope changed across repeats: "
+                f"{output_alias_scopes}"
+            )
+        output_alias_verification_scope = output_alias_scopes[0]
         if not retain_outputs:
             output_allocation_mode = "not_retained_unverified"
+        elif timed_output_capture_policy == (
+            "preallocated_output_contract_no_timed_return_capture"
+        ):
+            output_allocation_mode = (
+                "preallocated_output_contract_with_warmup_alias_probe"
+            )
         elif output_aliases_verified == invocations_per_repeat:
             output_allocation_mode = (
-                "preallocated_output_buffers_verified"
+                "preallocated_output_buffers_measured_returns_verified"
             )
         elif output_aliases_verified == 0:
             output_allocation_mode = (
@@ -1497,7 +1710,7 @@ class OperatorTestFramework:
                 "retained_until_repeat_end"
                 if retain_outputs else "not_retained"
             ),
-            protocol_version="operator-test-framework-v2-fresh-v2",
+            protocol_version="operator-test-framework-v2-fresh-v3",
             repeats=num_repeats,
             repeat_samples_ms=repeat_samples_ms,
             aggregation=(
@@ -1522,9 +1735,41 @@ class OperatorTestFramework:
                 if "npu" in device or "cuda" in device
                 else "host wall-clock elapsed time"
             ),
+            timed_output_capture_policy=timed_output_capture_policy,
+            preallocated_output_contract=preallocated_output_contract,
+            output_alias_verification_scope=(
+                output_alias_verification_scope
+            ),
+            preallocated_output_contract_invocations_per_repeat=(
+                invocations_per_repeat
+                if preallocated_output_contract == (
+                    "declared_phase_invariant_out"
+                )
+                else 0
+            ),
+            output_verification_replay_invocations_per_repeat=(
+                0
+            ),
+            total_operator_calls_per_repeat=(
+                invocations_per_repeat
+            ),
             workspace_allocation_policy="not_audited",
             timed_region=(
-                "_execute_core_operator calls only; prepare excluded"
+                (
+                    "_execute_core_operator calls only; prepare excluded; "
+                    "timed Python returns discarded under declared out contract"
+                )
+                if timed_output_capture_policy == (
+                    "preallocated_output_contract_no_timed_return_capture"
+                )
+                else (
+                    "_execute_core_operator plus return retention; "
+                    "prepare excluded"
+                )
+                if timed_output_capture_policy == (
+                    "retained_return_inside_timed_region"
+                )
+                else "_execute_core_operator calls only; prepare excluded"
             ),
         )
     

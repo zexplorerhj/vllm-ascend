@@ -17,6 +17,7 @@ formal_usage() {
 Usage:
   run_tests.sh --formal --operator OP --device DEVICE --output-dir DIR
       [--warmup W] [--iterations I] [--repeats R]
+      [--stabilization-repeats S]
       [--task-queue unset|0|1|2]
       [--shard-index N] [--num-shards M] [--quick] [--dry-run]
 
@@ -165,7 +166,8 @@ if [ "$#" -gt 0 ]; then
     formal_output_dir=""
     formal_warmup=""
     formal_iterations=""
-    formal_repeats=""
+    formal_repeats=5
+    formal_stabilization_repeats=2
     formal_task_queue=unset
     formal_shard_index=0
     formal_num_shards=1
@@ -174,7 +176,7 @@ if [ "$#" -gt 0 ]; then
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --operator|--device|--output-dir|--warmup|--iterations|--repeats|--task-queue|--shard-index|--num-shards)
+            --operator|--device|--output-dir|--warmup|--iterations|--repeats|--stabilization-repeats|--task-queue|--shard-index|--num-shards)
                 [ "$#" -ge 2 ] || formal_error "$1 缺少值"
                 case "$1" in
                     --operator) formal_operator=$2 ;;
@@ -183,6 +185,7 @@ if [ "$#" -gt 0 ]; then
                     --warmup) formal_warmup=$2 ;;
                     --iterations) formal_iterations=$2 ;;
                     --repeats) formal_repeats=$2 ;;
+                    --stabilization-repeats) formal_stabilization_repeats=$2 ;;
                     --task-queue) formal_task_queue=$2 ;;
                     --shard-index) formal_shard_index=$2 ;;
                     --num-shards) formal_num_shards=$2 ;;
@@ -245,6 +248,19 @@ if [ "$#" -gt 0 ]; then
             esac
         fi
     done
+    case "$formal_stabilization_repeats" in
+        ''|*[!0-9]*)
+            formal_error "--stabilization-repeats 必须是非负整数"
+            ;;
+    esac
+    case "$formal_stabilization_repeats" in
+        0|[1-9]*) ;;
+        *)
+            formal_error \
+                "--stabilization-repeats 必须使用规范十进制整数写法"
+            ;;
+    esac
+    export OPERATOR_TEST_STABILIZATION_REPEATS=$formal_stabilization_repeats
     case "$formal_task_queue" in
         unset)
             unset TASK_QUEUE_ENABLE

@@ -118,40 +118,58 @@ python3 tests/test_linear.py --mode accuracy
 
 `run_tests.sh --formal` dispatches the canonical curve entries through
 `OperatorTestFramework.run_core_operator_performance_test_v2`.  Each repeat
-prepares `warmup + iterations` independent input-storage sets before timing;
-the CSV reports the median of the repeat event means and retains every repeat
-sample.
+prepares `warmup + iterations` independent input/workspace-storage sets
+before timing; explicitly designated outputs are audited separately.  The CSV
+reports the median of the measured repeat Event means and retains every
+repeat sample.
 
-Protocol `operator-test-framework-v2-fresh-v4` dispatches the already prepared
-payloads with one direct Python loop.  It does not run an implicit clock-ramp
-kernel.  Device Event elapsed time still includes any stream-idle gap caused
-by Python/ATen launch dispatch, so the reported number is provider
-service-path latency, not a claim of profiler-isolated kernel duration.
+Protocol `operator-test-framework-v2-fresh-v5` first runs two complete
+fresh-storage stabilization repeats, excluded from aggregation, then runs
+five measured repeats by default.  Every stabilization and measured repeat
+independently prepares `W+I` payloads and never reuses an address within that
+repeat; one repeat's lifetime ends before the next begins.  The already
+prepared payloads are dispatched with one direct Python loop; there is no
+implicit clock-ramp kernel.  Device Event elapsed time still includes any
+stream-idle gap caused by Python/ATen launch dispatch, so the reported number
+is provider service-path latency, not a claim of profiler-isolated kernel
+duration.
+CSV provenance records the excluded stabilization samples, measured samples,
+max/min spread, and measured-repeat interquartile spread.
 
-Add, Linear, and recurrent GDN use deterministic adaptive measured iterations
-when the iteration flag is omitted.  All devices use the same
+Add, Linear, RMSNorm, and recurrent GDN use deterministic adaptive measured
+iterations when the iteration flag is omitted.  All devices use the same
 provider-independent byte formula for a shape:
 
 - Add BF16: `6 * elements`
 - square Linear FP16/BF16: `6 * size^2`
+- RMSNorm BF16:
+  `4*elements + 2*hidden + 4*(elements/hidden)`
 - recurrent GDN:
   `534628*T + 524288 + 4*(B+1) + (4*B for MTP3)`
 
 The selected count is
-`max(base_I, min(2048, floor(4 GiB / bytes_per_invocation) - W))`, clamped at
-zero before the outer maximum.  Four GiB is a *soft target*: historical base
-iterations are never reduced, so large shapes can exceed it.  CSV rows record
-the requested/base/effective counts, canonical byte estimate, target,
-estimated repeat footprint, overflow flag, and actual Event-window samples.
-This is stability-depth adaptation; it does not reuse addresses.
+`max(base_I, min(cap, floor(4 GiB / bytes_per_invocation) - W))`, clamped at
+zero before the outer maximum.  The cap is 8192 for Add and 2048 for Linear,
+RMSNorm, and recurrent GDN.  Four GiB is a *soft target*: historical base
+iterations are never reduced, so large shapes can exceed it.  PagedAttention
+uses fixed `W5/I30`; GroupGemm uses fixed `W10/I30`.  CSV rows record the
+requested/base/effective counts, canonical byte estimate, target, estimated
+repeat footprint, overflow flag, and actual Event-window samples.  This is
+stability-depth adaptation; it does not reuse addresses.
 
 When an operator has an explicit preallocated `out=` buffer and declares a
 phase-invariant output contract, all `W+I` output-buffer addresses are checked
-for independence and untimed warmup returns probe the alias contract.  Timed
+for independence, the complete input/workspace and output address domains
+must be disjoint, and untimed warmup returns probe the alias contract.  Timed
 Python return objects are then discarded.  Providers without that contract
 retain every return in Event-external preallocated Python list slots until the
 repeat ends; their slot assignment remains part of timed dispatch.
 Provider-internal workspace allocation remains `not_audited`.
+Only PagedAttention currently has a strict preallocated-output contract on
+both CUDA and NPU.  RMSNorm, FlashAttention, and GroupGemm have asymmetric
+native output-allocation APIs, so comparisons must preserve and disclose the
+per-row `output_allocation_mode`; they are service-path comparisons, not a
+claim of identical allocator-free kernel contracts.
 
 Formal NPU runs unset `TASK_QUEUE_ENABLE` unless
 `--task-queue 0|1|2` is supplied.  The selected value is written to each NPU

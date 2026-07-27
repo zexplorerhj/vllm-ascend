@@ -24,6 +24,7 @@ from operator_test_framework import (
 )
 
 ADD_BASE_ITERATIONS = 20
+ADD_ADAPTIVE_ITERATIONS_CAP = 8192
 
 
 class AddTestSuite(BaseTestSuite):
@@ -198,6 +199,7 @@ class AddTestSuite(BaseTestSuite):
                 requested_iterations=num_iterations,
                 base_iterations=ADD_BASE_ITERATIONS,
                 estimated_unique_bytes_per_invocation=6 * size,
+                adaptive_iterations_cap=ADD_ADAPTIVE_ITERATIONS_CAP,
             )
             effective_iterations = int(
                 iteration_plan["effective_iterations"]

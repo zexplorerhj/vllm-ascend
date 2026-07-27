@@ -102,7 +102,13 @@ def test_formal_all_quick_dispatches_every_precision_without_shapes(tmp_path):
         assert "--num-shards" in command
         assert command[command.index("--num-shards") + 1] == "1"
         assert not forbidden_shape_flags.intersection(command)
-        assert not protocol_flags.intersection(command)
+        present_protocol_flags = protocol_flags.intersection(command)
+        assert present_protocol_flags in (
+            {"--repeats"},
+            {"--tflops-repeats"},
+        )
+        repeat_flag = next(iter(present_protocol_flags))
+        assert command[command.index(repeat_flag) + 1] == "5"
 
         if Path(command[1]).name == "test_recurrent_gated_delta_rule.py":
             assert command[command.index("--output") + 1] == str(
@@ -212,6 +218,110 @@ def test_formal_dispatcher_unsets_task_queue_by_default(tmp_path):
     )
 
     assert task_queue_log.read_text(encoding="utf-8").strip() == "unset"
+
+
+def test_formal_dispatcher_exports_stabilization_repeats(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$OPERATOR_TEST_STABILIZATION_REPEATS\" "
+        "> \"$STABILIZATION_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    stabilization_log = tmp_path / "stabilization.log"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+    environment["STABILIZATION_LOG"] = str(stabilization_log)
+
+    subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "add",
+            "--device",
+            "npu:0",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--stabilization-repeats",
+            "3",
+            "--quick",
+        ],
+        check=True,
+        cwd=OPS_ROOT,
+        env=environment,
+    )
+
+    assert stabilization_log.read_text(encoding="utf-8").strip() == "3"
+
+
+def test_formal_dispatcher_exports_default_stabilization_repeats(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$OPERATOR_TEST_STABILIZATION_REPEATS\" "
+        "> \"$STABILIZATION_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    stabilization_log = tmp_path / "stabilization.log"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+    environment["STABILIZATION_LOG"] = str(stabilization_log)
+
+    subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "add",
+            "--device",
+            "npu:0",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--quick",
+        ],
+        check=True,
+        cwd=OPS_ROOT,
+        env=environment,
+    )
+
+    assert stabilization_log.read_text(encoding="utf-8").strip() == "2"
+
+
+def test_formal_dispatcher_rejects_noncanonical_stabilization_repeats(
+    tmp_path,
+):
+    completed = subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "add",
+            "--device",
+            "npu:0",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--stabilization-repeats",
+            "02",
+            "--dry-run",
+        ],
+        cwd=OPS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "规范十进制" in completed.stderr
+    assert "DRY-RUN:" not in completed.stdout
 
 
 def test_formal_dispatcher_can_explicitly_unset_task_queue(tmp_path):

@@ -13,6 +13,7 @@
 #
 
 from contextlib import contextmanager
+from dataclasses import fields
 import gc
 from pathlib import Path
 import sys
@@ -28,6 +29,7 @@ sys.path.insert(0, str(OPS_ROOT))
 from operator_test_framework import (  # noqa: E402
     BaseOperatorTest,
     OperatorTestFramework,
+    PerformanceMetrics,
     PrecisionType,
     build_curve_selection_provenance,
     build_fresh_iteration_plan,
@@ -145,6 +147,41 @@ class _InPlaceInputAliasOperator(_FreshCpuOperator):
         return prepared_data["x"]
 
 
+class _CrossInvocationInputAliasOperator(_FreshCpuOperator):
+
+    def __init__(self):
+        super().__init__()
+        self.prepared_inputs = []
+
+    def _prepare_data_for_core_operator(
+        self,
+        data,
+        device,
+        precision,
+        implementation="default",
+    ):
+        prepared = super()._prepare_data_for_core_operator(
+            data,
+            device,
+            precision,
+            implementation,
+        )
+        self.prepared_inputs.append(prepared["x"])
+        return prepared
+
+    def _execute_core_operator(
+        self,
+        prepared_data,
+        implementation="default",
+    ):
+        del prepared_data, implementation
+        output_index = (self.execute_calls + 1) % len(
+            self.prepared_inputs
+        )
+        self.execute_calls += 1
+        return self.prepared_inputs[output_index]
+
+
 class _IgnoredPreallocatedOutputOperator(_PreallocatedOutputOperator):
 
     def _execute_core_operator(self, prepared_data, implementation="default"):
@@ -221,8 +258,100 @@ class _RepeatLifetimeOperator(_FreshCpuOperator):
         return output
 
 
+class _DirectRepeatLifetimeOperator(_PreallocatedOutputOperator):
+
+    def __init__(self, invocations_per_repeat):
+        super().__init__()
+        self.invocations_per_repeat = invocations_per_repeat
+        self.current_input_refs = []
+        self.current_output_refs = []
+        self.alive_at_repeat_start = []
+
+    def _prepare_data_for_core_operator(
+        self,
+        data,
+        device,
+        precision,
+        implementation="default",
+    ):
+        invocation_index = self.prepare_calls % self.invocations_per_repeat
+        if invocation_index == 0 and self.prepare_calls:
+            gc.collect()
+            self.alive_at_repeat_start.append((
+                sum(ref() is not None for ref in self.current_input_refs),
+                sum(ref() is not None for ref in self.current_output_refs),
+            ))
+            self.current_input_refs = []
+            self.current_output_refs = []
+        prepared = super()._prepare_data_for_core_operator(
+            data,
+            device,
+            precision,
+            implementation,
+        )
+        self.current_input_refs.append(weakref.ref(prepared["x"]))
+        self.current_output_refs.append(weakref.ref(prepared["output"]))
+        return prepared
+
+
 def _framework(tmp_path):
     return OperatorTestFramework(result_dir=str(tmp_path / "results"))
+
+
+def test_performance_metrics_keeps_v4_positional_field_order():
+    legacy_fields = (
+        "avg_time_ms",
+        "throughput",
+        "precision_type",
+        "device_type",
+        "operator_name",
+        "iterations",
+        "throughput_ops_per_sec",
+        "tops",
+        "bandwidth_gb_s",
+        "framework_api",
+        "warmup_iterations",
+        "preallocated_input_sets",
+        "independent_storage_sets_verified",
+        "independent_output_storage_sets_verified",
+        "preallocated_output_aliases_verified",
+        "output_allocation_mode",
+        "output_storage_policy",
+        "protocol_version",
+        "repeats",
+        "repeat_samples_ms",
+        "aggregation",
+        "preallocated_invocations_per_repeat",
+        "input_storage_sets_verified",
+        "input_storage_ptr_count",
+        "output_storage_sets_verified",
+        "output_storage_ptr_count",
+        "output_tensor_count",
+        "input_reuse_within_repeat",
+        "timing_method",
+        "timing_semantics",
+        "timed_output_capture_policy",
+        "preallocated_output_contract",
+        "output_alias_verification_scope",
+        "preallocated_output_contract_invocations_per_repeat",
+        "output_verification_replay_invocations_per_repeat",
+        "total_operator_calls_per_repeat",
+        "workspace_allocation_policy",
+        "dispatch_loop_policy",
+        "device_stabilization_policy",
+        "device_stabilization_timed",
+        "task_queue_enable",
+        "timed_region",
+    )
+    actual_fields = tuple(field.name for field in fields(PerformanceMetrics))
+
+    assert actual_fields[:len(legacy_fields)] == legacy_fields
+    assert actual_fields[len(legacy_fields):] == (
+        "stabilization_repeats",
+        "stabilization_repeat_samples_ms",
+        "input_output_storage_disjoint",
+        "stabilization_operator_calls",
+    )
 
 
 def _execute_measurement_payloads(
@@ -275,6 +404,37 @@ def test_fresh_iteration_plan_honors_explicit_count():
     assert plan["iteration_selection_policy"] == "explicit_fixed"
     assert plan["requested_iterations"] == 7
     assert plan["effective_iterations"] == 7
+
+
+def test_nested_output_collection_matches_input_exclusion():
+    input_tensor = torch.empty(8)
+    output_tensor = torch.empty(8)
+    prepared = {
+        "x": input_tensor,
+        "providers": [
+            {
+                "metadata": "nested",
+                "output": output_tensor,
+            }
+        ],
+    }
+
+    outputs = OperatorTestFramework._prepared_output_values(prepared)
+    assert len(outputs) == 1
+    assert outputs[0] is output_tensor
+
+    inputs = OperatorTestFramework._prepared_input_values(prepared)
+    input_ptrs = OperatorTestFramework._device_storage_ptrs(
+        inputs,
+        "cpu",
+    )
+    output_ptrs = OperatorTestFramework._device_storage_ptrs(
+        outputs,
+        "cpu",
+    )
+    assert input_tensor.untyped_storage().data_ptr() in input_ptrs
+    assert output_tensor.untyped_storage().data_ptr() not in input_ptrs
+    assert output_tensor.untyped_storage().data_ptr() in output_ptrs
 
 
 def test_dispatch_writes_preallocated_output_slots_without_growth():
@@ -338,6 +498,94 @@ def test_v2_preallocates_each_repeat_and_uses_median(monkeypatch, tmp_path):
     assert metrics.preallocated_invocations_per_repeat == 3
     assert metrics.input_storage_sets_verified == 3
     assert metrics.output_storage_sets_verified == 3
+
+
+def test_v2_excludes_full_window_stabilization_repeats(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _FreshCpuOperator()
+    repeat_means = iter([9.0, 8.0, 3.0, 1.0, 2.0])
+
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
+        return next(repeat_means)
+
+    monkeypatch.setattr(
+        framework,
+        "_measure_execution_time_v2",
+        measure,
+    )
+
+    metrics = framework.run_core_operator_performance_test_v2(
+        operator_test=operator,
+        data=operator.generate_test_data(),
+        device="cpu",
+        precision=PrecisionType.FP32,
+        num_warmup=1,
+        num_iterations=2,
+        num_repeats=3,
+        num_stabilization_repeats=2,
+        retain_outputs=True,
+        verify_independent_storage=True,
+    )
+
+    assert operator.prepare_calls == 5 * (1 + 2)
+    assert operator.execute_calls == 5 * (1 + 2)
+    assert metrics.stabilization_repeat_samples_ms == [9.0, 8.0]
+    assert metrics.repeat_samples_ms == [3.0, 1.0, 2.0]
+    assert metrics.avg_time_ms == 2.0
+    assert metrics.aggregation == (
+        "median_of_post_stabilization_repeat_means"
+    )
+    assert metrics.device_stabilization_policy == (
+        "fresh_storage_full_window_priming_repeats"
+    )
+    assert metrics.device_stabilization_timed is True
+    assert metrics.stabilization_operator_calls == 2 * (1 + 2)
+
+    provenance = framework.performance_provenance(metrics)
+    assert provenance["stabilization_repeats"] == 2
+    assert provenance["stabilization_repeat_samples_ms"] == "[9.0, 8.0]"
+    assert provenance["repeat_p25_ms"] == 1.5
+    assert provenance["repeat_p75_ms"] == 2.5
+    assert provenance["repeat_iqr_pct"] == 50.0
+
+
+def test_v2_rejects_noncanonical_stabilization_environment(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _FreshCpuOperator()
+    monkeypatch.setenv("OPERATOR_TEST_STABILIZATION_REPEATS", "02")
+
+    with pytest.raises(
+        ValueError,
+        match="canonical base-10 integer syntax",
+    ):
+        framework.run_core_operator_performance_test_v2(
+            operator_test=operator,
+            data=operator.generate_test_data(),
+            device="cpu",
+            precision=PrecisionType.FP32,
+            num_warmup=1,
+            num_iterations=2,
+            num_repeats=1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -488,10 +736,12 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "framework_api": (
             "OperatorTestFramework.run_core_operator_performance_test_v2"
         ),
-        "protocol_version": "operator-test-framework-v2-fresh-v4",
+        "protocol_version": "operator-test-framework-v2-fresh-v5",
         "warmup": 1,
         "iterations": 2,
         "repeats": 2,
+        "stabilization_repeats": 0,
+        "stabilization_repeat_samples_ms": "[]",
         "repeat_samples_ms": "[0.25, 0.25]",
         "event_window_samples_ms": "[0.5, 0.5]",
         "event_window_min_ms": 0.5,
@@ -500,12 +750,16 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "repeat_min_ms": 0.25,
         "repeat_median_ms": 0.25,
         "repeat_max_ms": 0.25,
+        "repeat_p25_ms": 0.25,
+        "repeat_p75_ms": 0.25,
+        "repeat_iqr_pct": 0.0,
         "repeat_spread_pct": 0.0,
         "aggregation": "median_of_repeat_means",
         "preallocated_invocations_per_repeat": 3,
         "input_reuse_within_repeat": False,
         "input_storage_sets_verified": 3,
         "input_storage_ptr_count": 3,
+        "input_output_storage_disjoint": True,
         "output_storage_sets_verified": 3,
         "output_storage_ptr_count": 3,
         "output_tensor_count": 3,
@@ -536,6 +790,7 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "dispatch_loop_policy": "python_direct_prepared_payload_loop",
         "device_stabilization_policy": "none",
         "device_stabilization_timed": False,
+        "stabilization_operator_calls": 0,
         "task_queue_enable": "not_applicable",
         "timed_region": (
             "Python direct prepared-payload loop of "
@@ -586,6 +841,11 @@ def test_v2_proves_preallocated_output_aliases(monkeypatch, tmp_path):
 
     assert metrics.preallocated_output_aliases_verified == 1
     assert operator.execute_calls == 3
+    assert metrics.input_storage_sets_verified == 3
+    assert metrics.input_storage_ptr_count == 3
+    assert metrics.input_output_storage_disjoint is True
+    assert metrics.output_storage_sets_verified == 3
+    assert metrics.output_storage_ptr_count == 3
     assert metrics.output_allocation_mode == (
         "preallocated_output_contract_with_warmup_alias_probe"
     )
@@ -614,7 +874,7 @@ def test_v2_proves_preallocated_output_aliases(monkeypatch, tmp_path):
     )
 
 
-def test_v2_does_not_mislabel_in_place_input_as_preallocated_output(
+def test_v2_rejects_input_output_storage_alias(
     monkeypatch,
     tmp_path,
 ):
@@ -642,21 +902,64 @@ def test_v2_does_not_mislabel_in_place_input_as_preallocated_output(
         "_measure_execution_time_v2",
         measure,
     )
-    metrics = framework.run_core_operator_performance_test_v2(
-        operator_test=operator,
-        data=operator.generate_test_data(),
-        device="cpu",
-        precision=PrecisionType.FP32,
-        num_warmup=1,
-        num_iterations=2,
-        retain_outputs=True,
-        verify_independent_storage=True,
-    )
+    with pytest.raises(
+        RuntimeError,
+        match="input/workspace and output storage domains overlap",
+    ):
+        framework.run_core_operator_performance_test_v2(
+            operator_test=operator,
+            data=operator.generate_test_data(),
+            device="cpu",
+            precision=PrecisionType.FP32,
+            num_warmup=1,
+            num_iterations=2,
+            retain_outputs=True,
+            verify_independent_storage=True,
+        )
 
-    assert metrics.preallocated_output_aliases_verified == 0
-    assert metrics.output_allocation_mode == (
-        "no_preallocated_output_buffer_verified"
+
+def test_v2_rejects_cross_invocation_input_output_alias(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _CrossInvocationInputAliasOperator()
+
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
+        return 0.25
+
+    monkeypatch.setattr(
+        framework,
+        "_measure_execution_time_v2",
+        measure,
     )
+    with pytest.raises(
+        RuntimeError,
+        match="input/workspace and output storage domains overlap",
+    ):
+        framework.run_core_operator_performance_test_v2(
+            operator_test=operator,
+            data=operator.generate_test_data(),
+            device="cpu",
+            precision=PrecisionType.FP32,
+            num_warmup=1,
+            num_iterations=2,
+            retain_outputs=True,
+            verify_independent_storage=True,
+        )
 
 
 def test_v2_rejects_direct_path_when_prepared_output_is_ignored(
@@ -897,6 +1200,25 @@ def test_v2_releases_repeat_storage_before_next_repeat(tmp_path):
         num_iterations=1,
         num_repeats=3,
         retain_outputs=True,
+    )
+
+    assert operator.alive_at_repeat_start == [(0, 0), (0, 0)]
+
+
+def test_v2_releases_direct_output_storage_before_next_repeat(tmp_path):
+    framework = _framework(tmp_path)
+    operator = _DirectRepeatLifetimeOperator(invocations_per_repeat=2)
+
+    framework.run_core_operator_performance_test_v2(
+        operator_test=operator,
+        data=operator.generate_test_data(),
+        device="cpu",
+        precision=PrecisionType.FP32,
+        num_warmup=1,
+        num_iterations=1,
+        num_repeats=3,
+        retain_outputs=True,
+        verify_independent_storage=True,
     )
 
     assert operator.alive_at_repeat_start == [(0, 0), (0, 0)]

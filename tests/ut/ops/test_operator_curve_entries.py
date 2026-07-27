@@ -29,7 +29,10 @@ from tests.test_flash_attention import FlashAttentionTestSuite  # noqa: E402
 from tests.test_groupgemm import GroupGemmTestSuite  # noqa: E402
 from tests.test_linear import LinearTestSuite  # noqa: E402
 from tests.test_paged_attention import PagedAttentionTestSuite  # noqa: E402
-from tests.test_rmsnorm import RMSNormTestSuite  # noqa: E402
+from tests.test_rmsnorm import (  # noqa: E402
+    RMSNormTestSuite,
+    estimate_rmsnorm_fresh_bytes,
+)
 import recurrent_gated_delta_rule.benchmark as recurrent_benchmark  # noqa: E402
 import tests.test_recurrent_gated_delta_rule  # noqa: E402,F401
 
@@ -38,10 +41,12 @@ PROVENANCE = {
     "framework_api": (
         "OperatorTestFramework.run_core_operator_performance_test_v2"
     ),
-    "protocol_version": "operator-test-framework-v2-fresh-v4",
+    "protocol_version": "operator-test-framework-v2-fresh-v5",
     "warmup": 1,
     "iterations": 2,
     "repeats": 3,
+    "stabilization_repeats": 0,
+    "stabilization_repeat_samples_ms": "[]",
     "repeat_samples_ms": "[1.5, 1.0, 2.0]",
     "event_window_samples_ms": "[3.0, 2.0, 4.0]",
     "event_window_min_ms": 2.0,
@@ -50,12 +55,16 @@ PROVENANCE = {
     "repeat_min_ms": 1.0,
     "repeat_median_ms": 1.5,
     "repeat_max_ms": 2.0,
+    "repeat_p25_ms": 1.25,
+    "repeat_p75_ms": 1.75,
+    "repeat_iqr_pct": 100.0 / 3.0,
     "repeat_spread_pct": 100.0,
     "aggregation": "median_of_repeat_means",
     "preallocated_invocations_per_repeat": 3,
     "input_reuse_within_repeat": False,
     "input_storage_sets_verified": 3,
-    "input_storage_ptr_count": 6,
+    "input_storage_ptr_count": 3,
+    "input_output_storage_disjoint": True,
     "output_storage_sets_verified": 3,
     "output_storage_ptr_count": 3,
     "output_tensor_count": 3,
@@ -87,6 +96,7 @@ PROVENANCE = {
     "dispatch_loop_policy": "python_direct_prepared_payload_loop",
     "device_stabilization_policy": "none",
     "device_stabilization_timed": False,
+    "stabilization_operator_calls": 0,
     "task_queue_enable": "not_applicable",
     "timed_region": (
         "Python direct prepared-payload loop of _execute_core_operator; "
@@ -328,11 +338,11 @@ def test_add_auto_iterations_match_effective_csv_count(
     )
 
     row = result["rows"][0]
-    assert framework.calls[0]["num_iterations"] == 2048
+    assert framework.calls[0]["num_iterations"] == 8192
     assert row["iteration_selection_policy"] == (
         "adaptive_unique_storage_soft_target"
     )
-    assert row["iterations"] == row["effective_iterations"] == 2048
+    assert row["iterations"] == row["effective_iterations"] == 8192
     assert row["estimated_unique_bytes_per_invocation"] == 6 * 4096
 
 
@@ -402,6 +412,44 @@ def test_rmsnorm_each_formal_point_uses_one_v2_call(
         selected=1,
         complete=False,
     )
+
+
+def test_rmsnorm_auto_iterations_use_cross_provider_byte_formula(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _FakeFramework(tmp_path)
+    suite = RMSNormTestSuite()
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["cuda_vllm_rms_norm_out"])
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        framework,
+        "performance_provenance",
+        lambda metrics: _adaptive_provenance(framework),
+    )
+
+    result = suite.run_bandwidth_test(
+        sizes=[4096],
+        hidden_sizes=[1024],
+        target_total_elements=4096,
+        device="cuda:0",
+        num_warmup=10,
+        num_iterations=None,
+        num_repeats=3,
+        plot_results=False,
+        shard_index=0,
+        num_shards=2,
+    )
+
+    assert len(framework.calls) == 1
+    assert framework.calls[0]["num_iterations"] == 2048
+    row = result["size_rows"][0]
+    assert row["iterations"] == row["effective_iterations"] == 2048
+    assert row["estimated_unique_bytes_per_invocation"] == (
+        estimate_rmsnorm_fresh_bytes(4096, 4096)
+    )
+    assert row["estimated_unique_bytes_per_invocation"] == 24580
 
 
 def test_flash_cuda_runs_both_formal_providers_once_per_point(
@@ -516,7 +564,6 @@ def test_paged_attention_two_matrices_make_one_v2_call_per_point(
         batch_step=1,
         batch_curve_seq_lens=[128],
         num_warmup=5,
-        num_iterations=20,
         repeats=3,
         num_blocks=10000,
         block_size=128,
@@ -525,7 +572,7 @@ def test_paged_attention_two_matrices_make_one_v2_call_per_point(
 
     assert len(framework.calls) == 2
     for call in framework.calls:
-        _assert_formal_call(call, 5, 20, 3, "cuda_flashinfer_fa2")
+        _assert_formal_call(call, 5, 30, 3, "cuda_flashinfer_fa2")
         assert call["data"]["block_size"] == 128
         assert call["data"]["num_heads"] == 8
         assert call["data"]["num_kv_heads"] == 1

@@ -11,11 +11,36 @@ from typing import Dict, Any, List
 from tests.base_test_suite import BaseTestSuite
 from rmsnorm.rmsnorm_operator import RMSNormOperatorTest
 from operator_test_framework import (
+    FRESH_ITERATION_PLAN_FIELDS,
     PERFORMANCE_PROVENANCE_FIELDS,
     OperatorTestFramework,
     build_curve_selection_provenance,
+    build_fresh_iteration_plan,
     finalize_curve_coverage,
 )
+
+RMSNORM_BASE_ITERATIONS = 50
+RMSNORM_ADAPTIVE_ITERATIONS_CAP = 2048
+
+
+def estimate_rmsnorm_fresh_bytes(
+    total_elements: int,
+    hidden_size: int,
+) -> int:
+    """Provider-independent peak retained bytes for one BF16 invocation."""
+    if (
+        total_elements <= 0
+        or hidden_size <= 0
+        or total_elements % hidden_size
+    ):
+        raise ValueError(
+            "RMSNorm total_elements must be positive and divisible by "
+            "hidden_size"
+        )
+    rows = total_elements // hidden_size
+    # Worst formal provider retains BF16 x + gamma + y and FP32 rstd.
+    return 4 * total_elements + 2 * hidden_size + 4 * rows
+
 
 class RMSNormTestSuite(BaseTestSuite):
     """RMSNorm算子测试套件"""
@@ -121,7 +146,7 @@ class RMSNormTestSuite(BaseTestSuite):
         target_total_elements=64 * 1024 * 1024,
         device="auto",
         num_warmup=10,
-        num_iterations=50,
+        num_iterations=None,
         num_repeats=3,
         plot_results=True,
         quick=False,
@@ -244,7 +269,7 @@ class RMSNormTestSuite(BaseTestSuite):
             "curve",
             "total_elements", "hidden_size", "provider", "device",
             "precision", "avg_time_ms", "bandwidth_gb_s", "status",
-            "error", *provenance_fields,
+            "error", *FRESH_ITERATION_PLAN_FIELDS, *provenance_fields,
         ]
         size_rows = []
         hidden_rows = []
@@ -253,6 +278,23 @@ class RMSNormTestSuite(BaseTestSuite):
         def measure_point(
             point_index, curve, total_elements, hidden_size
         ):
+            iteration_plan = build_fresh_iteration_plan(
+                num_warmup=num_warmup,
+                requested_iterations=num_iterations,
+                base_iterations=RMSNORM_BASE_ITERATIONS,
+                estimated_unique_bytes_per_invocation=(
+                    estimate_rmsnorm_fresh_bytes(
+                        total_elements,
+                        hidden_size,
+                    )
+                ),
+                adaptive_iterations_cap=(
+                    RMSNORM_ADAPTIVE_ITERATIONS_CAP
+                ),
+            )
+            effective_iterations = int(
+                iteration_plan["effective_iterations"]
+            )
             row = {
                 "point_index": point_index,
                 "shard_index": shard_index,
@@ -268,8 +310,9 @@ class RMSNormTestSuite(BaseTestSuite):
                 "bandwidth_gb_s": "",
                 "status": "pending",
                 "error": "",
+                **iteration_plan,
                 "warmup": num_warmup,
-                "iterations": num_iterations,
+                "iterations": effective_iterations,
                 "repeats": num_repeats,
             }
             try:
@@ -284,7 +327,7 @@ class RMSNormTestSuite(BaseTestSuite):
                         precision=PrecisionType.BF16,
                         implementation=implementation,
                         num_warmup=num_warmup,
-                        num_iterations=num_iterations,
+                        num_iterations=effective_iterations,
                         num_repeats=num_repeats,
                         retain_outputs=True,
                         verify_independent_storage=True,
@@ -422,7 +465,15 @@ def main():
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help=(
+            "fixed measured iterations; omitted selects deterministic "
+            "fresh-storage adaptive iterations"
+        ),
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--sizes", type=int, nargs="+")
     parser.add_argument("--hidden-sizes", type=int, nargs="+")

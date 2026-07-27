@@ -222,6 +222,14 @@ class PerformanceMetrics:
     device_stabilization_timed: bool = False
     task_queue_enable: Optional[str] = None
     timed_region: Optional[str] = None
+    # V5 fields are appended so legacy positional construction keeps the
+    # exact V4 field order. Framework code constructs metrics by keyword.
+    stabilization_repeats: int = 0
+    stabilization_repeat_samples_ms: List[float] = field(
+        default_factory=list
+    )
+    input_output_storage_disjoint: bool = False
+    stabilization_operator_calls: int = 0
     
     def __post_init__(self):
         """初始化后处理，确保throughput_ops_per_sec有值"""
@@ -250,6 +258,8 @@ PERFORMANCE_PROVENANCE_FIELDS = (
     "warmup",
     "iterations",
     "repeats",
+    "stabilization_repeats",
+    "stabilization_repeat_samples_ms",
     "repeat_samples_ms",
     "event_window_samples_ms",
     "event_window_min_ms",
@@ -258,12 +268,16 @@ PERFORMANCE_PROVENANCE_FIELDS = (
     "repeat_min_ms",
     "repeat_median_ms",
     "repeat_max_ms",
+    "repeat_p25_ms",
+    "repeat_p75_ms",
+    "repeat_iqr_pct",
     "repeat_spread_pct",
     "aggregation",
     "preallocated_invocations_per_repeat",
     "input_reuse_within_repeat",
     "input_storage_sets_verified",
     "input_storage_ptr_count",
+    "input_output_storage_disjoint",
     "output_storage_sets_verified",
     "output_storage_ptr_count",
     "output_tensor_count",
@@ -286,6 +300,7 @@ PERFORMANCE_PROVENANCE_FIELDS = (
     "dispatch_loop_policy",
     "device_stabilization_policy",
     "device_stabilization_timed",
+    "stabilization_operator_calls",
     "task_queue_enable",
     "timed_region",
 )
@@ -565,7 +580,15 @@ class BaseOperatorTest(ABC):
 
 class OperatorTestFramework:
     """算子测试框架"""
-    
+
+    _PREPARED_OUTPUT_KEYS = frozenset({
+        "out",
+        "output",
+        "outputs",
+        "output_buffers",
+        "expert_outputs",
+    })
+
     def __init__(self, result_dir: str = "test_results"):
         self.result_dir = Path(result_dir)
         self.result_dir.mkdir(exist_ok=True)
@@ -626,24 +649,42 @@ class OperatorTestFramework:
         prepared: Any,
     ) -> List[Any]:
         """Collect values explicitly designated as prepared outputs."""
-        output_keys = {
-            "out",
-            "output",
-            "outputs",
-            "output_buffers",
-            "expert_outputs",
-        }
         outputs: List[Any] = []
-        if not isinstance(prepared, dict):
-            return outputs
-        for key, value in prepared.items():
-            if key in output_keys:
-                outputs.append(value)
-            elif isinstance(value, dict):
+        if isinstance(prepared, dict):
+            for key, value in prepared.items():
+                if key in cls._PREPARED_OUTPUT_KEYS:
+                    outputs.append(value)
+                else:
+                    outputs.extend(
+                        cls._prepared_output_values(value)
+                    )
+        elif isinstance(prepared, (list, tuple)):
+            for value in prepared:
                 outputs.extend(
                     cls._prepared_output_values(value)
                 )
         return outputs
+
+    @classmethod
+    def _prepared_input_values(cls, prepared: Any) -> Any:
+        """Return a nested view with explicitly designated outputs removed."""
+        if isinstance(prepared, dict):
+            return {
+                key: cls._prepared_input_values(value)
+                for key, value in prepared.items()
+                if key not in cls._PREPARED_OUTPUT_KEYS
+            }
+        if isinstance(prepared, list):
+            return [
+                cls._prepared_input_values(value)
+                for value in prepared
+            ]
+        if isinstance(prepared, tuple):
+            return tuple(
+                cls._prepared_input_values(value)
+                for value in prepared
+            )
+        return prepared
 
     @classmethod
     def _prepared_output_storage_ptrs(
@@ -685,6 +726,36 @@ class OperatorTestFramework:
             seen.update(current)
             verified += 1
         return verified, len(seen)
+
+    @classmethod
+    def _verify_disjoint_storage_domains(
+        cls,
+        left_values: Any,
+        right_values: Any,
+        device: str,
+        label: str,
+    ) -> None:
+        """Fail when two prepared/retained storage domains overlap."""
+        device_type = "npu" if "npu" in device else (
+            "cuda" if "cuda" in device else "cpu"
+        )
+        left_ptrs = cls._device_storage_ptrs(
+            left_values,
+            device_type,
+        )
+        right_ptrs = cls._device_storage_ptrs(
+            right_values,
+            device_type,
+        )
+        if not left_ptrs or not right_ptrs:
+            raise RuntimeError(
+                f"{label} requires non-empty {device_type} storage domains"
+            )
+        overlap = left_ptrs.intersection(right_ptrs)
+        if overlap:
+            raise RuntimeError(
+                f"{label} overlap_count={len(overlap)}"
+            )
 
     @classmethod
     def _count_preallocated_output_aliases(
@@ -736,6 +807,18 @@ class OperatorTestFramework:
             max(metrics.repeat_samples_ms)
             if metrics.repeat_samples_ms else None
         )
+        if len(metrics.repeat_samples_ms) >= 2:
+            repeat_p25_ms, _, repeat_p75_ms = statistics.quantiles(
+                metrics.repeat_samples_ms,
+                n=4,
+                method="inclusive",
+            )
+        elif metrics.repeat_samples_ms:
+            repeat_p25_ms = metrics.repeat_samples_ms[0]
+            repeat_p75_ms = metrics.repeat_samples_ms[0]
+        else:
+            repeat_p25_ms = None
+            repeat_p75_ms = None
         event_window_samples_ms = [
             sample * metrics.iterations
             for sample in metrics.repeat_samples_ms
@@ -757,6 +840,16 @@ class OperatorTestFramework:
             if repeat_min_ms is not None
             and repeat_max_ms is not None
             and repeat_min_ms > 0
+            else None
+        )
+        repeat_iqr_pct = (
+            (repeat_p75_ms - repeat_p25_ms)
+            / repeat_median_ms
+            * 100.0
+            if repeat_p25_ms is not None
+            and repeat_p75_ms is not None
+            and repeat_median_ms is not None
+            and repeat_median_ms > 0
             else None
         )
         output_tensors_per_set = (
@@ -781,6 +874,10 @@ class OperatorTestFramework:
             "warmup": metrics.warmup_iterations,
             "iterations": metrics.iterations,
             "repeats": metrics.repeats,
+            "stabilization_repeats": metrics.stabilization_repeats,
+            "stabilization_repeat_samples_ms": json.dumps(
+                metrics.stabilization_repeat_samples_ms
+            ),
             "repeat_samples_ms": json.dumps(metrics.repeat_samples_ms),
             "event_window_samples_ms": json.dumps(
                 event_window_samples_ms
@@ -791,6 +888,9 @@ class OperatorTestFramework:
             "repeat_min_ms": repeat_min_ms,
             "repeat_median_ms": repeat_median_ms,
             "repeat_max_ms": repeat_max_ms,
+            "repeat_p25_ms": repeat_p25_ms,
+            "repeat_p75_ms": repeat_p75_ms,
+            "repeat_iqr_pct": repeat_iqr_pct,
             "repeat_spread_pct": repeat_spread_pct,
             "aggregation": metrics.aggregation,
             "preallocated_invocations_per_repeat": (
@@ -801,6 +901,9 @@ class OperatorTestFramework:
                 metrics.input_storage_sets_verified
             ),
             "input_storage_ptr_count": metrics.input_storage_ptr_count,
+            "input_output_storage_disjoint": (
+                metrics.input_output_storage_disjoint
+            ),
             "output_storage_sets_verified": (
                 metrics.output_storage_sets_verified
             ),
@@ -849,6 +952,9 @@ class OperatorTestFramework:
             ),
             "device_stabilization_timed": (
                 metrics.device_stabilization_timed
+            ),
+            "stabilization_operator_calls": (
+                metrics.stabilization_operator_calls
             ),
             "task_queue_enable": metrics.task_queue_enable,
             "timed_region": metrics.timed_region,
@@ -1347,6 +1453,12 @@ class OperatorTestFramework:
             ]
         ] = None
         prepared_data = None
+        prepared_input_values = None
+        prepared_output_values = None
+        alias_prepared_data = None
+        alias_outputs = None
+        output_domain_values = None
+        timed_retained_outputs = None
         output = None
         execute_core_operator = None
         provider_context = None
@@ -1379,13 +1491,17 @@ class OperatorTestFramework:
             verified_input_sets = 0
             verified_input_ptrs = 0
             if verify_independent_storage:
+                prepared_input_values = [
+                    self._prepared_input_values(prepared_value)
+                    for prepared_value in prepared_data_list
+                ]
                 (
                     verified_input_sets,
                     verified_input_ptrs,
                 ) = self._verify_independent_storage_sets(
-                    prepared_data_list,
+                    prepared_input_values,
                     device,
-                    "V2 prepared input sets",
+                    "V2 prepared input/workspace sets",
                 )
 
             if "npu" in device:
@@ -1490,7 +1606,6 @@ class OperatorTestFramework:
                 elif "cuda" in device:
                     torch.cuda.synchronize(torch.device(device))
 
-                timed_retained_outputs = None
                 if not direct_preallocated_timing and retain_outputs:
                     retained_outputs.extend([None] * num_iterations)
                     timed_retained_outputs = retained_outputs
@@ -1593,6 +1708,19 @@ class OperatorTestFramework:
                         f"{verified_output_aliases}"
                     )
 
+            if verify_independent_storage and retain_outputs:
+                output_domain_values = (
+                    prepared_output_values
+                    if direct_preallocated_timing
+                    else retained_outputs
+                )
+                self._verify_disjoint_storage_domains(
+                    prepared_input_values,
+                    output_domain_values,
+                    device,
+                    "V2 input/workspace and output storage domains",
+                )
+
             result = (
                 float(repeat_time_ms),
                 verified_input_sets,
@@ -1610,6 +1738,12 @@ class OperatorTestFramework:
             prepared_data_list.clear()
             output = None
             prepared_data = None
+            prepared_input_values = None
+            prepared_output_values = None
+            alias_prepared_data = None
+            alias_outputs = None
+            output_domain_values = None
+            timed_retained_outputs = None
             execute_core_operator = None
             provider_context = None
             device_context = None
@@ -1640,16 +1774,42 @@ class OperatorTestFramework:
         num_repeats: int = 1,
         retain_outputs: bool = True,
         verify_independent_storage: bool = False,
+        num_stabilization_repeats: Optional[int] = None,
     ) -> PerformanceMetrics:
         """Measure the core operator with preallocated fresh storage.
 
         Every repeat independently prepares ``num_warmup + num_iterations``
-        payloads. The reported latency is the median of repeat event means.
+        payloads. Optional full-window stabilization repeats use the same
+        fresh-storage contract but are excluded from the reported median.
         """
+        if num_stabilization_repeats is None:
+            raw_stabilization_repeats = os.environ.get(
+                "OPERATOR_TEST_STABILIZATION_REPEATS",
+                "0",
+            )
+            try:
+                num_stabilization_repeats = int(
+                    raw_stabilization_repeats
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "OPERATOR_TEST_STABILIZATION_REPEATS must be a "
+                    "non-negative integer"
+                ) from exc
+            if str(num_stabilization_repeats) != raw_stabilization_repeats:
+                raise ValueError(
+                    "OPERATOR_TEST_STABILIZATION_REPEATS must use canonical "
+                    "base-10 integer syntax"
+                )
         for count_name, count_value, minimum in (
             ("num_warmup", num_warmup, 0),
             ("num_iterations", num_iterations, 1),
             ("num_repeats", num_repeats, 1),
+            (
+                "num_stabilization_repeats",
+                num_stabilization_repeats,
+                0,
+            ),
         ):
             if not isinstance(count_value, int) or isinstance(
                 count_value,
@@ -1663,8 +1823,8 @@ class OperatorTestFramework:
 
         print(
             f"  核心算子性能测试 V2: {device} - {precision.name} - "
-            f"{implementation} - W{num_warmup}/I{num_iterations}/"
-            f"R{num_repeats}"
+            f"{implementation} - S{num_stabilization_repeats}/"
+            f"W{num_warmup}/I{num_iterations}/R{num_repeats}"
         )
 
         has_prepare = hasattr(
@@ -1672,7 +1832,11 @@ class OperatorTestFramework:
         )
         has_execute = hasattr(operator_test, "_execute_core_operator")
         if not has_prepare or not has_execute:
-            if num_repeats != 1 or verify_independent_storage:
+            if (
+                num_repeats != 1
+                or num_stabilization_repeats
+                or verify_independent_storage
+            ):
                 raise RuntimeError(
                     "strict Framework V2 requires "
                     "_prepare_data_for_core_operator and "
@@ -1690,6 +1854,7 @@ class OperatorTestFramework:
             )
 
         invocations_per_repeat = num_warmup + num_iterations
+        stabilization_repeat_samples_ms: List[float] = []
         repeat_samples_ms: List[float] = []
         input_set_counts: List[int] = []
         input_ptr_counts: List[int] = []
@@ -1701,9 +1866,28 @@ class OperatorTestFramework:
         output_contracts: List[str] = []
         output_alias_scopes: List[str] = []
 
-        for repeat_index in range(num_repeats):
+        total_repeats = num_stabilization_repeats + num_repeats
+        for repeat_index in range(total_repeats):
+            is_stabilization = (
+                repeat_index < num_stabilization_repeats
+            )
+            phase_index = (
+                repeat_index
+                if is_stabilization
+                else repeat_index - num_stabilization_repeats
+            )
+            phase_count = (
+                num_stabilization_repeats
+                if is_stabilization
+                else num_repeats
+            )
+            phase_label = (
+                "stabilization repeat"
+                if is_stabilization
+                else "measured repeat"
+            )
             print(
-                f"    🔁 repeat {repeat_index + 1}/{num_repeats}: "
+                f"    🔁 {phase_label} {phase_index + 1}/{phase_count}: "
                 f"预分配 {invocations_per_repeat} 份"
             )
             (
@@ -1728,7 +1912,10 @@ class OperatorTestFramework:
                 retain_outputs,
                 verify_independent_storage,
             )
-            repeat_samples_ms.append(repeat_time_ms)
+            if is_stabilization:
+                stabilization_repeat_samples_ms.append(repeat_time_ms)
+            else:
+                repeat_samples_ms.append(repeat_time_ms)
             input_set_counts.append(verified_input_sets)
             input_ptr_counts.append(verified_input_ptrs)
             output_set_counts.append(verified_output_sets)
@@ -1845,16 +2032,28 @@ class OperatorTestFramework:
                 "retained_until_repeat_end"
                 if retain_outputs else "not_retained"
             ),
-            protocol_version="operator-test-framework-v2-fresh-v4",
+            protocol_version="operator-test-framework-v2-fresh-v5",
             repeats=num_repeats,
+            stabilization_repeats=num_stabilization_repeats,
+            stabilization_repeat_samples_ms=(
+                stabilization_repeat_samples_ms
+            ),
             repeat_samples_ms=repeat_samples_ms,
             aggregation=(
-                "median_of_repeat_means"
-                if num_repeats > 1 else "single_repeat_mean"
+                "median_of_post_stabilization_repeat_means"
+                if num_repeats > 1 and num_stabilization_repeats
+                else "median_of_repeat_means"
+                if num_repeats > 1
+                else "single_post_stabilization_repeat_mean"
+                if num_stabilization_repeats
+                else "single_repeat_mean"
             ),
             preallocated_invocations_per_repeat=invocations_per_repeat,
             input_storage_sets_verified=input_sets_verified,
             input_storage_ptr_count=input_ptr_count,
+            input_output_storage_disjoint=bool(
+                verify_independent_storage and retain_outputs
+            ),
             output_storage_sets_verified=output_sets_verified,
             output_storage_ptr_count=output_ptr_count,
             output_tensor_count=output_tensor_count,
@@ -1890,8 +2089,17 @@ class OperatorTestFramework:
             ),
             workspace_allocation_policy="not_audited",
             dispatch_loop_policy="python_direct_prepared_payload_loop",
-            device_stabilization_policy="none",
-            device_stabilization_timed=False,
+            device_stabilization_policy=(
+                "fresh_storage_full_window_priming_repeats"
+                if num_stabilization_repeats
+                else "none"
+            ),
+            device_stabilization_timed=bool(
+                num_stabilization_repeats
+            ),
+            stabilization_operator_calls=(
+                num_stabilization_repeats * invocations_per_repeat
+            ),
             task_queue_enable=(
                 os.environ.get("TASK_QUEUE_ENABLE", "unset")
                 if "npu" in device

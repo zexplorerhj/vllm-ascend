@@ -29,6 +29,8 @@ from operator_test_framework import (  # noqa: E402
     BaseOperatorTest,
     OperatorTestFramework,
     PrecisionType,
+    build_curve_selection_provenance,
+    finalize_curve_coverage,
 )
 
 
@@ -98,6 +100,40 @@ class _ReusedOutputOperator(_FreshCpuOperator):
         self.execute_calls += 1
         torch.add(prepared_data["x"], 1, out=self.shared_output)
         return self.shared_output
+
+
+class _PreallocatedOutputOperator(_FreshCpuOperator):
+
+    def _prepare_data_for_core_operator(
+        self,
+        data,
+        device,
+        precision,
+        implementation="default",
+    ):
+        self.prepare_calls += 1
+        x = data["x"].to(
+            device=device,
+            dtype=precision.value,
+        ).clone()
+        return {"x": x, "output": torch.empty_like(x)}
+
+    def _execute_core_operator(self, prepared_data, implementation="default"):
+        self.execute_calls += 1
+        torch.add(
+            prepared_data["x"],
+            1,
+            out=prepared_data["output"],
+        )
+        return prepared_data["output"]
+
+
+class _InPlaceInputAliasOperator(_FreshCpuOperator):
+
+    def _execute_core_operator(self, prepared_data, implementation="default"):
+        self.execute_calls += 1
+        prepared_data["x"].add_(1)
+        return prepared_data["x"]
 
 
 class _ContextOperator(_FreshCpuOperator):
@@ -349,11 +385,15 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "framework_api": (
             "OperatorTestFramework.run_core_operator_performance_test_v2"
         ),
-        "protocol_version": "operator-test-framework-v2-fresh-v1",
+        "protocol_version": "operator-test-framework-v2-fresh-v2",
         "warmup": 1,
         "iterations": 2,
         "repeats": 2,
         "repeat_samples_ms": "[0.25, 0.25]",
+        "repeat_min_ms": 0.25,
+        "repeat_median_ms": 0.25,
+        "repeat_max_ms": 0.25,
+        "repeat_spread_pct": 0.0,
         "aggregation": "median_of_repeat_means",
         "preallocated_invocations_per_repeat": 3,
         "input_reuse_within_repeat": False,
@@ -361,9 +401,161 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "input_storage_ptr_count": 3,
         "output_storage_sets_verified": 3,
         "output_storage_ptr_count": 3,
+        "output_tensor_count": 3,
+        "output_unique_storages_per_set": 1,
+        "preallocated_output_aliases_verified": 0,
+        "preallocated_output_sets_verified": 0,
+        "output_tensors_per_set": 1,
+        "output_allocation_mode": (
+            "no_preallocated_output_buffer_verified"
+        ),
+        "output_allocation_policy": (
+            "no_preallocated_output_buffer_verified"
+        ),
         "output_storage_policy": "retained_until_repeat_end",
-        "timed_region": "_execute_core_operator only; prepare excluded",
+        "timing_method": "host_perf_counter",
+        "timing_semantics": "host wall-clock elapsed time",
+        "workspace_allocation_policy": "not_audited",
+        "timed_region": (
+            "_execute_core_operator calls only; prepare excluded"
+        ),
     }
+
+
+def test_v2_proves_preallocated_output_aliases(monkeypatch, tmp_path):
+    framework = _framework(tmp_path)
+    operator = _PreallocatedOutputOperator()
+
+    def measure(functions, device):
+        for function in functions:
+            function()
+        return 0.25
+
+    monkeypatch.setattr(
+        framework,
+        "_measure_execution_time_v2",
+        measure,
+    )
+
+    metrics = framework.run_core_operator_performance_test_v2(
+        operator_test=operator,
+        data=operator.generate_test_data(),
+        device="cpu",
+        precision=PrecisionType.FP32,
+        num_warmup=1,
+        num_iterations=2,
+        retain_outputs=True,
+        verify_independent_storage=True,
+    )
+
+    assert metrics.preallocated_output_aliases_verified == 3
+    assert metrics.output_allocation_mode == (
+        "preallocated_output_buffers_verified"
+    )
+    assert framework.performance_provenance(metrics)[
+        "preallocated_output_aliases_verified"
+    ] == 3
+
+
+def test_v2_does_not_mislabel_in_place_input_as_preallocated_output(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _InPlaceInputAliasOperator()
+
+    def measure(functions, device):
+        for function in functions:
+            function()
+        return 0.25
+
+    monkeypatch.setattr(
+        framework,
+        "_measure_execution_time_v2",
+        measure,
+    )
+    metrics = framework.run_core_operator_performance_test_v2(
+        operator_test=operator,
+        data=operator.generate_test_data(),
+        device="cpu",
+        precision=PrecisionType.FP32,
+        num_warmup=1,
+        num_iterations=2,
+        retain_outputs=True,
+        verify_independent_storage=True,
+    )
+
+    assert metrics.preallocated_output_aliases_verified == 0
+    assert metrics.output_allocation_mode == (
+        "no_preallocated_output_buffer_verified"
+    )
+
+
+def test_curve_selection_never_labels_custom_or_quick_as_full():
+    custom = build_curve_selection_provenance(
+        quick=False,
+        num_shards=1,
+        total_formal_points=16,
+        total_requested_points=1,
+        selected_points=1,
+        uses_formal_shape_matrix=False,
+    )
+    assert custom["selection_mode"] == "custom_shape_matrix"
+    assert custom["selection_covers_full_formal_matrix"] is False
+    assert custom["coverage_complete"] is False
+
+    quick = build_curve_selection_provenance(
+        quick=True,
+        num_shards=1,
+        total_formal_points=16,
+        total_requested_points=16,
+        selected_points=1,
+        uses_formal_shape_matrix=True,
+    )
+    assert quick["selection_mode"] == "quick_shape_subset"
+    assert quick["shape_matrix_source"] == "default_formal"
+    assert quick["selection_covers_full_formal_matrix"] is False
+
+    shard = build_curve_selection_provenance(
+        quick=False,
+        num_shards=2,
+        total_formal_points=16,
+        total_requested_points=16,
+        selected_points=8,
+        uses_formal_shape_matrix=True,
+    )
+    assert shard["selection_mode"] == "formal_shape_shard"
+    assert shard["coverage_mode"] == "sharded"
+
+
+def test_curve_coverage_becomes_complete_only_after_all_success():
+    selection = build_curve_selection_provenance(
+        quick=False,
+        num_shards=1,
+        total_formal_points=2,
+        total_requested_points=2,
+        selected_points=2,
+        uses_formal_shape_matrix=True,
+    )
+    rows = [
+        {**selection, "point_index": 0, "status": "ok"},
+        {**selection, "point_index": 1, "status": "ok"},
+    ]
+    assert finalize_curve_coverage(rows) is True
+    assert all(row["coverage_complete"] is True for row in rows)
+
+    failed_rows = [
+        {**selection, "point_index": 0, "status": "ok"},
+        {**selection, "point_index": 1, "status": "error"},
+    ]
+    assert finalize_curve_coverage(failed_rows) is False
+    assert all(row["coverage_complete"] is False for row in failed_rows)
+
+    duplicate_rows = [
+        {**selection, "point_index": 0, "status": "ok"},
+        {**selection, "point_index": 0, "status": "ok"},
+    ]
+    assert finalize_curve_coverage(duplicate_rows) is False
 
 
 def test_v2_keeps_single_repeat_compatibility(monkeypatch, tmp_path):

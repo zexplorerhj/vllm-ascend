@@ -11,6 +11,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing import Dict, Any, List
 from tests.base_test_suite import BaseTestSuite
+from operator_test_framework import (
+    PERFORMANCE_PROVENANCE_FIELDS,
+    build_curve_selection_provenance,
+    finalize_curve_coverage,
+)
 from paged_attention.base import PagedAttentionOperatorTest
 
 
@@ -420,15 +425,7 @@ class PagedAttentionTestSuite(BaseTestSuite):
             f"\n📈 曲线1: batch={seqlen_batch_size}, "
             f"seqlen={seqlen_start}..{seqlen_end}"
         )
-        provenance_fields = [
-            "framework_api", "protocol_version", "warmup", "iterations",
-            "repeats", "repeat_samples_ms", "aggregation",
-            "preallocated_invocations_per_repeat",
-            "input_reuse_within_repeat", "input_storage_sets_verified",
-            "input_storage_ptr_count", "output_storage_sets_verified",
-            "output_storage_ptr_count", "output_storage_policy",
-            "timed_region",
-        ]
+        provenance_fields = list(PERFORMANCE_PROVENANCE_FIELDS)
         common_fields = [
             "provider", "device", "device_name", "torch_version",
             "provider_version", "precision", "num_heads", "num_kv_heads",
@@ -438,10 +435,44 @@ class PagedAttentionTestSuite(BaseTestSuite):
         seqlen_fields = [
             *common_fields[:9], "seq_len", *common_fields[9:],
             "point_index", "shard_index", "num_shards",
+            "selection_mode", "shape_matrix_source", "coverage_mode",
+            "coverage_total_formal_points", "coverage_selected_points",
+            "coverage_total_requested_points",
+            "selection_covers_full_formal_matrix", "coverage_complete",
+            "provider_selection_mode",
             *provenance_fields,
         ]
         failures = []
         seqlen_point_count = len(implementations) * len(seqlens)
+        seqlen_total_formal_points = (
+            len(formal_implementations) * 32
+        )
+        seqlen_selected_points = sum(
+            1
+            for implementation_index, _ in enumerate(implementations)
+            for seqlen_index, _ in enumerate(seqlens)
+            if (not quick or seqlen_index == 0)
+            and (
+                implementation_index * len(seqlens) + seqlen_index
+            ) % num_shards == shard_index
+        )
+        providers_complete = (
+            set(implementations) == set(formal_implementations)
+        )
+        seqlen_selection_provenance = build_curve_selection_provenance(
+            quick=quick,
+            num_shards=num_shards,
+            total_formal_points=seqlen_total_formal_points,
+            total_requested_points=len(implementations) * len(seqlens),
+            selected_points=seqlen_selected_points,
+            uses_formal_shape_matrix=(
+                seqlens == list(range(1024, 32768 + 1, 1024))
+                and seqlen_batch_size == 128
+                and block_size == 128
+                and num_blocks == 10000
+            ),
+            providers_complete=providers_complete,
+        )
         for implementation_index, impl in enumerate(implementations):
             print(f"\n  provider: {impl}")
             for seqlen_index, seq_len in enumerate(seqlens):
@@ -474,6 +505,8 @@ class PagedAttentionTestSuite(BaseTestSuite):
                     "point_index": point_index,
                     "shard_index": shard_index,
                     "num_shards": num_shards,
+                    **seqlen_selection_provenance,
+                    "provider_selection_mode": "fixed_formal_provider",
                     "warmup": num_warmup,
                     "iterations": num_iterations,
                     "repeats": repeats,
@@ -539,6 +572,11 @@ class PagedAttentionTestSuite(BaseTestSuite):
         batch_fields = [
             *common_fields[:9], "seq_len_fixed", *common_fields[9:],
             "point_index", "shard_index", "num_shards",
+            "selection_mode", "shape_matrix_source", "coverage_mode",
+            "coverage_total_formal_points", "coverage_selected_points",
+            "coverage_total_requested_points",
+            "selection_covers_full_formal_matrix", "coverage_complete",
+            "provider_selection_mode",
             *provenance_fields,
         ]
 
@@ -548,6 +586,42 @@ class PagedAttentionTestSuite(BaseTestSuite):
         )
         batch_points_per_provider = (
             len(batch_curve_seq_lens) * len(batch_sizes)
+        )
+        batch_total_formal_points = (
+            len(formal_implementations)
+            * 2
+            * 128
+        )
+        batch_selected_points = sum(
+            1
+            for implementation_index, _ in enumerate(implementations)
+            for fixed_seq_index, _ in enumerate(batch_curve_seq_lens)
+            for batch_index, _ in enumerate(batch_sizes)
+            if (not quick or batch_index == 0)
+            and (
+                seqlen_point_count
+                + implementation_index * batch_points_per_provider
+                + fixed_seq_index * len(batch_sizes)
+                + batch_index
+            ) % num_shards == shard_index
+        )
+        batch_selection_provenance = build_curve_selection_provenance(
+            quick=quick,
+            num_shards=num_shards,
+            total_formal_points=batch_total_formal_points,
+            total_requested_points=(
+                len(implementations)
+                * len(batch_curve_seq_lens)
+                * len(batch_sizes)
+            ),
+            selected_points=batch_selected_points,
+            uses_formal_shape_matrix=(
+                batch_sizes == list(range(1, 129))
+                and batch_curve_seq_lens == [10000, 30000]
+                and block_size == 128
+                and num_blocks == 10000
+            ),
+            providers_complete=providers_complete,
         )
         for implementation_index, impl in enumerate(implementations):
             print(f"\n  provider: {impl}")
@@ -588,6 +662,8 @@ class PagedAttentionTestSuite(BaseTestSuite):
                         "point_index": point_index,
                         "shard_index": shard_index,
                         "num_shards": num_shards,
+                        **batch_selection_provenance,
+                        "provider_selection_mode": "fixed_formal_provider",
                         "warmup": num_warmup,
                         "iterations": num_iterations,
                         "repeats": repeats,
@@ -647,6 +723,28 @@ class PagedAttentionTestSuite(BaseTestSuite):
         print(f"\n✅ seqlen曲线数据已保存: {seqlen_csv}")
 
         print(f"✅ batch曲线数据已保存: {batch_csv}")
+
+        for path, curve_rows, curve_fields, complete in (
+            (
+                seqlen_csv,
+                seqlen_rows,
+                seqlen_fields,
+                finalize_curve_coverage(seqlen_rows),
+            ),
+            (
+                batch_csv,
+                batch_rows,
+                batch_fields,
+                finalize_curve_coverage(batch_rows),
+            ),
+        ):
+            if complete:
+                with path.open("w", newline="", encoding="utf-8") as file_obj:
+                    writer = csv.DictWriter(
+                        file_obj, fieldnames=curve_fields
+                    )
+                    writer.writeheader()
+                    writer.writerows(curve_rows)
 
         if plot_results:
             plt.figure(figsize=(12, 7))

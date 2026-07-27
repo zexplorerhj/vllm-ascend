@@ -84,6 +84,14 @@ def test_formal_all_quick_dispatches_every_precision_without_shapes(tmp_path):
         "--modes",
         "--batches",
     }
+    protocol_flags = {
+        "--warmup",
+        "--iterations",
+        "--repeats",
+        "--tflops-warmup",
+        "--tflops-iterations",
+        "--tflops-repeats",
+    }
     for command in commands:
         assert command[0] == "python3"
         assert "--quick" in command
@@ -92,15 +100,7 @@ def test_formal_all_quick_dispatches_every_precision_without_shapes(tmp_path):
         assert "--num-shards" in command
         assert command[command.index("--num-shards") + 1] == "1"
         assert not forbidden_shape_flags.intersection(command)
-
-        if Path(command[1]).name in {"test_linear.py", "test_groupgemm.py"}:
-            assert command[command.index("--tflops-warmup") + 1] == "1"
-            assert command[command.index("--tflops-iterations") + 1] == "2"
-            assert command[command.index("--tflops-repeats") + 1] == "2"
-        else:
-            assert command[command.index("--warmup") + 1] == "1"
-            assert command[command.index("--iterations") + 1] == "2"
-            assert command[command.index("--repeats") + 1] == "2"
+        assert not protocol_flags.intersection(command)
 
         if Path(command[1]).name == "test_recurrent_gated_delta_rule.py":
             assert command[command.index("--output") + 1] == str(
@@ -112,7 +112,7 @@ def test_formal_all_quick_dispatches_every_precision_without_shapes(tmp_path):
             )
 
 
-def test_formal_dispatcher_forwards_explicit_protocol_and_shard(tmp_path):
+def test_formal_quick_forwards_explicit_protocol_and_shard(tmp_path):
     output_dir = tmp_path / "group"
     commands = _dry_run(
         "--operator",
@@ -131,6 +131,7 @@ def test_formal_dispatcher_forwards_explicit_protocol_and_shard(tmp_path):
         "2",
         "--num-shards",
         "4",
+        "--quick",
     )
 
     assert len(commands) == 2
@@ -142,7 +143,7 @@ def test_formal_dispatcher_forwards_explicit_protocol_and_shard(tmp_path):
         assert command[command.index("--tflops-repeats") + 1] == "5"
         assert command[command.index("--shard-index") + 1] == "2"
         assert command[command.index("--num-shards") + 1] == "4"
-        assert "--quick" not in command
+        assert "--quick" in command
 
 
 def test_formal_dispatcher_rejects_invalid_shard_without_running_python(

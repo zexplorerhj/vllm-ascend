@@ -38,11 +38,15 @@ PROVENANCE = {
     "framework_api": (
         "OperatorTestFramework.run_core_operator_performance_test_v2"
     ),
-    "protocol_version": "operator-test-framework-v2-fresh-v1",
+    "protocol_version": "operator-test-framework-v2-fresh-v2",
     "warmup": 1,
     "iterations": 2,
     "repeats": 3,
     "repeat_samples_ms": "[1.5, 1.0, 2.0]",
+    "repeat_min_ms": 1.0,
+    "repeat_median_ms": 1.5,
+    "repeat_max_ms": 2.0,
+    "repeat_spread_pct": 100.0,
     "aggregation": "median_of_repeat_means",
     "preallocated_invocations_per_repeat": 3,
     "input_reuse_within_repeat": False,
@@ -50,8 +54,21 @@ PROVENANCE = {
     "input_storage_ptr_count": 6,
     "output_storage_sets_verified": 3,
     "output_storage_ptr_count": 3,
+    "output_tensor_count": 3,
+    "output_unique_storages_per_set": 1,
+    "preallocated_output_aliases_verified": 3,
+    "preallocated_output_sets_verified": 3,
+    "output_tensors_per_set": 1,
+    "output_allocation_mode": "preallocated_output_buffers_verified",
+    "output_allocation_policy": "preallocated_output_buffers_verified",
     "output_storage_policy": "retained_until_repeat_end",
-    "timed_region": "_execute_core_operator only; prepare excluded",
+    "timing_method": "device_event",
+    "timing_semantics": (
+        "device elapsed time; includes stream-idle gaps between start/end "
+        "events caused by host dispatch"
+    ),
+    "workspace_allocation_policy": "not_audited",
+    "timed_region": "_execute_core_operator calls only; prepare excluded",
 }
 
 
@@ -133,6 +150,31 @@ def _assert_success_rows(rows):
             assert row[key] == value
 
 
+def _assert_coverage(
+    rows,
+    *,
+    mode,
+    total,
+    requested,
+    selected,
+    complete,
+    source="custom",
+    selection_complete=False,
+):
+    assert rows
+    for row in rows:
+        assert row["selection_mode"] == mode
+        assert row["shape_matrix_source"] == source
+        assert row["coverage_total_formal_points"] == total
+        assert row["coverage_total_requested_points"] == requested
+        assert row["coverage_selected_points"] == selected
+        assert (
+            row["selection_covers_full_formal_matrix"]
+            is selection_complete
+        )
+        assert row["coverage_complete"] is complete
+
+
 def test_add_formal_point_uses_one_v2_call_and_provenance(
     monkeypatch, tmp_path
 ):
@@ -156,6 +198,14 @@ def test_add_formal_point_uses_one_v2_call_and_provenance(
         framework.calls[0], 5, 20, 3, "cuda_torch_add_out"
     )
     _assert_success_rows(result["rows"])
+    _assert_coverage(
+        result["rows"],
+        mode="custom_shape_matrix",
+        total=16,
+        requested=1,
+        selected=1,
+        complete=False,
+    )
 
 
 def test_linear_formal_point_is_bias_free_and_uses_one_v2_call(
@@ -182,6 +232,14 @@ def test_linear_formal_point_is_bias_free_and_uses_one_v2_call(
     )
     assert framework.calls[0]["data"]["bias"] is False
     _assert_success_rows(result["rows"])
+    _assert_coverage(
+        result["rows"],
+        mode="custom_shape_matrix",
+        total=31,
+        requested=1,
+        selected=1,
+        complete=False,
+    )
 
 
 def test_rmsnorm_each_formal_point_uses_one_v2_call(
@@ -209,7 +267,16 @@ def test_rmsnorm_each_formal_point_uses_one_v2_call(
         _assert_formal_call(
             call, 10, 50, 3, "cuda_vllm_rms_norm_out"
         )
-    _assert_success_rows(result["size_rows"] + result["hidden_rows"])
+    rows = result["size_rows"] + result["hidden_rows"]
+    _assert_success_rows(rows)
+    _assert_coverage(
+        rows,
+        mode="custom_shape_matrix",
+        total=16,
+        requested=1,
+        selected=1,
+        complete=False,
+    )
 
 
 def test_flash_cuda_runs_both_formal_providers_once_per_point(
@@ -293,6 +360,14 @@ def test_groupgemm_formal_point_uses_i30_and_native_provider(
     assert len(framework.calls) == 1
     _assert_formal_call(framework.calls[0], 10, 30, 3, provider)
     _assert_success_rows(result["results"])
+    _assert_coverage(
+        result["results"],
+        mode="custom_shape_matrix",
+        total=10,
+        requested=1,
+        selected=1,
+        complete=False,
+    )
 
 
 def test_paged_attention_two_matrices_make_one_v2_call_per_point(
@@ -396,6 +471,26 @@ def test_recurrent_point_uses_one_v2_call_and_framework_provenance(
     with output.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert rows[0]["protocol_version"] == PROVENANCE["protocol_version"]
+    assert rows[0]["preallocated_output_aliases_verified"] == "3"
+    assert rows[0]["preallocated_output_sets_verified"] == "3"
+    assert rows[0]["output_tensors_per_set"] == "1"
+    assert rows[0]["output_allocation_mode"] == (
+        "preallocated_output_buffers_verified"
+    )
+    assert rows[0]["output_allocation_policy"] == (
+        "preallocated_output_buffers_verified"
+    )
+    assert rows[0]["repeat_min_ms"] == "1.0"
+    assert rows[0]["repeat_median_ms"] == "1.5"
+    assert rows[0]["repeat_max_ms"] == "2.0"
+    assert rows[0]["repeat_spread_pct"] == "100.0"
+    assert rows[0]["selection_mode"] == "custom_shape_matrix"
+    assert rows[0]["shape_matrix_source"] == "custom"
+    assert rows[0]["coverage_total_formal_points"] == "7"
+    assert rows[0]["coverage_total_requested_points"] == "1"
+    assert rows[0]["coverage_selected_points"] == "1"
+    assert rows[0]["selection_covers_full_formal_matrix"] == "False"
+    assert rows[0]["coverage_complete"] == "False"
     assert rows[0]["status"] == "ok"
 
 
@@ -533,6 +628,14 @@ def test_add_quick_keeps_first_formal_point_identity(
 
     assert [call["data"]["shape"] for call in framework.calls] == [(8,)]
     assert [row["point_index"] for row in result["rows"]] == [0]
+    _assert_coverage(
+        result["rows"],
+        mode="quick_shape_subset",
+        total=16,
+        requested=3,
+        selected=1,
+        complete=False,
+    )
 
 
 def test_linear_shard_keeps_global_formal_point_identity(
@@ -556,6 +659,14 @@ def test_linear_shard_keeps_global_formal_point_identity(
     assert [row["point_index"] for row in result["rows"]] == [1]
     assert result["rows"][0]["shard_index"] == 1
     assert result["rows"][0]["num_shards"] == 2
+    _assert_coverage(
+        result["rows"],
+        mode="custom_shape_matrix",
+        total=31,
+        requested=3,
+        selected=1,
+        complete=False,
+    )
 
 
 def test_rmsnorm_quick_keeps_one_point_per_formal_matrix(
@@ -579,6 +690,14 @@ def test_rmsnorm_quick_keeps_one_point_per_formal_matrix(
     assert len(framework.calls) == 2
     rows = result["size_rows"] + result["hidden_rows"]
     assert [row["point_index"] for row in rows] == [0, 2]
+    _assert_coverage(
+        rows,
+        mode="quick_shape_subset",
+        total=16,
+        requested=2,
+        selected=1,
+        complete=False,
+    )
 
 
 def test_flash_quick_keeps_one_shape_for_each_formal_provider(
@@ -667,6 +786,14 @@ def test_groupgemm_shard_keeps_global_formal_point_identity(
 
     assert [call["data"]["seq_len"] for call in framework.calls] == [16]
     assert [row["point_index"] for row in result["results"]] == [1]
+    _assert_coverage(
+        result["results"],
+        mode="custom_shape_matrix",
+        total=10,
+        requested=3,
+        selected=1,
+        complete=False,
+    )
 
 
 def test_paged_attention_quick_keeps_one_point_per_formal_matrix(
@@ -748,6 +875,15 @@ def test_recurrent_quick_keeps_first_batch_of_each_mode(
     with output.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert [int(row["point_index"]) for row in rows] == [0, 2]
+    assert {
+        (
+            row["selection_mode"],
+            row["coverage_total_formal_points"],
+            row["coverage_selected_points"],
+            row["coverage_complete"],
+        )
+        for row in rows
+    } == {("quick_shape_subset", "7", "1", "False")}
 
 
 def test_default_formal_shape_matrices_remain_reachable(
@@ -760,29 +896,69 @@ def test_default_formal_shape_matrices_remain_reachable(
     add_suite = AddTestSuite()
     add_suite.framework = add_framework
     add_suite.operator_test = _FakeOperator(["cuda_torch_add_out"])
-    add_suite.run_bandwidth_test(device="cuda:0", plot_results=False)
+    add_result = add_suite.run_bandwidth_test(
+        device="cuda:0", plot_results=False
+    )
     assert [
         call["data"]["shape"][0] for call in add_framework.calls
     ] == [2**power for power in range(12, 28)]
+    _assert_coverage(
+        add_result["rows"],
+        mode="full_formal_shape_matrix",
+        source="default_formal",
+        total=16,
+        requested=16,
+        selected=16,
+        selection_complete=True,
+        complete=True,
+    )
 
     linear_framework = _FakeFramework(tmp_path / "linear")
     linear_suite = LinearTestSuite(precision="fp16")
     linear_suite.framework = linear_framework
     linear_suite.operator_test = _FakeOperator(["cuda_torch_mm_out"])
-    linear_suite.run_tflops_test(device="cuda:0", plot_results=False)
+    linear_result = linear_suite.run_tflops_test(
+        device="cuda:0", plot_results=False
+    )
     assert [
         call["data"]["batch_size"] for call in linear_framework.calls
     ] == list(range(256, 4097, 128))
+    _assert_coverage(
+        linear_result["rows"],
+        mode="full_formal_shape_matrix",
+        source="default_formal",
+        total=31,
+        requested=31,
+        selected=31,
+        selection_complete=True,
+        complete=True,
+    )
 
     rms_framework = _FakeFramework(tmp_path / "rmsnorm")
     rms_suite = RMSNormTestSuite()
     rms_suite.framework = rms_framework
     rms_suite.operator_test = _FakeOperator(["cuda_vllm_rms_norm_out"])
-    rms_suite.run_bandwidth_test(device="cuda:0", plot_results=False)
+    rms_result = rms_suite.run_bandwidth_test(
+        device="cuda:0", plot_results=False
+    )
     assert len(rms_framework.calls) == 32
     assert [
         call["data"]["shape"][1] for call in rms_framework.calls[16:]
     ] == [1024 * index for index in range(1, 17)]
+    for curve_rows in (
+        rms_result["size_rows"],
+        rms_result["hidden_rows"],
+    ):
+        _assert_coverage(
+            curve_rows,
+            mode="full_formal_shape_matrix",
+            source="default_formal",
+            total=16,
+            requested=16,
+            selected=16,
+            selection_complete=True,
+            complete=True,
+        )
 
     flash_framework = _FakeFramework(tmp_path / "flash")
     flash_suite = FlashAttentionTestSuite()
@@ -799,7 +975,7 @@ def test_default_formal_shape_matrices_remain_reachable(
             "sparse_mode": 3 if kwargs["causal"] else 0,
         },
     )
-    flash_suite.run_tflops_test(
+    flash_result = flash_suite.run_tflops_test(
         precision="bf16",
         device="cuda:0",
         plot_results=False,
@@ -817,6 +993,16 @@ def test_default_formal_shape_matrices_remain_reachable(
         call["data"]["metadata"]["causal"]
         for call in flash_framework.calls
     } == {True, False}
+    _assert_coverage(
+        flash_result["rows"],
+        mode="full_formal_shape_matrix",
+        source="default_formal",
+        total=40,
+        requested=40,
+        selected=40,
+        selection_complete=True,
+        complete=True,
+    )
 
     group_framework = _FakeFramework(tmp_path / "group")
     group_suite = GroupGemmTestSuite(
@@ -829,16 +1015,28 @@ def test_default_formal_shape_matrices_remain_reachable(
     group_suite.operator_test = _FakeOperator([
         "cuda_vllm_cutlass_scaled_mm_bf16"
     ])
-    group_suite.run_tflops_test(device="cuda:0", plot_results=False)
+    group_result = group_suite.run_tflops_test(
+        device="cuda:0", plot_results=False
+    )
     assert [
         call["data"]["seq_len"] for call in group_framework.calls
     ] == [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    _assert_coverage(
+        group_result["results"],
+        mode="full_formal_shape_matrix",
+        source="default_formal",
+        total=10,
+        requested=10,
+        selected=10,
+        selection_complete=True,
+        complete=True,
+    )
 
     paged_framework = _FakeFramework(tmp_path / "paged")
     paged_suite = PagedAttentionTestSuite()
     paged_suite.framework = paged_framework
     paged_suite.operator_test = _FakeOperator(["cuda_flashinfer_fa2"])
-    paged_suite.run_latency_plot_test(
+    paged_result = paged_suite.run_latency_plot_test(
         device="cuda:0",
         plot_results=False,
     )
@@ -855,6 +1053,26 @@ def test_default_formal_shape_matrices_remain_reachable(
         call["data"]["max_seq_len"]
         for call in paged_framework.calls[32:]
     } == {10000, 30000}
+    _assert_coverage(
+        paged_result["seqlen_rows"],
+        mode="full_formal_shape_matrix",
+        source="default_formal",
+        total=32,
+        requested=32,
+        selected=32,
+        selection_complete=True,
+        complete=True,
+    )
+    _assert_coverage(
+        paged_result["batch_rows"],
+        mode="full_formal_shape_matrix",
+        source="default_formal",
+        total=256,
+        requested=256,
+        selected=256,
+        selection_complete=True,
+        complete=True,
+    )
 
     recurrent_framework = _FakeFramework(tmp_path / "recurrent")
     recurrent_operator = _FakeOperator(["cuda_vllm_fla_direct_out"])
@@ -892,3 +1110,27 @@ def test_default_formal_shape_matrices_remain_reachable(
         for mode in ("decode", "mtp3")
         for batch in (1, 4, 8, 16, 32, 64, 128)
     ]
+    with output.open(newline="", encoding="utf-8") as handle:
+        recurrent_rows = list(csv.DictReader(handle))
+    assert {
+        (
+            row["selection_mode"],
+            row["shape_matrix_source"],
+            row["coverage_total_formal_points"],
+            row["coverage_total_requested_points"],
+            row["coverage_selected_points"],
+            row["selection_covers_full_formal_matrix"],
+            row["coverage_complete"],
+        )
+        for row in recurrent_rows
+    } == {
+        (
+            "full_formal_shape_matrix",
+            "default_formal",
+            "7",
+            "7",
+            "7",
+            "True",
+            "True",
+        )
+    }

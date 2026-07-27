@@ -9,7 +9,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing import Dict, Any, List
 from tests.base_test_suite import BaseTestSuite
-from operator_test_framework import PrecisionType
+from operator_test_framework import (
+    PERFORMANCE_PROVENANCE_FIELDS,
+    PrecisionType,
+    build_curve_selection_provenance,
+    finalize_curve_coverage,
+)
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest
 from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest
 
@@ -192,21 +197,38 @@ class GroupGemmTestSuite(BaseTestSuite):
             )
         implementation = implementations[0]
 
+        formal_seq_lens = [
+            64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
+        ]
         if seq_lens is None:
-            seq_lens = [
-                64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
-            ]
+            seq_lens = formal_seq_lens
         else:
             seq_lens = list(seq_lens)
         if not seq_lens or any(value <= 0 for value in seq_lens):
             raise ValueError(f"seq_lens 必须是非空正整数列表: {seq_lens}")
         indexed_seq_lens = list(enumerate(seq_lens))
+        total_requested_points = len(indexed_seq_lens)
         if quick:
             indexed_seq_lens = indexed_seq_lens[:1]
         indexed_seq_lens = [
             item for item in indexed_seq_lens
             if item[0] % num_shards == shard_index
         ]
+        coverage_selected_points = len(indexed_seq_lens)
+        selection_provenance = build_curve_selection_provenance(
+            quick=quick,
+            num_shards=num_shards,
+            total_formal_points=len(formal_seq_lens),
+            total_requested_points=total_requested_points,
+            selected_points=coverage_selected_points,
+            uses_formal_shape_matrix=(
+                seq_lens == formal_seq_lens
+                and num_experts == 8
+                and hidden_dim == 7168
+                and out_channel == 4096
+                and not self.use_nz_format
+            ),
+        )
 
         metric_name = "INT8_TOPS" if self.precision == "int8" else "BF16_TFLOPS"
 
@@ -230,17 +252,14 @@ class GroupGemmTestSuite(BaseTestSuite):
             f"groupgemm_tflops_curve_{self.precision}_"
             f"{device.replace(':', '_')}_{timestamp}.png"
         )
-        provenance_fields = [
-            "framework_api", "protocol_version", "warmup", "iterations",
-            "repeats", "repeat_samples_ms", "aggregation",
-            "preallocated_invocations_per_repeat",
-            "input_reuse_within_repeat", "input_storage_sets_verified",
-            "input_storage_ptr_count", "output_storage_sets_verified",
-            "output_storage_ptr_count", "output_storage_policy",
-            "timed_region",
-        ]
+        provenance_fields = list(PERFORMANCE_PROVENANCE_FIELDS)
         fieldnames = [
-            "point_index", "shard_index", "num_shards", "seq_len",
+            "point_index", "shard_index", "num_shards", "selection_mode",
+            "shape_matrix_source", "coverage_mode",
+            "coverage_total_formal_points", "coverage_selected_points",
+            "coverage_total_requested_points",
+            "selection_covers_full_formal_matrix", "coverage_complete",
+            "seq_len",
             "num_experts", "hidden_dim", "out_channel", "implementation",
             "kernel", "output_semantics",
             "avg_time_ms", "metric", "throughput_trillion_ops_s",
@@ -254,6 +273,7 @@ class GroupGemmTestSuite(BaseTestSuite):
                 "point_index": point_index,
                 "shard_index": shard_index,
                 "num_shards": num_shards,
+                **selection_provenance,
                 "seq_len": seq_len,
                 "num_experts": num_experts,
                 "hidden_dim": hidden_dim,
@@ -339,6 +359,12 @@ class GroupGemmTestSuite(BaseTestSuite):
                     error=f"{type(exc).__name__}: {exc}",
                 )
             results.append(row)
+            with csv_file.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(results)
+
+        if finalize_curve_coverage(results):
             with csv_file.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()

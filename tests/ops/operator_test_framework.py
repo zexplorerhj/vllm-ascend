@@ -195,6 +195,7 @@ class PerformanceMetrics:
     independent_storage_sets_verified: int = 0
     independent_output_storage_sets_verified: int = 0
     preallocated_output_aliases_verified: int = 0
+    output_allocation_mode: Optional[str] = None
     output_storage_policy: Optional[str] = None
     protocol_version: Optional[str] = None
     repeats: int = 1
@@ -205,7 +206,11 @@ class PerformanceMetrics:
     input_storage_ptr_count: int = 0
     output_storage_sets_verified: int = 0
     output_storage_ptr_count: int = 0
+    output_tensor_count: int = 0
     input_reuse_within_repeat: bool = False
+    timing_method: Optional[str] = None
+    timing_semantics: Optional[str] = None
+    workspace_allocation_policy: Optional[str] = None
     timed_region: Optional[str] = None
     
     def __post_init__(self):
@@ -227,6 +232,111 @@ class PerformanceMetrics:
             result += f"  吞吐量: {self.throughput:.2f} ops/s\n"
         
         return result
+
+
+PERFORMANCE_PROVENANCE_FIELDS = (
+    "framework_api",
+    "protocol_version",
+    "warmup",
+    "iterations",
+    "repeats",
+    "repeat_samples_ms",
+    "repeat_min_ms",
+    "repeat_median_ms",
+    "repeat_max_ms",
+    "repeat_spread_pct",
+    "aggregation",
+    "preallocated_invocations_per_repeat",
+    "input_reuse_within_repeat",
+    "input_storage_sets_verified",
+    "input_storage_ptr_count",
+    "output_storage_sets_verified",
+    "output_storage_ptr_count",
+    "output_tensor_count",
+    "output_unique_storages_per_set",
+    "preallocated_output_aliases_verified",
+    "preallocated_output_sets_verified",
+    "output_tensors_per_set",
+    "output_allocation_mode",
+    "output_allocation_policy",
+    "output_storage_policy",
+    "timing_method",
+    "timing_semantics",
+    "workspace_allocation_policy",
+    "timed_region",
+)
+
+
+def build_curve_selection_provenance(
+    *,
+    quick: bool,
+    num_shards: int,
+    total_formal_points: int,
+    total_requested_points: int,
+    selected_points: int,
+    uses_formal_shape_matrix: bool,
+    providers_complete: bool = True,
+) -> Dict[str, Any]:
+    """Describe shape selection without claiming measurements succeeded."""
+    selection_covers_full_formal_matrix = (
+        not quick
+        and num_shards == 1
+        and uses_formal_shape_matrix
+        and providers_complete
+        and selected_points == total_formal_points
+    )
+    if quick:
+        selection_mode = "quick_shape_subset"
+    elif selection_covers_full_formal_matrix:
+        selection_mode = "full_formal_shape_matrix"
+    elif uses_formal_shape_matrix and num_shards > 1:
+        selection_mode = "formal_shape_shard"
+    elif not providers_complete:
+        selection_mode = "provider_subset"
+    else:
+        selection_mode = "custom_shape_matrix"
+    return {
+        "selection_mode": selection_mode,
+        "shape_matrix_source": (
+            "default_formal" if uses_formal_shape_matrix else "custom"
+        ),
+        "coverage_mode": (
+            "sharded" if num_shards > 1 else "single_process"
+        ),
+        "coverage_total_formal_points": total_formal_points,
+        "coverage_total_requested_points": total_requested_points,
+        "coverage_selected_points": selected_points,
+        "selection_covers_full_formal_matrix": (
+            selection_covers_full_formal_matrix
+        ),
+        # This is deliberately false in checkpoints and becomes true only
+        # after every canonical formal point has completed successfully.
+        "coverage_complete": False,
+    }
+
+
+def finalize_curve_coverage(
+    rows: List[Dict[str, Any]],
+    *,
+    success_statuses: Tuple[str, ...] = ("ok", "success"),
+) -> bool:
+    """Mark a curve complete only after all canonical points succeeded."""
+    complete = bool(rows)
+    if complete:
+        total_formal_points = int(rows[0]["coverage_total_formal_points"])
+        point_indices = [int(row["point_index"]) for row in rows]
+        complete = (
+            all(
+                bool(row["selection_covers_full_formal_matrix"])
+                for row in rows
+            )
+            and len(rows) == total_formal_points
+            and len(set(point_indices)) == total_formal_points
+            and all(row.get("status") in success_statuses for row in rows)
+        )
+    for row in rows:
+        row["coverage_complete"] = complete
+    return complete
 
 
 class BaseOperatorTest(ABC):
@@ -329,6 +439,53 @@ class OperatorTestFramework:
                 )
         return pointers
 
+    @staticmethod
+    def _device_tensor_count(value: Any, device_type: str) -> int:
+        """Count tensors, including empty tensors and storage-sharing views."""
+        if isinstance(value, torch.Tensor):
+            return int(value.device.type == device_type)
+        if isinstance(value, dict):
+            return sum(
+                OperatorTestFramework._device_tensor_count(
+                    child, device_type
+                )
+                for child in value.values()
+            )
+        if isinstance(value, (list, tuple)):
+            return sum(
+                OperatorTestFramework._device_tensor_count(
+                    child, device_type
+                )
+                for child in value
+            )
+        return 0
+
+    @classmethod
+    def _prepared_output_storage_ptrs(
+        cls,
+        prepared: Any,
+        device_type: str,
+    ) -> set[int]:
+        """Collect only buffers explicitly designated as prepared outputs."""
+        output_keys = {
+            "out",
+            "output",
+            "outputs",
+            "output_buffers",
+            "expert_outputs",
+        }
+        pointers: set[int] = set()
+        if not isinstance(prepared, dict):
+            return pointers
+        for key, value in prepared.items():
+            if key in output_keys:
+                pointers.update(cls._device_storage_ptrs(value, device_type))
+            elif isinstance(value, dict):
+                pointers.update(
+                    cls._prepared_output_storage_ptrs(value, device_type)
+                )
+        return pointers
+
     @classmethod
     def _verify_independent_storage_sets(
         cls,
@@ -358,9 +515,79 @@ class OperatorTestFramework:
             verified += 1
         return verified, len(seen)
 
+    @classmethod
+    def _count_preallocated_output_aliases(
+        cls,
+        prepared_values: List[Any],
+        outputs: List[Any],
+        device: str,
+    ) -> int:
+        """Count calls returning explicitly designated output buffers."""
+        if len(prepared_values) != len(outputs):
+            raise RuntimeError(
+                "prepared/output count mismatch: "
+                f"{len(prepared_values)} != {len(outputs)}"
+            )
+
+        device_type = "npu" if "npu" in device else (
+            "cuda" if "cuda" in device else "cpu"
+        )
+        verified = 0
+        for prepared, output in zip(prepared_values, outputs):
+            prepared_output_ptrs = cls._prepared_output_storage_ptrs(
+                prepared, device_type
+            )
+            output_ptrs = cls._device_storage_ptrs(output, device_type)
+            if (
+                output_ptrs
+                and output_ptrs.issubset(prepared_output_ptrs)
+            ):
+                verified += 1
+        return verified
+
+    @staticmethod
+    def performance_provenance_fields() -> List[str]:
+        """Return the one canonical CSV schema for V2 protocol evidence."""
+        return list(PERFORMANCE_PROVENANCE_FIELDS)
+
     @staticmethod
     def performance_provenance(metrics: PerformanceMetrics) -> Dict[str, Any]:
         """Return the stable, flat protocol fields written to curve CSVs."""
+        repeat_min_ms = (
+            min(metrics.repeat_samples_ms)
+            if metrics.repeat_samples_ms else None
+        )
+        repeat_median_ms = (
+            statistics.median(metrics.repeat_samples_ms)
+            if metrics.repeat_samples_ms else None
+        )
+        repeat_max_ms = (
+            max(metrics.repeat_samples_ms)
+            if metrics.repeat_samples_ms else None
+        )
+        repeat_spread_pct = (
+            (repeat_max_ms / repeat_min_ms - 1.0) * 100.0
+            if repeat_min_ms is not None
+            and repeat_max_ms is not None
+            and repeat_min_ms > 0
+            else None
+        )
+        output_tensors_per_set = (
+            metrics.output_tensor_count
+            // metrics.output_storage_sets_verified
+            if metrics.output_storage_sets_verified > 0
+            and metrics.output_tensor_count
+            % metrics.output_storage_sets_verified == 0
+            else None
+        )
+        output_unique_storages_per_set = (
+            metrics.output_storage_ptr_count
+            // metrics.output_storage_sets_verified
+            if metrics.output_storage_sets_verified > 0
+            and metrics.output_storage_ptr_count
+            % metrics.output_storage_sets_verified == 0
+            else None
+        )
         return {
             "framework_api": metrics.framework_api,
             "protocol_version": metrics.protocol_version,
@@ -368,6 +595,10 @@ class OperatorTestFramework:
             "iterations": metrics.iterations,
             "repeats": metrics.repeats,
             "repeat_samples_ms": json.dumps(metrics.repeat_samples_ms),
+            "repeat_min_ms": repeat_min_ms,
+            "repeat_median_ms": repeat_median_ms,
+            "repeat_max_ms": repeat_max_ms,
+            "repeat_spread_pct": repeat_spread_pct,
             "aggregation": metrics.aggregation,
             "preallocated_invocations_per_repeat": (
                 metrics.preallocated_invocations_per_repeat
@@ -381,7 +612,25 @@ class OperatorTestFramework:
                 metrics.output_storage_sets_verified
             ),
             "output_storage_ptr_count": metrics.output_storage_ptr_count,
+            "output_tensor_count": metrics.output_tensor_count,
+            "output_unique_storages_per_set": (
+                output_unique_storages_per_set
+            ),
+            "preallocated_output_aliases_verified": (
+                metrics.preallocated_output_aliases_verified
+            ),
+            "preallocated_output_sets_verified": (
+                metrics.preallocated_output_aliases_verified
+            ),
+            "output_tensors_per_set": output_tensors_per_set,
+            "output_allocation_mode": metrics.output_allocation_mode,
+            "output_allocation_policy": metrics.output_allocation_mode,
             "output_storage_policy": metrics.output_storage_policy,
+            "timing_method": metrics.timing_method,
+            "timing_semantics": metrics.timing_semantics,
+            "workspace_allocation_policy": (
+                metrics.workspace_allocation_policy
+            ),
             "timed_region": metrics.timed_region,
         }
     
@@ -874,13 +1123,15 @@ class OperatorTestFramework:
         num_iterations: int,
         retain_outputs: bool,
         verify_independent_storage: bool,
-    ) -> Tuple[float, int, int, int, int, int]:
+    ) -> Tuple[float, int, int, int, int, int, int]:
         """Run one fresh-storage V2 repeat and return only scalar results."""
         invocations_per_repeat = num_warmup + num_iterations
         prepared_data_list: List[Any] = []
         retained_outputs: List[Any] = []
         test_functions: List[Callable] = []
-        result: Optional[Tuple[float, int, int, int, int, int]] = None
+        result: Optional[
+            Tuple[float, int, int, int, int, int, int]
+        ] = None
         prepared_data = None
         output = None
         run_and_retain = None
@@ -979,6 +1230,15 @@ class OperatorTestFramework:
 
             verified_output_sets = 0
             verified_output_ptrs = 0
+            verified_output_tensors = 0
+            if retain_outputs:
+                device_type = "npu" if "npu" in device else (
+                    "cuda" if "cuda" in device else "cpu"
+                )
+                verified_output_tensors = sum(
+                    self._device_tensor_count(value, device_type)
+                    for value in retained_outputs
+                )
             if verify_independent_storage and retain_outputs:
                 (
                     verified_output_sets,
@@ -990,16 +1250,35 @@ class OperatorTestFramework:
                 )
 
             verified_output_aliases = 0
+            if retain_outputs:
+                verified_output_aliases = (
+                    self._count_preallocated_output_aliases(
+                        prepared_data_list,
+                        retained_outputs,
+                        device,
+                    )
+                )
             if retain_outputs and hasattr(
                 operator_test, "_verify_preallocated_output_aliases"
             ):
-                verified_output_aliases = (
+                provider_verified_aliases = (
                     operator_test._verify_preallocated_output_aliases(
                         prepared_data_list,
                         retained_outputs,
                         implementation,
                     )
                 )
+                if (
+                    provider_verified_aliases
+                    and provider_verified_aliases
+                    != verified_output_aliases
+                ):
+                    raise RuntimeError(
+                        "provider output-alias verification disagrees with "
+                        "generic storage relation: "
+                        f"{provider_verified_aliases} != "
+                        f"{verified_output_aliases}"
+                    )
 
             result = (
                 float(repeat_time_ms),
@@ -1007,6 +1286,7 @@ class OperatorTestFramework:
                 verified_input_ptrs,
                 verified_output_sets,
                 verified_output_ptrs,
+                verified_output_tensors,
                 verified_output_aliases,
             )
         finally:
@@ -1100,6 +1380,7 @@ class OperatorTestFramework:
         input_ptr_counts: List[int] = []
         output_set_counts: List[int] = []
         output_ptr_counts: List[int] = []
+        output_tensor_counts: List[int] = []
         output_alias_counts: List[int] = []
 
         for repeat_index in range(num_repeats):
@@ -1113,6 +1394,7 @@ class OperatorTestFramework:
                 verified_input_ptrs,
                 verified_output_sets,
                 verified_output_ptrs,
+                verified_output_tensors,
                 verified_output_aliases,
             ) = self._run_core_operator_performance_repeat_v2(
                 operator_test,
@@ -1130,6 +1412,7 @@ class OperatorTestFramework:
             input_ptr_counts.append(verified_input_ptrs)
             output_set_counts.append(verified_output_sets)
             output_ptr_counts.append(verified_output_ptrs)
+            output_tensor_counts.append(verified_output_tensors)
             output_alias_counts.append(verified_output_aliases)
 
         avg_time = float(statistics.median(repeat_samples_ms))
@@ -1169,7 +1452,23 @@ class OperatorTestFramework:
         input_ptr_count = min(input_ptr_counts)
         output_sets_verified = min(output_set_counts)
         output_ptr_count = min(output_ptr_counts)
+        output_tensor_count = min(output_tensor_counts)
         output_aliases_verified = min(output_alias_counts)
+        if not retain_outputs:
+            output_allocation_mode = "not_retained_unverified"
+        elif output_aliases_verified == invocations_per_repeat:
+            output_allocation_mode = (
+                "preallocated_output_buffers_verified"
+            )
+        elif output_aliases_verified == 0:
+            output_allocation_mode = (
+                "no_preallocated_output_buffer_verified"
+            )
+        else:
+            output_allocation_mode = (
+                "partially_preallocated_output_buffers_"
+                f"{output_aliases_verified}_of_{invocations_per_repeat}"
+            )
 
         return PerformanceMetrics(
             avg_time_ms=avg_time,
@@ -1193,11 +1492,12 @@ class OperatorTestFramework:
             preallocated_output_aliases_verified=(
                 output_aliases_verified
             ),
+            output_allocation_mode=output_allocation_mode,
             output_storage_policy=(
                 "retained_until_repeat_end"
                 if retain_outputs else "not_retained"
             ),
-            protocol_version="operator-test-framework-v2-fresh-v1",
+            protocol_version="operator-test-framework-v2-fresh-v2",
             repeats=num_repeats,
             repeat_samples_ms=repeat_samples_ms,
             aggregation=(
@@ -1209,9 +1509,22 @@ class OperatorTestFramework:
             input_storage_ptr_count=input_ptr_count,
             output_storage_sets_verified=output_sets_verified,
             output_storage_ptr_count=output_ptr_count,
+            output_tensor_count=output_tensor_count,
             input_reuse_within_repeat=False,
+            timing_method=(
+                "device_event"
+                if "npu" in device or "cuda" in device
+                else "host_perf_counter"
+            ),
+            timing_semantics=(
+                "device elapsed time; includes stream-idle gaps between "
+                "start/end events caused by host dispatch"
+                if "npu" in device or "cuda" in device
+                else "host wall-clock elapsed time"
+            ),
+            workspace_allocation_policy="not_audited",
             timed_region=(
-                "_execute_core_operator only; prepare excluded"
+                "_execute_core_operator calls only; prepare excluded"
             ),
         )
     

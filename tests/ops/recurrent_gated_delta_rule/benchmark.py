@@ -20,8 +20,11 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from operator_test_framework import (  # noqa: E402
+    PERFORMANCE_PROVENANCE_FIELDS,
     OperatorTestFramework,
     PrecisionType,
+    build_curve_selection_provenance,
+    finalize_curve_coverage,
 )
 from recurrent_gated_delta_rule.base import (  # noqa: E402
     HEAD_DIM,
@@ -51,25 +54,11 @@ CSV_FIELDS = (
     "g_dtype",
     "time_ms",
     "recurrent_tokens_per_second",
-    "warmup",
-    "iterations",
-    "repeats",
-    "repeat_samples_ms",
-    "protocol_version",
-    "aggregation",
-    "preallocated_invocations_per_repeat",
-    "input_reuse_within_repeat",
-    "input_storage_sets_verified",
-    "input_storage_ptr_count",
-    "output_storage_sets_verified",
-    "output_storage_ptr_count",
+    *PERFORMANCE_PROVENANCE_FIELDS,
     # Historical aliases retained for existing CSV consumers.
     "independent_storage_sets_verified",
     "storage_ptr_count",
-    "output_storage_policy",
     "bytes_per_invocation",
-    "timed_region",
-    "framework_api",
     "seed",
     "correctness_cosine",
     "correctness_max_abs",
@@ -83,6 +72,14 @@ CSV_FIELDS = (
     "point_index",
     "shard_index",
     "num_shards",
+    "selection_mode",
+    "shape_matrix_source",
+    "coverage_mode",
+    "coverage_total_formal_points",
+    "coverage_total_requested_points",
+    "coverage_selected_points",
+    "selection_covers_full_formal_matrix",
+    "coverage_complete",
 )
 
 
@@ -269,6 +266,10 @@ def main(argv: list[str] | None = None) -> int:
             time_ms="",
             recurrent_tokens_per_second="",
             repeat_samples_ms="",
+            repeat_min_ms="",
+            repeat_median_ms="",
+            repeat_max_ms="",
+            repeat_spread_pct="",
             protocol_version="",
             aggregation="",
             preallocated_invocations_per_repeat="",
@@ -277,6 +278,11 @@ def main(argv: list[str] | None = None) -> int:
             input_storage_ptr_count="",
             output_storage_sets_verified="",
             output_storage_ptr_count="",
+            preallocated_output_aliases_verified="",
+            preallocated_output_sets_verified="",
+            output_tensors_per_set="",
+            output_allocation_mode="",
+            output_allocation_policy="",
             independent_storage_sets_verified="",
             storage_ptr_count="",
             output_storage_policy="",
@@ -288,12 +294,48 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     points = [(mode, batch) for mode in args.modes for batch in args.batches]
+    indexed_points = list(enumerate(points))
+    selected_points = [
+        (point_index, mode, batch_size)
+        for point_index, (mode, batch_size) in indexed_points
+        if (
+            not args.quick
+            or point_index % len(args.batches) == 0
+        )
+        and point_index % args.num_shards == args.shard_index
+    ]
+    coverage_total_by_mode = {
+        mode: sum(
+            candidate_mode == mode
+            for _, (candidate_mode, _) in indexed_points
+        )
+        for mode in args.modes
+    }
+    coverage_selected_by_mode = {
+        mode: sum(
+            candidate_mode == mode
+            for _, candidate_mode, _ in selected_points
+        )
+        for mode in args.modes
+    }
+    canonical_modes = ["decode", "mtp3"]
+    canonical_batches = list(DEFAULT_BATCHES)
+    selection_by_mode = {
+        mode: build_curve_selection_provenance(
+            quick=args.quick,
+            num_shards=args.num_shards,
+            total_formal_points=len(canonical_batches),
+            total_requested_points=coverage_total_by_mode[mode],
+            selected_points=coverage_selected_by_mode[mode],
+            uses_formal_shape_matrix=(
+                args.modes == canonical_modes
+                and args.batches == canonical_batches
+            ),
+        )
+        for mode in args.modes
+    }
     rows: list[dict[str, Any]] = []
-    for point_index, (mode, batch_size) in enumerate(points):
-        if args.quick and point_index % len(args.batches) != 0:
-            continue
-        if point_index % args.num_shards != args.shard_index:
-            continue
+    for point_index, mode, batch_size in selected_points:
         tokens_per_sequence = TOKEN_COUNTS[mode]
         total_tokens = batch_size * tokens_per_sequence
         check = checks.get(mode, {})
@@ -329,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             "point_index": point_index,
             "shard_index": args.shard_index,
             "num_shards": args.num_shards,
+            **selection_by_mode[mode],
         }
         if mode in correctness_errors:
             mark_error(row, correctness_errors[mode])
@@ -386,6 +429,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(row["error"], file=sys.stderr, flush=True)
         rows.append(row)
+        write_csv(args.output, rows)
+
+    any_complete = False
+    for mode in args.modes:
+        any_complete = finalize_curve_coverage(
+            [row for row in rows if row["mode"] == mode]
+        ) or any_complete
+    if any_complete:
         write_csv(args.output, rows)
 
     if not rows or any(row["status"] != "ok" for row in rows):

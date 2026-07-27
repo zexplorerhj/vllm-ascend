@@ -25,7 +25,6 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from add.add_operator import AddOperatorTest  # noqa: E402
 from flashattention.base import FlashAttentionOperatorTest  # noqa: E402
-import flashattention.impl as flashattention_impl  # noqa: E402
 from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest  # noqa: E402
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest  # noqa: E402
 from linear.linear_operator import LinearOperatorTest  # noqa: E402
@@ -359,6 +358,116 @@ def test_paged_attention_timed_result_keeps_auxiliary_output():
     assert correctness_result is primary
 
 
+def test_paged_attention_npu_out_aliases_every_warmup_and_timed_result(
+    monkeypatch,
+):
+    implementation = "npu_fused_infer_attention_score"
+    operator = PagedAttentionOperatorTest()
+    provider = operator.implementations[implementation]
+    requested_devices = _fake_accelerator_tensor_to(monkeypatch, "npu:0")
+    calls = []
+
+    def fake_fused_infer_attention_score_out(**kwargs):
+        out = kwargs.pop("out")
+        calls.append((kwargs, out))
+        return tuple(out)
+
+    monkeypatch.setattr(
+        provider,
+        "_out_operator",
+        lambda: fake_fused_infer_attention_score_out,
+    )
+    data = {
+        "query": torch.ones(2, 2, 4),
+        "key_cache": torch.ones(2, 128, 1, 4),
+        "value_cache": torch.ones(2, 128, 1, 4),
+        "block_table": torch.tensor([[0], [1]], dtype=torch.int32),
+        "context_lens": torch.tensor([1, 2], dtype=torch.int32),
+        "block_size": 128,
+        "num_heads": 2,
+        "num_kv_heads": 1,
+        "head_size": 4,
+        "scale": 0.5,
+    }
+    prepared_data_list = [
+        operator._prepare_data_for_core_operator(
+            data,
+            "npu:0",
+            SimpleNamespace(value=torch.float32),
+            implementation,
+        )
+        for _ in range(3)
+    ]
+    outputs = [
+        operator._execute_core_operator(prepared, implementation)
+        for prepared in prepared_data_list
+    ]
+
+    assert requested_devices == ["npu:0"] * 15
+    assert len(calls) == 3
+    assert operator._verify_preallocated_output_aliases(
+        prepared_data_list,
+        outputs,
+        implementation,
+    ) == 3
+    for prepared, result in zip(prepared_data_list, outputs):
+        expected = prepared["out"]
+        assert isinstance(result, tuple)
+        assert result[0] is expected[0]
+        assert result[1] is expected[1]
+        assert expected[0].shape == data["query"].shape
+        assert expected[1].shape == (1,)
+        assert expected[1].dtype == torch.float32
+        assert prepared["operator_kwargs"]["softmax_lse_flag"] is False
+    for first, second in zip(
+        prepared_data_list,
+        prepared_data_list[1:],
+    ):
+        for first_tensor, second_tensor in zip(
+            first["out"],
+            second["out"],
+        ):
+            assert first_tensor.untyped_storage().data_ptr() != (
+                second_tensor.untyped_storage().data_ptr()
+            )
+
+    bad_outputs = list(outputs)
+    bad_outputs[1] = (
+        outputs[1][0],
+        torch.empty(1, dtype=torch.float32),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="does not alias preallocated out at 1:1",
+    ):
+        operator._verify_preallocated_output_aliases(
+            prepared_data_list,
+            bad_outputs,
+            implementation,
+        )
+
+    expected_lse = prepared_data_list[1]["out"][1]
+    expected_lse.untyped_storage().resize_(
+        expected_lse.element_size() * 2
+    )
+    shifted_lse = expected_lse.as_strided(
+        expected_lse.shape,
+        expected_lse.stride(),
+        storage_offset=1,
+    )
+    shifted_outputs = list(outputs)
+    shifted_outputs[1] = (outputs[1][0], shifted_lse)
+    with pytest.raises(
+        RuntimeError,
+        match="does not alias preallocated out at 1:1",
+    ):
+        operator._verify_preallocated_output_aliases(
+            prepared_data_list,
+            shifted_outputs,
+            implementation,
+        )
+
+
 @pytest.mark.parametrize(
     "execute_implementation",
     ["default", "npu_flash_attention"],
@@ -368,26 +477,19 @@ def test_flashattention_npu_framework_metadata_never_reaches_provider(
     execute_implementation,
 ):
     operator = FlashAttentionOperatorTest()
-    primary = torch.tensor([1.0])
-    auxiliary = torch.tensor([2.0])
-    log_sum_exp = torch.tensor([3.0])
-    native_result = (primary, auxiliary, log_sum_exp)
+    provider = operator.implementations["npu_flash_attention"]
     provider_calls = []
     requested_devices = _fake_accelerator_tensor_to(monkeypatch, "npu:0")
 
-    def fake_fused_infer_attention_score(**kwargs):
+    def fake_fused_infer_attention_score_out(**kwargs):
+        out = kwargs.pop("out")
         provider_calls.append(kwargs)
-        assert "_implementation" not in kwargs
-        return native_result
+        return tuple(out)
 
     monkeypatch.setattr(
-        flashattention_impl,
-        "torch_npu",
-        SimpleNamespace(
-            npu_fused_infer_attention_score=(
-                fake_fused_infer_attention_score
-            )
-        ),
+        provider,
+        "_out_operator",
+        lambda: fake_fused_infer_attention_score_out,
     )
     prepared = operator._prepare_data_for_core_operator(
         {
@@ -411,9 +513,123 @@ def test_flashattention_npu_framework_metadata_never_reaches_provider(
     assert requested_devices == ["npu:0"] * 3
     assert set(prepared) == {"_implementation", "provider_data"}
     assert prepared["_implementation"] == "npu_flash_attention"
-    assert provider_calls[0].keys() == prepared["provider_data"].keys()
-    assert timed_result is native_result
-    assert operator._primary_output(timed_result) is primary
+    provider_data = prepared["provider_data"]
+    assert set(provider_data) == {"operator", "operator_kwargs", "out"}
+    assert provider_calls[0].keys() == provider_data["operator_kwargs"].keys()
+    assert "_implementation" not in provider_calls[0]
+    assert provider_calls[0]["softmax_lse_flag"] is False
+    assert timed_result[0] is provider_data["out"][0]
+    assert timed_result[1] is provider_data["out"][1]
+    assert operator._primary_output(timed_result) is provider_data["out"][0]
+    assert provider_data["out"][1].shape == (1,)
+    assert provider_data["out"][1].dtype == torch.float32
+
+
+def test_flashattention_npu_out_aliases_every_warmup_and_timed_result(
+    monkeypatch,
+):
+    implementation = "npu_flash_attention"
+    operator = FlashAttentionOperatorTest()
+    provider = operator.implementations[implementation]
+    requested_devices = _fake_accelerator_tensor_to(monkeypatch, "npu:0")
+    calls = []
+
+    def fake_fused_infer_attention_score_out(**kwargs):
+        out = kwargs.pop("out")
+        calls.append((kwargs, out))
+        return tuple(out)
+
+    monkeypatch.setattr(
+        provider,
+        "_out_operator",
+        lambda: fake_fused_infer_attention_score_out,
+    )
+    data = {
+        "query": torch.ones(1, 2, 4, 8),
+        "key": torch.ones(1, 2, 4, 8),
+        "value": torch.ones(1, 2, 4, 8),
+        "num_heads": 2,
+        "num_kv_heads": 2,
+        "input_layout": "BNSD",
+    }
+    prepared_data_list = [
+        operator._prepare_data_for_core_operator(
+            data,
+            "npu:0",
+            SimpleNamespace(value=torch.float32),
+            implementation,
+        )
+        for _ in range(3)
+    ]
+    outputs = [
+        operator._execute_core_operator(prepared, implementation)
+        for prepared in prepared_data_list
+    ]
+
+    assert requested_devices == ["npu:0"] * 9
+    assert len(calls) == 3
+    assert operator._verify_preallocated_output_aliases(
+        prepared_data_list,
+        outputs,
+        implementation,
+    ) == 3
+    for prepared, result in zip(prepared_data_list, outputs):
+        expected = prepared["provider_data"]["out"]
+        assert isinstance(result, tuple)
+        assert result[0] is expected[0]
+        assert result[1] is expected[1]
+        assert expected[0].shape == data["query"].shape
+        assert expected[1].shape == (1,)
+        assert expected[1].dtype == torch.float32
+        assert prepared["provider_data"]["operator_kwargs"][
+            "softmax_lse_flag"
+        ] is False
+    for first, second in zip(
+        prepared_data_list,
+        prepared_data_list[1:],
+    ):
+        first_out = first["provider_data"]["out"]
+        second_out = second["provider_data"]["out"]
+        for first_tensor, second_tensor in zip(first_out, second_out):
+            assert first_tensor.untyped_storage().data_ptr() != (
+                second_tensor.untyped_storage().data_ptr()
+            )
+
+    bad_outputs = list(outputs)
+    bad_outputs[1] = (
+        outputs[1][0],
+        torch.empty(1, dtype=torch.float32),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="does not alias preallocated out at 1:1",
+    ):
+        operator._verify_preallocated_output_aliases(
+            prepared_data_list,
+            bad_outputs,
+            implementation,
+        )
+
+    expected_lse = prepared_data_list[1]["provider_data"]["out"][1]
+    expected_lse.untyped_storage().resize_(
+        expected_lse.element_size() * 2
+    )
+    shifted_lse = expected_lse.as_strided(
+        expected_lse.shape,
+        expected_lse.stride(),
+        storage_offset=1,
+    )
+    shifted_outputs = list(outputs)
+    shifted_outputs[1] = (outputs[1][0], shifted_lse)
+    with pytest.raises(
+        RuntimeError,
+        match="does not alias preallocated out at 1:1",
+    ):
+        operator._verify_preallocated_output_aliases(
+            prepared_data_list,
+            shifted_outputs,
+            implementation,
+        )
 
 
 @pytest.mark.parametrize(

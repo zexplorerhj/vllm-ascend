@@ -245,12 +245,6 @@ if [ "$#" -gt 0 ]; then
         fi
     done
 
-    if [ "$formal_quick" -eq 1 ]; then
-        [ -n "$formal_warmup" ] || formal_warmup=1
-        [ -n "$formal_iterations" ] || formal_iterations=2
-        [ -n "$formal_repeats" ] || formal_repeats=2
-    fi
-
     if ! command -v python3 &> /dev/null; then
         formal_error "未找到 python3"
     fi

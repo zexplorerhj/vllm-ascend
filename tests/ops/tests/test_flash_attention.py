@@ -22,7 +22,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.base_test_suite import BaseTestSuite
 from flashattention.base import FlashAttentionOperatorTest
-from operator_test_framework import OperatorTestFramework
+from operator_test_framework import (
+    PERFORMANCE_PROVENANCE_FIELDS,
+    OperatorTestFramework,
+    build_curve_selection_provenance,
+    finalize_curve_coverage,
+)
 
 class FlashAttentionTestSuite(BaseTestSuite):
     """FlashAttention算子测试套件"""
@@ -342,17 +347,15 @@ class FlashAttentionTestSuite(BaseTestSuite):
             f"flashattention_tflops_curve_{precision}_{device_tag}_"
             f"{timestamp}.png"
         )
-        provenance_fields = [
-            "framework_api", "protocol_version", "warmup", "iterations",
-            "repeats", "repeat_samples_ms", "aggregation",
-            "preallocated_invocations_per_repeat",
-            "input_reuse_within_repeat", "input_storage_sets_verified",
-            "input_storage_ptr_count", "output_storage_sets_verified",
-            "output_storage_ptr_count", "output_storage_policy",
-            "timed_region",
-        ]
+        provenance_fields = list(PERFORMANCE_PROVENANCE_FIELDS)
         fieldnames = [
-            "point_index", "shard_index", "num_shards", "head_dim",
+            "point_index", "shard_index", "num_shards",
+            "selection_mode", "shape_matrix_source", "coverage_mode",
+            "coverage_total_formal_points", "coverage_selected_points",
+            "coverage_total_requested_points",
+            "selection_covers_full_formal_matrix", "coverage_complete",
+            "provider_selection_mode",
+            "batch_size", "num_heads", "head_dim",
             "causal", "n_ctx", "provider", "device", "device_name",
             "precision", "avg_time_ms", "TFLOPS", "status", "error",
             *provenance_fields,
@@ -387,6 +390,44 @@ class FlashAttentionTestSuite(BaseTestSuite):
             for case in benchmark_cases
         }
         shape_points_per_provider = len(benchmark_cases) * len(n_ctx_values)
+        coverage_total_formal_points = (
+            len(formal_implementations) * 2 * 2 * 5
+        )
+        selected_point_indices = []
+        for selected_implementation in implementations:
+            selected_implementation_index = formal_implementations.index(
+                selected_implementation
+            )
+            for selected_case_index in range(len(benchmark_cases)):
+                for selected_n_ctx_index in range(len(n_ctx_values)):
+                    if quick and selected_n_ctx_index != 0:
+                        continue
+                    selected_point_index = (
+                        selected_implementation_index
+                        * shape_points_per_provider
+                        + selected_case_index * len(n_ctx_values)
+                        + selected_n_ctx_index
+                    )
+                    if selected_point_index % num_shards == shard_index:
+                        selected_point_indices.append(selected_point_index)
+        coverage_selected_points = len(selected_point_indices)
+        selection_provenance = build_curve_selection_provenance(
+            quick=quick,
+            num_shards=num_shards,
+            total_formal_points=coverage_total_formal_points,
+            total_requested_points=(
+                len(implementations) * shape_points_per_provider
+            ),
+            selected_points=coverage_selected_points,
+            uses_formal_shape_matrix=(
+                n_ctx_values == [1024, 2048, 4096, 8192, 16384]
+                and head_dims == [64, 128]
+                and causal_values == [True, False]
+            ),
+            providers_complete=(
+                set(implementations) == set(formal_implementations)
+            ),
+        )
         for implementation in implementations:
             implementation_index = formal_implementations.index(
                 implementation
@@ -411,6 +452,10 @@ class FlashAttentionTestSuite(BaseTestSuite):
                         "point_index": point_index,
                         "shard_index": shard_index,
                         "num_shards": num_shards,
+                        **selection_provenance,
+                        "provider_selection_mode": "fixed_formal_provider",
+                        "batch_size": case["batch_size"],
+                        "num_heads": case["num_heads"],
                         "head_dim": head_dim,
                         "causal": causal,
                         "n_ctx": n_ctx,
@@ -502,6 +547,8 @@ class FlashAttentionTestSuite(BaseTestSuite):
                     results.append(row)
                     checkpoint()
 
+        if finalize_curve_coverage(results):
+            checkpoint()
         print(f"\n✅ 测试结果已保存至 {csv_file}")
 
         successful_rows = [

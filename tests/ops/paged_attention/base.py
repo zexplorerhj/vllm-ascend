@@ -503,7 +503,7 @@ class PagedAttentionOperatorTest(BaseOperatorTest):
     def _verify_preallocated_output_aliases(
         self,
         prepared_data_list: List[Dict[str, Any]],
-        outputs: List[torch.Tensor],
+        outputs: List[Any],
         implementation: str,
     ) -> int:
         """Verify ``out=`` providers returned each invocation's owned buffer."""
@@ -515,6 +515,50 @@ class PagedAttentionOperatorTest(BaseOperatorTest):
         resolved = implementation
         if resolved == "default" and prepared_data_list:
             resolved = prepared_data_list[0].get("_implementation", "default")
+        if resolved == "npu_fused_infer_attention_score":
+            for index, (prepared_data, result) in enumerate(
+                zip(prepared_data_list, outputs)
+            ):
+                if not isinstance(result, tuple) or len(result) != 2:
+                    raise RuntimeError(
+                        "NPU PagedAttention out overload returned an "
+                        f"invalid result at {index}"
+                    )
+                expected_outputs = prepared_data["out"]
+                if (
+                    expected_outputs[0].untyped_storage().data_ptr()
+                    == expected_outputs[1].untyped_storage().data_ptr()
+                ):
+                    raise RuntimeError(
+                        "NPU PagedAttention primary and LSE out buffers alias "
+                        f"each other at {index}"
+                    )
+                for output_index, (actual, expected) in enumerate(
+                    zip(result, expected_outputs)
+                ):
+                    if not isinstance(actual, torch.Tensor):
+                        raise RuntimeError(
+                            "NPU PagedAttention out overload returned a "
+                            f"non-tensor at {index}:{output_index}"
+                        )
+                    aliases = (
+                        actual.untyped_storage().data_ptr()
+                        == expected.untyped_storage().data_ptr()
+                        and actual.data_ptr() == expected.data_ptr()
+                        and actual.storage_offset()
+                        == expected.storage_offset()
+                        and actual.shape == expected.shape
+                        and actual.dtype == expected.dtype
+                        and actual.device == expected.device
+                        and actual.stride() == expected.stride()
+                    )
+                    if not aliases:
+                        raise RuntimeError(
+                            "NPU PagedAttention output does not alias "
+                            f"preallocated out at {index}:{output_index}"
+                        )
+            return len(outputs)
+
         if resolved not in {"cuda_flashinfer_fa2", "npu_original"}:
             return 0
 

@@ -229,6 +229,17 @@ class FlashAttentionNpuImpl:
     
     def __init__(self):
         self.name = "npu_flash_attention"
+
+    @staticmethod
+    def _out_operator() -> Callable[..., Any]:
+        """Resolve the registered out overload outside the measured region."""
+        try:
+            return torch.ops.npu.npu_fused_infer_attention_score.out
+        except (AttributeError, RuntimeError) as exc:
+            raise RuntimeError(
+                "torch.ops.npu.npu_fused_infer_attention_score.out "
+                "is unavailable"
+            ) from exc
     
     def prepare_data(self, data: Dict[str, Any], device: str, precision) -> Dict[str, Any]:
 
@@ -454,14 +465,25 @@ class FlashAttentionNpuImpl:
                     # But our test case uses seq_len=256, block_size=128, so it is divisible.
                     pass
         
-        return kwargs
+        kwargs["softmax_lse_flag"] = False
+        output = torch.empty_like(kwargs["query"])
+        softmax_lse = torch.empty(
+            1,
+            dtype=torch.float32,
+            device=kwargs["query"].device,
+        )
+        return {
+            "operator": self._out_operator(),
+            "operator_kwargs": kwargs,
+            "out": [output, softmax_lse],
+        }
 
     def execute_core_operator(self, prepared_data: Dict[str, Any]):
-        """Execute core operator - torch_npu.npu_fused_infer_attention_score"""
-        if torch_npu is None:
-            raise RuntimeError("torch_npu is not available")
-            
-        return torch_npu.npu_fused_infer_attention_score(**prepared_data)
+        """Execute the registered out overload with prepared output buffers."""
+        return prepared_data["operator"](
+            **prepared_data["operator_kwargs"],
+            out=prepared_data["out"],
+        )
 
     def run_full_implementation(self, data: Dict[str, Any], device: str, precision) -> torch.Tensor:
         """Run full implementation (including data preparation and post-processing)"""
@@ -474,9 +496,10 @@ class FlashAttentionNpuImpl:
         output = native_result[0]
         
         # Post-process for layout if needed
-        input_layout = prepared_data.get('input_layout', "BNSD")
+        operator_kwargs = prepared_data["operator_kwargs"]
+        input_layout = operator_kwargs.get('input_layout', "BNSD")
         if input_layout == "TND":
-            num_heads = prepared_data['num_heads']
+            num_heads = operator_kwargs['num_heads']
             head_size = output.shape[-1]
             
             # Try to get dimensions from metadata or input shapes

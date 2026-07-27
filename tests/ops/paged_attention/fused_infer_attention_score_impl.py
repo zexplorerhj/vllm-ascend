@@ -3,12 +3,9 @@ PagedAttention使用npu_fused_infer_attention_score算子实现
 参考: https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/attention/attention_v1.py
 """
 
+from typing import Any, Callable, Dict
+
 import torch
-try:
-    import torch_npu
-except ImportError:
-    torch_npu = None
-from typing import Dict, Any, List
 
 
 class FusedInferAttentionScoreImpl:
@@ -16,6 +13,17 @@ class FusedInferAttentionScoreImpl:
     
     def __init__(self):
         self.name = "npu_fused_infer_attention_score"
+
+    @staticmethod
+    def _out_operator() -> Callable[..., Any]:
+        """Resolve the registered out overload outside the measured region."""
+        try:
+            return torch.ops.npu.npu_fused_infer_attention_score.out
+        except (AttributeError, RuntimeError) as exc:
+            raise RuntimeError(
+                "torch.ops.npu.npu_fused_infer_attention_score.out "
+                "is unavailable"
+            ) from exc
     
     def prepare_data(self, data: Dict[str, Any], device: str, precision) -> Dict[str, Any]:
         """准备数据用于核心算子执行 - TND格式"""
@@ -59,38 +67,39 @@ class FusedInferAttentionScoreImpl:
 
         attn_mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(device=device)
 
-        return {
+        operator_kwargs = {
             'query': query_reshaped,
             'key': key_cache,
             'value': value_cache,
+            'atten_mask': attn_mask,
             'block_table': block_table,
-            'seq_lens_kv': seq_lens_list,
-            'seq_lens_q': query_lens_list,
+            'input_layout': "TND",
             'block_size': block_size,
+            'actual_seq_lengths': query_lens_list,
+            'actual_seq_lengths_kv': seq_lens_list,
             'num_heads': data['num_heads'],
-            'num_kv_heads': data['num_kv_heads'],
+            'num_key_value_heads': data['num_kv_heads'],
             'scale': data['scale'],
-            'head_size': data['head_size'],
-            'atten_mask': attn_mask
+            'sparse_mode': 3,
+            'softmax_lse_flag': False,
+        }
+        output = torch.empty_like(query_reshaped)
+        softmax_lse = torch.empty(
+            1,
+            dtype=torch.float32,
+            device=query_reshaped.device,
+        )
+        return {
+            'operator': self._out_operator(),
+            'operator_kwargs': operator_kwargs,
+            'out': [output, softmax_lse],
         }
     
     def execute_core_operator(self, prepared_data: Dict[str, Any]):
-        """执行核心算子 - torch_npu.npu_fused_infer_attention_score"""
-        
-        return torch_npu.npu_fused_infer_attention_score(
-            query=prepared_data['query'],
-            key=prepared_data['key'],
-            value=prepared_data['value'],
-            atten_mask=prepared_data['atten_mask'],
-            block_table=prepared_data['block_table'],
-            input_layout="TND",
-            block_size=prepared_data['block_size'],
-            actual_seq_lengths=prepared_data['seq_lens_q'],
-            actual_seq_lengths_kv=prepared_data['seq_lens_kv'],
-            num_key_value_heads=prepared_data['num_kv_heads'],
-            num_heads=prepared_data['num_heads'],
-            scale=prepared_data['scale'],
-            sparse_mode=3,
+        """执行已注册的 out 重载并返回原生输出 tuple。"""
+        return prepared_data['operator'](
+            **prepared_data['operator_kwargs'],
+            out=prepared_data['out'],
         )
     
     def run_full_implementation(self, data: Dict[str, Any], device: str, precision) -> torch.Tensor:
@@ -100,9 +109,10 @@ class FusedInferAttentionScoreImpl:
         output = native_result[0]
         
         # 后处理
-        num_heads = prepared_data['num_heads']
-        head_size = prepared_data['head_size']
-        num_tokens = prepared_data['query'].shape[0] # T dimension
+        operator_kwargs = prepared_data['operator_kwargs']
+        num_heads = operator_kwargs['num_heads']
+        head_size = data['head_size']
+        num_tokens = operator_kwargs['query'].shape[0] # T dimension
         
         # 调整输出形状 [num_tokens, num_heads, head_size] -> [batch_size, num_heads, head_size]
         # 在 decode 阶段 num_tokens == batch_size

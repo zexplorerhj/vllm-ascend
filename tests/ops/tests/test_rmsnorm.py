@@ -10,7 +10,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from typing import Dict, Any, List
 from tests.base_test_suite import BaseTestSuite
 from rmsnorm.rmsnorm_operator import RMSNormOperatorTest
-from operator_test_framework import OperatorTestFramework
+from operator_test_framework import (
+    PERFORMANCE_PROVENANCE_FIELDS,
+    OperatorTestFramework,
+    build_curve_selection_provenance,
+    finalize_curve_coverage,
+)
 
 class RMSNormTestSuite(BaseTestSuite):
     """RMSNorm算子测试套件"""
@@ -134,12 +139,15 @@ class RMSNormTestSuite(BaseTestSuite):
             raise ValueError(
                 "shard index must satisfy 0 <= index < num_shards"
             )
-        sizes = list(sizes) if sizes is not None else [
-            2**i for i in range(12, 28)
+        formal_sizes = [2**i for i in range(12, 28)]
+        formal_hidden_sizes = [
+            1024 * index for index in range(1, 17)
         ]
+        formal_target_total_elements = 64 * 1024 * 1024
+        sizes = list(sizes) if sizes is not None else formal_sizes
         hidden_sizes = (
             list(hidden_sizes) if hidden_sizes is not None
-            else [1024 * index for index in range(1, 17)]
+            else formal_hidden_sizes
         )
         if (
             not sizes
@@ -153,6 +161,8 @@ class RMSNormTestSuite(BaseTestSuite):
             (len(sizes) + index, hidden_size)
             for index, hidden_size in enumerate(hidden_sizes)
         ]
+        total_requested_sizes = len(indexed_sizes)
+        total_requested_hidden_sizes = len(indexed_hidden_sizes)
         if quick:
             indexed_sizes = indexed_sizes[:1]
             indexed_hidden_sizes = indexed_hidden_sizes[:1]
@@ -164,6 +174,28 @@ class RMSNormTestSuite(BaseTestSuite):
             item for item in indexed_hidden_sizes
             if item[0] % num_shards == shard_index
         ]
+        selection_by_curve = {
+            "total_size": build_curve_selection_provenance(
+                quick=quick,
+                num_shards=num_shards,
+                total_formal_points=len(formal_sizes),
+                total_requested_points=total_requested_sizes,
+                selected_points=len(indexed_sizes),
+                uses_formal_shape_matrix=sizes == formal_sizes,
+            ),
+            "hidden_size": build_curve_selection_provenance(
+                quick=quick,
+                num_shards=num_shards,
+                total_formal_points=len(formal_hidden_sizes),
+                total_requested_points=total_requested_hidden_sizes,
+                selected_points=len(indexed_hidden_sizes),
+                uses_formal_shape_matrix=(
+                    hidden_sizes == formal_hidden_sizes
+                    and target_total_elements
+                    == formal_target_total_elements
+                ),
+            ),
+        }
         if device == "auto":
             try:
                 import torch_npu
@@ -202,17 +234,14 @@ class RMSNormTestSuite(BaseTestSuite):
         plot_file = result_dir / (
             f"rmsnorm_bandwidth_curve_{device_tag}_{timestamp}.png"
         )
-        provenance_fields = [
-            "framework_api", "protocol_version", "warmup", "iterations",
-            "repeats", "repeat_samples_ms", "aggregation",
-            "preallocated_invocations_per_repeat",
-            "input_reuse_within_repeat", "input_storage_sets_verified",
-            "input_storage_ptr_count", "output_storage_sets_verified",
-            "output_storage_ptr_count", "output_storage_policy",
-            "timed_region",
-        ]
+        provenance_fields = list(PERFORMANCE_PROVENANCE_FIELDS)
         fieldnames = [
-            "point_index", "shard_index", "num_shards", "curve",
+            "point_index", "shard_index", "num_shards", "selection_mode",
+            "shape_matrix_source", "coverage_mode",
+            "coverage_total_formal_points", "coverage_selected_points",
+            "coverage_total_requested_points",
+            "selection_covers_full_formal_matrix", "coverage_complete",
+            "curve",
             "total_elements", "hidden_size", "provider", "device",
             "precision", "avg_time_ms", "bandwidth_gb_s", "status",
             "error", *provenance_fields,
@@ -228,6 +257,7 @@ class RMSNormTestSuite(BaseTestSuite):
                 "point_index": point_index,
                 "shard_index": shard_index,
                 "num_shards": num_shards,
+                **selection_by_curve[curve],
                 "curve": curve,
                 "total_elements": total_elements,
                 "hidden_size": hidden_size,
@@ -308,6 +338,24 @@ class RMSNormTestSuite(BaseTestSuite):
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(hidden_rows)
+
+        for path, curve_rows, complete in (
+            (
+                size_csv,
+                size_rows,
+                finalize_curve_coverage(size_rows),
+            ),
+            (
+                hidden_csv,
+                hidden_rows,
+                finalize_curve_coverage(hidden_rows),
+            ),
+        ):
+            if complete:
+                with path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(curve_rows)
 
         successful_size = [
             row for row in size_rows if row["status"] == "ok"

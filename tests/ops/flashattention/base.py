@@ -382,3 +382,65 @@ class FlashAttentionOperatorTest(BaseOperatorTest):
             return impl.execute_core_operator(provider_data)
         else:
             raise ValueError(f"不支持的实现方式: {implementation}")
+
+    def _verify_preallocated_output_aliases(
+        self,
+        prepared_data_list: List[Dict[str, Any]],
+        outputs: List[Any],
+        implementation: str,
+    ) -> int:
+        """Verify every NPU invocation returned its two prepared out tensors."""
+        if len(prepared_data_list) != len(outputs):
+            raise RuntimeError(
+                "prepared/output count mismatch: "
+                f"{len(prepared_data_list)} != {len(outputs)}"
+            )
+        resolved = implementation
+        if resolved == "default" and prepared_data_list:
+            resolved = prepared_data_list[0].get(
+                "_implementation", "default"
+            )
+        if resolved != "npu_flash_attention":
+            return 0
+
+        for index, (prepared_data, result) in enumerate(
+            zip(prepared_data_list, outputs)
+        ):
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise RuntimeError(
+                    "NPU FlashAttention out overload returned an invalid "
+                    f"result at {index}"
+                )
+            expected_outputs = prepared_data["provider_data"]["out"]
+            if (
+                expected_outputs[0].untyped_storage().data_ptr()
+                == expected_outputs[1].untyped_storage().data_ptr()
+            ):
+                raise RuntimeError(
+                    "NPU FlashAttention primary and LSE out buffers alias "
+                    f"each other at {index}"
+                )
+            for output_index, (actual, expected) in enumerate(
+                zip(result, expected_outputs)
+            ):
+                if not isinstance(actual, torch.Tensor):
+                    raise RuntimeError(
+                        "NPU FlashAttention out overload returned a "
+                        f"non-tensor at {index}:{output_index}"
+                    )
+                aliases = (
+                    actual.untyped_storage().data_ptr()
+                    == expected.untyped_storage().data_ptr()
+                    and actual.data_ptr() == expected.data_ptr()
+                    and actual.storage_offset() == expected.storage_offset()
+                    and actual.shape == expected.shape
+                    and actual.dtype == expected.dtype
+                    and actual.device == expected.device
+                    and actual.stride() == expected.stride()
+                )
+                if not aliases:
+                    raise RuntimeError(
+                        "NPU FlashAttention output does not alias "
+                        f"preallocated out at {index}:{output_index}"
+                    )
+        return len(outputs)

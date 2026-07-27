@@ -15,6 +15,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from typing import Dict, Any, List
 from tests.base_test_suite import BaseTestSuite
 from add.add_operator import AddOperatorTest
+from operator_test_framework import (
+    PERFORMANCE_PROVENANCE_FIELDS,
+    build_curve_selection_provenance,
+    finalize_curve_coverage,
+)
 
 
 class AddTestSuite(BaseTestSuite):
@@ -110,12 +115,14 @@ class AddTestSuite(BaseTestSuite):
             raise ValueError(
                 "shard index must satisfy 0 <= index < num_shards"
             )
+        formal_sizes = [2**i for i in range(12, 28)]
         if sizes is None:
-            sizes = [2**i for i in range(12, 28)]
+            sizes = formal_sizes
         sizes = list(sizes)
         if not sizes or any(size <= 0 for size in sizes):
             raise ValueError("sizes must contain positive integers")
         indexed_sizes = list(enumerate(sizes))
+        total_requested_points = len(indexed_sizes)
         if quick:
             indexed_sizes = indexed_sizes[:1]
         indexed_sizes = [
@@ -123,6 +130,15 @@ class AddTestSuite(BaseTestSuite):
             for point_index, size in indexed_sizes
             if point_index % num_shards == shard_index
         ]
+        coverage_selected_points = len(indexed_sizes)
+        selection_provenance = build_curve_selection_provenance(
+            quick=quick,
+            num_shards=num_shards,
+            total_formal_points=len(formal_sizes),
+            total_requested_points=total_requested_points,
+            selected_points=coverage_selected_points,
+            uses_formal_shape_matrix=sizes == formal_sizes,
+        )
         if device == "auto":
             try:
                 import torch_npu
@@ -157,17 +173,14 @@ class AddTestSuite(BaseTestSuite):
         plot_file = result_dir / (
             f"add_bandwidth_curve_{device.replace(':', '_')}_{timestamp}.png"
         )
-        provenance_fields = [
-            "framework_api", "protocol_version", "warmup", "iterations",
-            "repeats", "repeat_samples_ms", "aggregation",
-            "preallocated_invocations_per_repeat",
-            "input_reuse_within_repeat", "input_storage_sets_verified",
-            "input_storage_ptr_count", "output_storage_sets_verified",
-            "output_storage_ptr_count", "output_storage_policy",
-            "timed_region",
-        ]
+        provenance_fields = list(PERFORMANCE_PROVENANCE_FIELDS)
         fieldnames = [
-            "point_index", "shard_index", "num_shards", "size", "provider",
+            "point_index", "shard_index", "num_shards", "selection_mode",
+            "shape_matrix_source", "coverage_mode",
+            "coverage_total_formal_points", "coverage_selected_points",
+            "coverage_total_requested_points",
+            "selection_covers_full_formal_matrix", "coverage_complete",
+            "size", "provider",
             "device", "precision", "avg_time_ms", "bandwidth_gb_s",
             "status", "error", *provenance_fields,
         ]
@@ -179,6 +192,7 @@ class AddTestSuite(BaseTestSuite):
                 "point_index": point_index,
                 "shard_index": shard_index,
                 "num_shards": num_shards,
+                **selection_provenance,
                 "size": size,
                 "provider": implementation,
                 "device": device,
@@ -231,6 +245,12 @@ class AddTestSuite(BaseTestSuite):
                     error=f"{type(exc).__name__}: {exc}",
                 )
             rows.append(row)
+            with csv_file.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+        if finalize_curve_coverage(rows):
             with csv_file.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()

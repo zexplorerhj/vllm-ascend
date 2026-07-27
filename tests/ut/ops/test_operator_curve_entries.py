@@ -399,6 +399,96 @@ def test_recurrent_point_uses_one_v2_call_and_framework_provenance(
     assert rows[0]["status"] == "ok"
 
 
+@pytest.mark.parametrize("failure_kind", ["returned_failure", "exception"])
+def test_recurrent_correctness_error_checkpoints_mode_and_continues(
+    monkeypatch, tmp_path, failure_kind
+):
+    output = tmp_path / f"recurrent-{failure_kind}.csv"
+    framework = _FakeFramework(tmp_path)
+
+    class CorrectnessOperator(_FakeOperator):
+
+        def correctness(self, mode, device, provider):
+            del device, provider
+            if mode == "decode":
+                if failure_kind == "exception":
+                    raise RuntimeError("synthetic correctness exception")
+                return {
+                    "cosine": 0.1,
+                    "max_abs": 3.0,
+                    "mean_abs": 2.0,
+                    "state_cosine": 0.2,
+                    "state_max_abs": 4.0,
+                    "state_mean_abs": 2.5,
+                    "passed": False,
+                }
+            return {
+                "cosine": 1.0,
+                "max_abs": 0.0,
+                "mean_abs": 0.0,
+                "state_cosine": 1.0,
+                "state_max_abs": 0.0,
+                "state_mean_abs": 0.0,
+                "passed": True,
+            }
+
+    operator = CorrectnessOperator(["cuda_vllm_fla_direct_out"])
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "resolve_device",
+        lambda requested: ("cuda:0", "fake"),
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "RecurrentGatedDeltaRuleOperatorTest",
+        lambda: operator,
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "OperatorTestFramework",
+        lambda result_dir: framework,
+    )
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "environment",
+        lambda *args: {},
+    )
+    monkeypatch.setattr(recurrent_benchmark, "cleanup", lambda device: None)
+    checkpoint_snapshots = []
+    original_write_csv = recurrent_benchmark.write_csv
+
+    def record_checkpoint(path, rows):
+        checkpoint_snapshots.append([dict(row) for row in rows])
+        original_write_csv(path, rows)
+
+    monkeypatch.setattr(
+        recurrent_benchmark,
+        "write_csv",
+        record_checkpoint,
+    )
+
+    exit_code = recurrent_benchmark.main([
+        "--device", "cuda:0",
+        "--modes", "decode,mtp3",
+        "--batches", "1",
+        "--output", str(output),
+    ])
+
+    assert exit_code == 1
+    assert len(framework.calls) == 1
+    assert framework.calls[0]["data"]["mode"] == "mtp3"
+    assert [len(snapshot) for snapshot in checkpoint_snapshots] == [1, 2]
+    assert checkpoint_snapshots[0][0]["mode"] == "decode"
+    assert checkpoint_snapshots[0][0]["status"] == "error"
+    with output.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["mode"] for row in rows] == ["decode", "mtp3"]
+    assert rows[0]["status"] == "error"
+    assert "correctness" in rows[0]["error"]
+    assert rows[1]["status"] == "ok"
+    assert rows[1]["protocol_version"] == PROVENANCE["protocol_version"]
+
+
 def test_failed_point_is_checkpointed_and_curve_fails(
     monkeypatch, tmp_path
 ):

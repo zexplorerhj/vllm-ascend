@@ -234,13 +234,57 @@ def main(argv: list[str] | None = None) -> int:
     env_path.write_text(json.dumps(env, indent=2, ensure_ascii=False) + "\n")
 
     checks: dict[str, dict[str, float | bool]] = {}
+    correctness_errors: dict[str, str] = {}
     if not args.skip_correctness:
         for mode in args.modes:
-            checks[mode] = operator.correctness(mode, device, provider)
-            print("correctness", mode, json.dumps(checks[mode]), flush=True)
-            if not checks[mode]["passed"]:
-                raise RuntimeError(f"correctness failed for {mode}: {checks[mode]}")
-            cleanup(device)
+            try:
+                check = operator.correctness(mode, device, provider)
+                checks[mode] = check
+                print("correctness", mode, json.dumps(check), flush=True)
+                if not check["passed"]:
+                    correctness_errors[mode] = (
+                        f"correctness failed for {mode}: {check}"
+                    )
+            except Exception as exc:
+                correctness_errors[mode] = (
+                    f"correctness for {mode} raised "
+                    f"{type(exc).__name__}: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+            try:
+                cleanup(device)
+            except Exception as exc:
+                cleanup_error = (
+                    f"correctness cleanup for {mode} raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if mode in correctness_errors:
+                    correctness_errors[mode] += f"\n{cleanup_error}"
+                else:
+                    correctness_errors[mode] = cleanup_error
+
+    def mark_error(row: dict[str, Any], error: str) -> None:
+        row.update(
+            time_ms="",
+            recurrent_tokens_per_second="",
+            repeat_samples_ms="",
+            protocol_version="",
+            aggregation="",
+            preallocated_invocations_per_repeat="",
+            input_reuse_within_repeat="",
+            input_storage_sets_verified="",
+            input_storage_ptr_count="",
+            output_storage_sets_verified="",
+            output_storage_ptr_count="",
+            independent_storage_sets_verified="",
+            storage_ptr_count="",
+            output_storage_policy="",
+            bytes_per_invocation="",
+            timed_region="",
+            framework_api="",
+            status="error",
+            error=error,
+        )
 
     points = [(mode, batch) for mode in args.modes for batch in args.batches]
     rows: list[dict[str, Any]] = []
@@ -283,6 +327,12 @@ def main(argv: list[str] | None = None) -> int:
             "shard_index": args.shard_index,
             "num_shards": args.num_shards,
         }
+        if mode in correctness_errors:
+            mark_error(row, correctness_errors[mode])
+            print(row["error"], file=sys.stderr, flush=True)
+            rows.append(row)
+            write_csv(args.output, rows)
+            continue
         try:
             data = operator.generate_test_data(
                 mode=mode,
@@ -327,26 +377,9 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
         except Exception as exc:
-            row.update(
-                time_ms="",
-                recurrent_tokens_per_second="",
-                repeat_samples_ms="",
-                protocol_version="",
-                aggregation="",
-                preallocated_invocations_per_repeat="",
-                input_reuse_within_repeat="",
-                input_storage_sets_verified="",
-                input_storage_ptr_count="",
-                output_storage_sets_verified="",
-                output_storage_ptr_count="",
-                independent_storage_sets_verified="",
-                storage_ptr_count="",
-                output_storage_policy="",
-                bytes_per_invocation="",
-                timed_region="",
-                framework_api="",
-                status="error",
-                error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+            mark_error(
+                row,
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
             )
             print(row["error"], file=sys.stderr, flush=True)
         rows.append(row)

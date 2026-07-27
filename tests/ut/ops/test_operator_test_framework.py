@@ -241,6 +241,48 @@ def test_v2_rejects_invalid_counts(
             num_repeats=num_repeats,
         )
 
+    assert operator.prepare_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("count_name", "invalid_value"),
+    [
+        ("num_warmup", True),
+        ("num_warmup", 1.0),
+        ("num_warmup", "1"),
+        ("num_iterations", True),
+        ("num_iterations", 1.0),
+        ("num_iterations", "1"),
+        ("num_repeats", True),
+        ("num_repeats", 1.0),
+        ("num_repeats", "1"),
+    ],
+)
+def test_v2_rejects_non_integer_counts_before_preparation(
+    tmp_path,
+    count_name,
+    invalid_value,
+):
+    framework = _framework(tmp_path)
+    operator = _FreshCpuOperator()
+    counts = {
+        "num_warmup": 0,
+        "num_iterations": 1,
+        "num_repeats": 1,
+    }
+    counts[count_name] = invalid_value
+
+    with pytest.raises(ValueError, match="must be a non-bool int"):
+        framework.run_core_operator_performance_test_v2(
+            operator_test=operator,
+            data=operator.generate_test_data(),
+            device="cpu",
+            precision=PrecisionType.FP32,
+            **counts,
+        )
+
+    assert operator.prepare_calls == 0
+
 
 def test_v2_rejects_reused_prepared_storage(tmp_path):
     framework = _framework(tmp_path)

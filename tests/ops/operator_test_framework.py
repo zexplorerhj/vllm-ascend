@@ -863,6 +863,176 @@ class OperatorTestFramework:
             bandwidth_gb_s=bandwidth_gb_s
         )
     
+    def _run_core_operator_performance_repeat_v2(
+        self,
+        operator_test: BaseOperatorTest,
+        data: Dict[str, Any],
+        device: str,
+        precision: PrecisionType,
+        implementation: str,
+        num_warmup: int,
+        num_iterations: int,
+        retain_outputs: bool,
+        verify_independent_storage: bool,
+    ) -> Tuple[float, int, int, int, int, int]:
+        """Run one fresh-storage V2 repeat and return only scalar results."""
+        invocations_per_repeat = num_warmup + num_iterations
+        prepared_data_list: List[Any] = []
+        retained_outputs: List[Any] = []
+        test_functions: List[Callable] = []
+        result: Optional[Tuple[float, int, int, int, int, int]] = None
+        prepared_data = None
+        output = None
+        run_and_retain = None
+        provider_context = None
+        device_context = None
+
+        try:
+            with torch.inference_mode():
+                for invocation_index in range(invocations_per_repeat):
+                    prepared_data_list.append(
+                        operator_test._prepare_data_for_core_operator(
+                            data,
+                            device,
+                            precision,
+                            implementation,
+                        )
+                    )
+                    if (
+                        (invocation_index + 1) % 10 == 0
+                        or invocation_index == 0
+                    ):
+                        print(
+                            "      预分配进度: "
+                            f"{invocation_index + 1}/"
+                            f"{invocations_per_repeat}"
+                        )
+
+            verified_input_sets = 0
+            verified_input_ptrs = 0
+            if verify_independent_storage:
+                (
+                    verified_input_sets,
+                    verified_input_ptrs,
+                ) = self._verify_independent_storage_sets(
+                    prepared_data_list,
+                    device,
+                    "V2 prepared input sets",
+                )
+
+            if "npu" in device:
+                device_context = torch_npu.npu.device(device)
+            elif "cuda" in device:
+                device_context = torch.cuda.device(torch.device(device))
+            else:
+                device_context = nullcontext()
+
+            context_factory = getattr(
+                operator_test,
+                "_core_operator_benchmark_context",
+                None,
+            )
+            provider_context = (
+                context_factory(device, precision, implementation)
+                if context_factory is not None
+                else nullcontext()
+            )
+
+            for prepared_data in prepared_data_list[num_warmup:]:
+
+                def run_and_retain(payload=prepared_data):
+                    output = operator_test._execute_core_operator(
+                        payload,
+                        implementation,
+                    )
+                    if retain_outputs:
+                        retained_outputs.append(output)
+                    return output
+
+                test_functions.append(run_and_retain)
+
+            with device_context, provider_context, torch.inference_mode():
+                for warmup_index in range(num_warmup):
+                    output = operator_test._execute_core_operator(
+                        prepared_data_list[warmup_index],
+                        implementation,
+                    )
+                    if retain_outputs:
+                        retained_outputs.append(output)
+
+                if "npu" in device:
+                    torch_npu.npu.synchronize()
+                elif "cuda" in device:
+                    torch.cuda.synchronize(torch.device(device))
+
+                repeat_time_ms = self._measure_execution_time_v2(
+                    test_functions,
+                    device,
+                )
+                if (
+                    not math.isfinite(repeat_time_ms)
+                    or repeat_time_ms <= 0
+                ):
+                    raise RuntimeError(
+                        f"invalid repeat latency: {repeat_time_ms} ms"
+                    )
+
+            verified_output_sets = 0
+            verified_output_ptrs = 0
+            if verify_independent_storage and retain_outputs:
+                (
+                    verified_output_sets,
+                    verified_output_ptrs,
+                ) = self._verify_independent_storage_sets(
+                    retained_outputs,
+                    device,
+                    "V2 retained output sets",
+                )
+
+            verified_output_aliases = 0
+            if retain_outputs and hasattr(
+                operator_test, "_verify_preallocated_output_aliases"
+            ):
+                verified_output_aliases = (
+                    operator_test._verify_preallocated_output_aliases(
+                        prepared_data_list,
+                        retained_outputs,
+                        implementation,
+                    )
+                )
+
+            result = (
+                float(repeat_time_ms),
+                verified_input_sets,
+                verified_input_ptrs,
+                verified_output_sets,
+                verified_output_ptrs,
+                verified_output_aliases,
+            )
+        finally:
+            test_functions.clear()
+            retained_outputs.clear()
+            prepared_data_list.clear()
+            output = None
+            prepared_data = None
+            run_and_retain = None
+            provider_context = None
+            device_context = None
+            gc.collect()
+            try:
+                if "npu" in device:
+                    with torch_npu.npu.device(device):
+                        torch_npu.npu.empty_cache()
+                elif "cuda" in device:
+                    with torch.cuda.device(torch.device(device)):
+                        torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        if result is None:
+            raise RuntimeError("repeat completed without a latency result")
+        return result
+
     def run_core_operator_performance_test_v2(
         self,
         operator_test: BaseOperatorTest,
@@ -881,12 +1051,20 @@ class OperatorTestFramework:
         Every repeat independently prepares ``num_warmup + num_iterations``
         payloads. The reported latency is the median of repeat event means.
         """
-        if num_warmup < 0:
-            raise ValueError("num_warmup must be >= 0")
-        if num_iterations <= 0:
-            raise ValueError("num_iterations must be > 0")
-        if num_repeats <= 0:
-            raise ValueError("num_repeats must be > 0")
+        for count_name, count_value, minimum in (
+            ("num_warmup", num_warmup, 0),
+            ("num_iterations", num_iterations, 1),
+            ("num_repeats", num_repeats, 1),
+        ):
+            if not isinstance(count_value, int) or isinstance(
+                count_value,
+                bool,
+            ):
+                raise ValueError(f"{count_name} must be a non-bool int")
+            if count_value < minimum:
+                if minimum == 0:
+                    raise ValueError(f"{count_name} must be >= 0")
+                raise ValueError(f"{count_name} must be > {minimum - 1}")
 
         print(
             f"  核心算子性能测试 V2: {device} - {precision.name} - "
@@ -929,147 +1107,30 @@ class OperatorTestFramework:
                 f"    🔁 repeat {repeat_index + 1}/{num_repeats}: "
                 f"预分配 {invocations_per_repeat} 份"
             )
-            prepared_data_list: List[Any] = []
-            retained_outputs: List[Any] = []
-            test_functions: List[Callable] = []
-
-            try:
-                with torch.inference_mode():
-                    for invocation_index in range(invocations_per_repeat):
-                        prepared_data_list.append(
-                            operator_test._prepare_data_for_core_operator(
-                                data,
-                                device,
-                                precision,
-                                implementation,
-                            )
-                        )
-                        if (
-                            (invocation_index + 1) % 10 == 0
-                            or invocation_index == 0
-                        ):
-                            print(
-                                "      预分配进度: "
-                                f"{invocation_index + 1}/"
-                                f"{invocations_per_repeat}"
-                            )
-
-                verified_input_sets = 0
-                verified_input_ptrs = 0
-                if verify_independent_storage:
-                    (
-                        verified_input_sets,
-                        verified_input_ptrs,
-                    ) = self._verify_independent_storage_sets(
-                        prepared_data_list,
-                        device,
-                        "V2 prepared input sets",
-                    )
-                input_set_counts.append(verified_input_sets)
-                input_ptr_counts.append(verified_input_ptrs)
-
-                if "npu" in device:
-                    device_context = torch_npu.npu.device(device)
-                elif "cuda" in device:
-                    device_context = torch.cuda.device(torch.device(device))
-                else:
-                    device_context = nullcontext()
-
-                context_factory = getattr(
-                    operator_test,
-                    "_core_operator_benchmark_context",
-                    None,
-                )
-                provider_context = (
-                    context_factory(device, precision, implementation)
-                    if context_factory is not None
-                    else nullcontext()
-                )
-
-                for prepared_data in prepared_data_list[num_warmup:]:
-
-                    def run_and_retain(payload=prepared_data):
-                        output = operator_test._execute_core_operator(
-                            payload,
-                            implementation,
-                        )
-                        if retain_outputs:
-                            retained_outputs.append(output)
-                        return output
-
-                    test_functions.append(run_and_retain)
-
-                with device_context, provider_context, torch.inference_mode():
-                    for warmup_index in range(num_warmup):
-                        output = operator_test._execute_core_operator(
-                            prepared_data_list[warmup_index],
-                            implementation,
-                        )
-                        if retain_outputs:
-                            retained_outputs.append(output)
-
-                    if "npu" in device:
-                        torch_npu.npu.synchronize()
-                    elif "cuda" in device:
-                        torch.cuda.synchronize(torch.device(device))
-
-                    repeat_time_ms = self._measure_execution_time_v2(
-                        test_functions,
-                        device,
-                    )
-                    if (
-                        not math.isfinite(repeat_time_ms)
-                        or repeat_time_ms <= 0
-                    ):
-                        raise RuntimeError(
-                            f"invalid repeat latency: {repeat_time_ms} ms"
-                        )
-                repeat_samples_ms.append(float(repeat_time_ms))
-
-                verified_output_sets = 0
-                verified_output_ptrs = 0
-                if verify_independent_storage and retain_outputs:
-                    (
-                        verified_output_sets,
-                        verified_output_ptrs,
-                    ) = self._verify_independent_storage_sets(
-                        retained_outputs,
-                        device,
-                        "V2 retained output sets",
-                    )
-                output_set_counts.append(verified_output_sets)
-                output_ptr_counts.append(verified_output_ptrs)
-
-                verified_output_aliases = 0
-                if retain_outputs and hasattr(
-                    operator_test, "_verify_preallocated_output_aliases"
-                ):
-                    verified_output_aliases = (
-                        operator_test._verify_preallocated_output_aliases(
-                            prepared_data_list,
-                            retained_outputs,
-                            implementation,
-                        )
-                    )
-                output_alias_counts.append(verified_output_aliases)
-            finally:
-                test_functions.clear()
-                retained_outputs.clear()
-                prepared_data_list.clear()
-                output = None
-                prepared_data = None
-                run_and_retain = None
-                provider_context = None
-                gc.collect()
-                try:
-                    if "npu" in device:
-                        with torch_npu.npu.device(device):
-                            torch_npu.npu.empty_cache()
-                    elif "cuda" in device:
-                        with torch.cuda.device(torch.device(device)):
-                            torch.cuda.empty_cache()
-                except Exception:
-                    pass
+            (
+                repeat_time_ms,
+                verified_input_sets,
+                verified_input_ptrs,
+                verified_output_sets,
+                verified_output_ptrs,
+                verified_output_aliases,
+            ) = self._run_core_operator_performance_repeat_v2(
+                operator_test,
+                data,
+                device,
+                precision,
+                implementation,
+                num_warmup,
+                num_iterations,
+                retain_outputs,
+                verify_independent_storage,
+            )
+            repeat_samples_ms.append(repeat_time_ms)
+            input_set_counts.append(verified_input_sets)
+            input_ptr_counts.append(verified_input_ptrs)
+            output_set_counts.append(verified_output_sets)
+            output_ptr_counts.append(verified_output_ptrs)
+            output_alias_counts.append(verified_output_aliases)
 
         avg_time = float(statistics.median(repeat_samples_ms))
         print(

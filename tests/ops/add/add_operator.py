@@ -61,38 +61,17 @@ class AddOperatorTest(BaseOperatorTest):
     ) -> torch.Tensor:
         """运行设备实现"""
 
-        if implementation in (
-            self.CUDA_IMPLEMENTATION,
-            self.NPU_IMPLEMENTATION,
-        ):
-            prepared = self._prepare_data_for_core_operator(
-                data, device, precision, implementation
-            )
-            return self._execute_core_operator(
-                prepared, implementation
-            ).cpu().float()
-        
-        # 转换数据类型和设备
-        tensor_a = data['tensor_a'].to(dtype=precision.value, device=device)
-        tensor_b = data['tensor_b'].to(dtype=precision.value, device=device)
-        
-        # 根据实现类型选择不同的加法方式
-        if implementation == "torch_add" or implementation == "default":
-            result = torch.add(tensor_a, tensor_b)
-        elif implementation == "operator_add":
-            result = tensor_a + tensor_b  # 使用操作符重载
-        else:
-            raise ValueError(f"不支持的实现类型: {implementation}")
-            
-        return result.cpu().float()
+        implementation = self._resolve_implementation(device, implementation)
+        prepared = self._prepare_data_for_core_operator(
+            data, device, precision, implementation
+        )
+        return self._execute_core_operator(
+            prepared, implementation
+        ).cpu().float()
     
     def get_available_implementations(self, device: str) -> List[str]:
         """获取可用的实现列表"""
-        if device.startswith(("cuda", "npu")):
-            return self.get_formal_implementations(device)
-        if "cpu" in device:
-            return ["torch_add", "operator_add"]
-        return []
+        return self.get_formal_implementations(device)
 
     def get_formal_implementations(self, device: str) -> List[str]:
         """Return the fixed native provider used by formal curves."""
@@ -101,6 +80,21 @@ class AddOperatorTest(BaseOperatorTest):
         if device.startswith("npu"):
             return [self.NPU_IMPLEMENTATION]
         return []
+
+    def _resolve_implementation(
+        self, device: str, implementation: str
+    ) -> str:
+        """Resolve and validate the formal provider for ``device``."""
+        formal = self.get_formal_implementations(device)
+        if implementation == "default":
+            if not formal:
+                raise ValueError(f"Add 不支持设备 {device}")
+            return formal[0]
+        if implementation not in formal:
+            raise ValueError(
+                f"实现 {implementation!r} 不适用于 {device}; formal={formal}"
+            )
+        return implementation
     
     def calculate_throughput(self, data: Dict[str, Any], time_ms: float) -> float:
         """计算吞吐量（GFLOPS）"""
@@ -157,9 +151,7 @@ class AddOperatorTest(BaseOperatorTest):
     def _prepare_data_for_core_operator(self, data: Dict[str, Any], device: str, precision: PrecisionType, implementation: str = "default") -> Dict[str, Any]:
         """为核心算子准备数据（排除预处理开销）"""
         # 将数据移动到目标设备和精度
-        if implementation == "default":
-            formal = self.get_formal_implementations(device)
-            implementation = formal[0] if formal else "torch_add"
+        implementation = self._resolve_implementation(device, implementation)
         tensor_a = data['tensor_a'].to(
             dtype=precision.value, device=device, copy=True
         )

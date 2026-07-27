@@ -88,36 +88,11 @@ class LinearOperatorTest(BaseOperatorTest):
     ) -> torch.Tensor:
         """运行设备实现"""
 
-        if implementation in (
-            self.CUDA_IMPLEMENTATION,
-            self.NPU_IMPLEMENTATION,
-        ):
-            prepared = self._prepare_data_for_core_operator(
-                data, device, precision, implementation
-            )
-            return self._execute_core_operator(prepared, implementation)
-        
-        # 将数据移动到指定设备和精度
-        input_tensor = data['input'].to(device=device, dtype=precision.value)
-        weight_tensor = data['weight'].to(device=device, dtype=precision.value)
-        bias_tensor = data['bias'].to(device=device, dtype=precision.value) if data['bias'] is not None else None
-        
-        # 确保设备同步
-        if "npu" in device:
-            torch_npu.npu.synchronize()
-        elif "cuda" in device:
-            torch.cuda.synchronize()
-        
-        # 执行Linear操作 - 使用torch.nn.functional.linear
-        result = F.linear(input_tensor, weight_tensor, bias_tensor)
-        
-        # 确保计算完成
-        if "npu" in device:
-            torch_npu.npu.synchronize()
-        elif "cuda" in device:
-            torch.cuda.synchronize()
-        
-        return result
+        implementation = self._resolve_implementation(device, implementation)
+        prepared = self._prepare_data_for_core_operator(
+            data, device, precision, implementation
+        )
+        return self._execute_core_operator(prepared, implementation)
     
     def run_core_operator(
         self, 
@@ -127,8 +102,11 @@ class LinearOperatorTest(BaseOperatorTest):
         implementation: str = "default"
     ) -> torch.Tensor:
         """运行核心算子操作（用于精确性能测试）- 使用torch.nn.functional.linear"""
-        
-        return F.linear(data['input'], data['weight'], data['bias'])
+        implementation = self._resolve_implementation(device, implementation)
+        prepared = self._prepare_data_for_core_operator(
+            data, device, precision, implementation
+        )
+        return self._execute_core_operator(prepared, implementation)
     
     def _prepare_data_for_core_operator(
         self, 
@@ -148,11 +126,7 @@ class LinearOperatorTest(BaseOperatorTest):
         Returns:
             Dict[str, Any]: 准备好的数据
         """
-        if implementation == "default":
-            formal = self.get_formal_implementations(device)
-            if not formal:
-                raise ValueError(f"Linear 不支持设备 {device}")
-            implementation = formal[0]
+        implementation = self._resolve_implementation(device, implementation)
 
         input_tensor = data['input'].to(
             device=device, dtype=precision.value, copy=True
@@ -215,6 +189,21 @@ class LinearOperatorTest(BaseOperatorTest):
         if device.startswith("npu"):
             return [self.NPU_IMPLEMENTATION]
         return []
+
+    def _resolve_implementation(
+        self, device: str, implementation: str
+    ) -> str:
+        """Resolve and validate the formal provider for ``device``."""
+        formal = self.get_formal_implementations(device)
+        if implementation == "default":
+            if not formal:
+                raise ValueError(f"Linear 不支持设备 {device}")
+            return formal[0]
+        if implementation not in formal:
+            raise ValueError(
+                f"实现 {implementation!r} 不适用于 {device}; formal={formal}"
+            )
+        return implementation
     
     def calculate_flops(self, data: Dict[str, Any]) -> Optional[float]:
         """计算浮点运算次数 (FLOPS)

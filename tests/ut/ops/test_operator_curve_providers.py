@@ -29,6 +29,7 @@ from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest  # noqa: E402
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest  # noqa: E402
 from linear.linear_operator import LinearOperatorTest  # noqa: E402
 from paged_attention.base import PagedAttentionOperatorTest  # noqa: E402
+from paged_attention.cuda_impl import FlashInferPagedKVImpl  # noqa: E402
 from recurrent_gated_delta_rule.base import (  # noqa: E402
     RecurrentGatedDeltaRuleOperatorTest,
 )
@@ -217,29 +218,121 @@ def test_groupgemm_int8_formal_provider_calls_low_level_out_kernel(monkeypatch):
     assert output_arguments == list(prepared["expert_outputs"])
 
 
+def _fake_accelerator_tensor_to(monkeypatch, expected_device):
+    original_to = torch.Tensor.to
+    requested_devices = []
+
+    def fake_to(tensor, *args, **kwargs):
+        device = kwargs.pop("device", None)
+        if device is None and args and isinstance(args[0], str):
+            device, args = args[0], args[1:]
+        if device is not None:
+            requested_devices.append(device)
+            assert device == expected_device
+        kwargs.pop("copy", None)
+        return original_to(tensor, *args, **kwargs).clone()
+
+    monkeypatch.setattr(torch.Tensor, "to", fake_to)
+    return requested_devices
+
+
+@pytest.mark.parametrize(
+    ("factory", "device", "implementation"),
+    [
+        (AddOperatorTest, "npu:0", AddOperatorTest.CUDA_IMPLEMENTATION),
+        (AddOperatorTest, "cpu", AddOperatorTest.CUDA_IMPLEMENTATION),
+        (AddOperatorTest, "cuda:0", AddOperatorTest.NPU_IMPLEMENTATION),
+        (AddOperatorTest, "cpu", AddOperatorTest.NPU_IMPLEMENTATION),
+        (LinearOperatorTest, "npu:0", LinearOperatorTest.CUDA_IMPLEMENTATION),
+        (LinearOperatorTest, "cpu", LinearOperatorTest.CUDA_IMPLEMENTATION),
+        (LinearOperatorTest, "cuda:0", LinearOperatorTest.NPU_IMPLEMENTATION),
+        (LinearOperatorTest, "cpu", LinearOperatorTest.NPU_IMPLEMENTATION),
+        (RMSNormOperatorTest, "npu:0", RMSNormOperatorTest.CUDA_IMPLEMENTATION),
+        (RMSNormOperatorTest, "cpu", RMSNormOperatorTest.CUDA_IMPLEMENTATION),
+        (RMSNormOperatorTest, "cuda:0", RMSNormOperatorTest.NPU_IMPLEMENTATION),
+        (RMSNormOperatorTest, "cpu", RMSNormOperatorTest.NPU_IMPLEMENTATION),
+    ],
+)
+def test_explicit_formal_provider_rejects_cross_device_request(
+    factory,
+    device,
+    implementation,
+):
+    operator = factory()
+
+    with pytest.raises(ValueError, match="不适用于|not formal"):
+        operator._prepare_data_for_core_operator(
+            {},
+            device,
+            SimpleNamespace(value=torch.float32),
+            implementation,
+        )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [AddOperatorTest, LinearOperatorTest, RMSNormOperatorTest],
+)
+def test_default_formal_provider_rejects_unsupported_device(factory):
+    operator = factory()
+
+    with pytest.raises(ValueError, match="不支持设备|unsupported device"):
+        operator._prepare_data_for_core_operator(
+            {},
+            "cpu",
+            SimpleNamespace(value=torch.float32),
+            "default",
+        )
+
+
+@pytest.mark.parametrize(
+    ("factory", "device", "expected"),
+    [
+        (AddOperatorTest, "cuda:7", AddOperatorTest.CUDA_IMPLEMENTATION),
+        (AddOperatorTest, "npu:3", AddOperatorTest.NPU_IMPLEMENTATION),
+        (LinearOperatorTest, "cuda:7", LinearOperatorTest.CUDA_IMPLEMENTATION),
+        (LinearOperatorTest, "npu:3", LinearOperatorTest.NPU_IMPLEMENTATION),
+        (RMSNormOperatorTest, "cuda:7", RMSNormOperatorTest.CUDA_IMPLEMENTATION),
+        (RMSNormOperatorTest, "npu:3", RMSNormOperatorTest.NPU_IMPLEMENTATION),
+    ],
+)
+def test_default_formal_provider_resolves_for_requested_device(
+    factory,
+    device,
+    expected,
+):
+    assert factory()._resolve_implementation(device, "default") == expected
+
+
 def test_rmsnorm_timed_npu_result_keeps_auxiliary_output(monkeypatch):
     operator = RMSNormOperatorTest()
     primary = torch.tensor([1.0])
     auxiliary = torch.tensor([2.0])
     native_result = (primary, auxiliary)
+    requested_devices = _fake_accelerator_tensor_to(monkeypatch, "npu:0")
     monkeypatch.setattr(
         rmsnorm_module,
         "torch_npu",
         SimpleNamespace(npu_rms_norm=lambda *args, **kwargs: native_result),
     )
 
-    timed_result = operator._execute_core_operator(
+    prepared = operator._prepare_data_for_core_operator(
         {
             "x": torch.tensor([3.0]),
             "gamma": torch.tensor([4.0]),
             "eps": 1.0e-6,
-            "implementation": operator.NPU_IMPLEMENTATION,
-            "device": "npu:0",
         },
-        operator.NPU_IMPLEMENTATION,
+        "npu:0",
+        SimpleNamespace(value=torch.float32),
+        "default",
+    )
+    timed_result = operator._execute_core_operator(
+        prepared,
+        "default",
     )
     correctness_result = operator._primary_output(timed_result)
 
+    assert requested_devices == ["npu:0", "npu:0"]
     assert timed_result is native_result
     assert correctness_result is primary
 
@@ -273,26 +366,28 @@ def test_attention_timed_result_keeps_auxiliary_output(
     assert correctness_result is primary
 
 
-def test_add_formal_prepare_owns_fresh_inputs_and_output():
+def test_add_formal_prepare_owns_fresh_inputs_and_output(monkeypatch):
     operator = AddOperatorTest()
     data = {
         "tensor_a": torch.arange(8, dtype=torch.float32),
         "tensor_b": torch.arange(8, dtype=torch.float32),
     }
+    requested_devices = _fake_accelerator_tensor_to(monkeypatch, "cuda:0")
 
     first = operator._prepare_data_for_core_operator(
         data,
-        "cpu",
+        "cuda:0",
         SimpleNamespace(value=torch.float32),
-        operator.CUDA_IMPLEMENTATION,
+        "default",
     )
     second = operator._prepare_data_for_core_operator(
         data,
-        "cpu",
+        "cuda:0",
         SimpleNamespace(value=torch.float32),
-        operator.CUDA_IMPLEMENTATION,
+        "default",
     )
 
+    assert requested_devices == ["cuda:0"] * 4
     for key in ("tensor_a", "tensor_b", "output"):
         assert first[key].untyped_storage().data_ptr() != (
             second[key].untyped_storage().data_ptr()
@@ -302,39 +397,113 @@ def test_add_formal_prepare_owns_fresh_inputs_and_output():
     ) is first["output"]
 
 
-def test_add_formal_provider_is_usable_by_correctness_entry():
-    operator = AddOperatorTest()
-    data = {
-        "tensor_a": torch.arange(8, dtype=torch.float32),
-        "tensor_b": torch.arange(8, dtype=torch.float32),
-    }
-
-    result = operator.run_device_implementation(
-        data,
-        "cpu",
-        SimpleNamespace(value=torch.float32),
-        operator.CUDA_IMPLEMENTATION,
-    )
-
-    assert torch.equal(result, data["tensor_a"] + data["tensor_b"])
-
-
-def test_linear_formal_correctness_uses_bias_free_mm_semantics():
+def test_linear_formal_correctness_uses_bias_free_mm_semantics(monkeypatch):
     operator = LinearOperatorTest()
     data = {
         "input": torch.arange(8, dtype=torch.float32).reshape(2, 4),
         "weight": torch.arange(12, dtype=torch.float32).reshape(3, 4),
         "bias": torch.full((3,), 1000.0),
     }
+    requested_devices = _fake_accelerator_tensor_to(monkeypatch, "cuda:0")
+    mm_calls = []
+    original_empty = torch.empty
 
-    result = operator.run_device_implementation(
+    def fake_mm(input_tensor, weight_t, *, out):
+        mm_calls.append((input_tensor, weight_t, out))
+        torch.matmul(input_tensor, weight_t, out=out)
+        return out
+
+    def fake_empty(*args, **kwargs):
+        if kwargs.get("device") == "cuda:0":
+            kwargs = {**kwargs, "device": "cpu"}
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "mm", fake_mm)
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    prepared = operator._prepare_data_for_core_operator(
         data,
-        "cpu",
+        "cuda:0",
         SimpleNamespace(value=torch.float32),
-        operator.CUDA_IMPLEMENTATION,
+        "default",
     )
+    result = operator._execute_core_operator(prepared, "default")
 
-    assert torch.equal(result, torch.mm(data["input"], data["weight"].t()))
+    assert requested_devices == ["cuda:0", "cuda:0"]
+    assert len(mm_calls) == 1
+    assert mm_calls[0][0] is prepared["input"]
+    assert mm_calls[0][1] is prepared["weight_t"]
+    assert mm_calls[0][2] is prepared["output"]
+    assert result is prepared["output"]
+    assert torch.equal(result, torch.matmul(data["input"], data["weight"].t()))
+
+
+def test_flashinfer_prepare_owns_fresh_zeroed_workspace(monkeypatch):
+    implementation = FlashInferPagedKVImpl(workspace_bytes=32)
+    original_empty = torch.empty
+    original_zeros = torch.zeros
+    zeros_calls = []
+
+    def fake_empty(*args, **kwargs):
+        if kwargs.get("device") == "cuda:0":
+            kwargs = {**kwargs, "device": "cpu"}
+        return original_empty(*args, **kwargs)
+
+    def fake_zeros(*args, **kwargs):
+        zeros_calls.append((args, kwargs.copy()))
+        if kwargs.get("device") == "cuda:0":
+            kwargs = {**kwargs, "device": "cpu"}
+        return original_zeros(*args, **kwargs)
+
+    class FakeWrapper:
+
+        def __init__(
+            self,
+            workspace,
+            kv_layout,
+            use_tensor_cores,
+            backend,
+        ):
+            self.workspace = workspace
+            self.kv_layout = kv_layout
+            self.use_tensor_cores = use_tensor_cores
+            self.backend = backend
+
+        def plan(self, *args, **kwargs):
+            self.plan_args = args
+            self.plan_kwargs = kwargs
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch, "zeros", fake_zeros)
+    monkeypatch.setattr(
+        implementation,
+        "_copy_tensor",
+        lambda tensor, *, device, dtype: tensor.to(dtype=dtype).clone(),
+    )
+    monkeypatch.setattr(implementation, "_wrapper_class", lambda: FakeWrapper)
+    data = {
+        "block_size": 128,
+        "num_heads": 8,
+        "num_kv_heads": 1,
+        "head_size": 4,
+        "context_lens": torch.tensor([128], dtype=torch.int32),
+        "block_table": torch.tensor([[0]], dtype=torch.int32),
+        "query": torch.ones(1, 8, 4),
+        "key_cache": torch.ones(1, 128, 1, 4),
+        "value_cache": torch.ones(1, 128, 1, 4),
+        "scale": 0.5,
+    }
+    precision = SimpleNamespace(value=torch.float32)
+
+    first = implementation.prepare_data(data, "cuda:0", precision)
+    second = implementation.prepare_data(data, "cuda:0", precision)
+
+    assert len(zeros_calls) == 2
+    assert all(call[1]["device"] == "cuda:0" for call in zeros_calls)
+    assert first["workspace"].untyped_storage().data_ptr() != (
+        second["workspace"].untyped_storage().data_ptr()
+    )
+    assert torch.count_nonzero(first["workspace"]).item() == 0
+    assert torch.count_nonzero(second["workspace"]).item() == 0
 
 
 def test_flashattention_sdpa_context_is_selected_for_complete_repeat():

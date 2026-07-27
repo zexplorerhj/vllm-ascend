@@ -114,9 +114,7 @@ class RMSNormOperatorTest(BaseOperatorTest):
 
     def _prepare_data_for_core_operator(self, data: Dict[str, Any], device: str, precision: PrecisionType, implementation: str = "default") -> Dict[str, Any]:
         """为核心算子准备数据（排除预处理开销）"""
-        if implementation == "default":
-            formal = self.get_formal_implementations(device)
-            implementation = formal[0] if formal else "manual"
+        implementation = self._resolve_implementation(device, implementation)
         x = data['x'].to(
             device=device, dtype=precision.value, copy=True
         )
@@ -170,9 +168,7 @@ class RMSNormOperatorTest(BaseOperatorTest):
 
     def get_available_implementations(self, device: str) -> List[str]:
         """获取可用的实现列表"""
-        if device.startswith(("cuda", "npu")):
-            return self.get_formal_implementations(device)
-        return ["manual"]
+        return self.get_formal_implementations(device)
 
     def get_formal_implementations(self, device: str) -> List[str]:
         """Return the fixed native provider used by formal curves."""
@@ -181,6 +177,21 @@ class RMSNormOperatorTest(BaseOperatorTest):
         if device.startswith("npu"):
             return [self.NPU_IMPLEMENTATION]
         return []
+
+    def _resolve_implementation(
+        self, device: str, implementation: str
+    ) -> str:
+        """Resolve and validate the formal provider for ``device``."""
+        formal = self.get_formal_implementations(device)
+        if implementation == "default":
+            if not formal:
+                raise ValueError(f"RMSNorm 不支持设备 {device}")
+            return formal[0]
+        if implementation not in formal:
+            raise ValueError(
+                f"实现 {implementation!r} 不适用于 {device}; formal={formal}"
+            )
+        return implementation
     
     def calculate_throughput(self, data: Dict[str, Any], time_ms: float) -> Optional[float]:
         """计算吞吐量（GFLOPS）"""

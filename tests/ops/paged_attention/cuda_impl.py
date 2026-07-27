@@ -135,7 +135,7 @@ class FlashInferPagedKVImpl:
         last_page_len = self._copy_tensor(
             last_page_len_cpu, device=device, dtype=torch.int32
         )
-        workspace = torch.empty(
+        workspace = torch.zeros(
             self.workspace_bytes, dtype=torch.uint8, device=device
         )
         output = torch.empty_like(query)

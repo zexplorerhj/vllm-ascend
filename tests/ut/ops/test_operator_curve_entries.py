@@ -605,8 +605,8 @@ def test_flash_quick_keeps_one_shape_for_each_formal_provider(
     result = suite.run_tflops_test(
         precision="fp16",
         n_ctx_values=[32, 64],
-        head_dims=[64],
-        causal_values=[True],
+        head_dims=[64, 128],
+        causal_values=[True, False],
         device="cuda:0",
         quick=True,
         plot_results=False,
@@ -614,9 +614,29 @@ def test_flash_quick_keeps_one_shape_for_each_formal_provider(
 
     assert [call["implementation"] for call in framework.calls] == [
         "cuda_sdpa_flash_attention",
+        "cuda_sdpa_flash_attention",
+        "cuda_sdpa_flash_attention",
+        "cuda_sdpa_flash_attention",
+        "cuda_flash_attn_func",
+        "cuda_flash_attn_func",
+        "cuda_flash_attn_func",
         "cuda_flash_attn_func",
     ]
-    assert [row["point_index"] for row in result["rows"]] == [0, 2]
+    assert {
+        (
+            call["data"]["metadata"]["head_dim"],
+            call["data"]["metadata"]["causal"],
+        )
+        for call in framework.calls
+    } == {
+        (64, True),
+        (64, False),
+        (128, True),
+        (128, False),
+    }
+    assert [row["point_index"] for row in result["rows"]] == [
+        0, 2, 4, 6, 8, 10, 12, 14,
+    ]
 
 
 def test_groupgemm_shard_keeps_global_formal_point_identity(
@@ -675,9 +695,12 @@ def test_paged_attention_quick_keeps_one_point_per_formal_matrix(
         plot_results=False,
     )
 
-    assert len(framework.calls) == 2
+    assert len(framework.calls) == 3
     rows = result["seqlen_rows"] + result["batch_rows"]
-    assert [row["point_index"] for row in rows] == [0, 2]
+    assert [row["point_index"] for row in rows] == [0, 2, 4]
+    assert [
+        call["data"]["max_seq_len"] for call in framework.calls[1:]
+    ] == [128, 256]
 
 
 def test_recurrent_quick_keeps_first_batch_of_each_mode(

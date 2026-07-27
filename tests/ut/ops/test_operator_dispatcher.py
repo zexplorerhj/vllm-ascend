@@ -248,3 +248,36 @@ def test_relative_output_dir_is_resolved_from_callers_directory(tmp_path):
     assert command[command.index("--result-dir") + 1] == str(
         tmp_path / "caller-results"
     )
+
+
+def test_no_argument_option_seven_still_lists_registered_operators(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$DISPATCH_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    dispatch_log = tmp_path / "interactive.log"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+    environment["DISPATCH_LOG"] = str(dispatch_log)
+
+    completed = subprocess.run(
+        ["bash", str(DISPATCHER)],
+        cwd=tmp_path,
+        input="7\n",
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0
+    assert dispatch_log.read_text(encoding="utf-8").splitlines() == [
+        "test_main.py --list"
+    ]
+    assert "test_recurrent_gated_delta_rule.py" not in dispatch_log.read_text(
+        encoding="utf-8"
+    )

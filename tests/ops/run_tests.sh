@@ -291,8 +291,8 @@ echo "3. 只测试GroupGemm算子"
 echo "4. 只测试Linear算子"
 echo "5. 只测试RMSNorm算子"
 echo "6. 只测试FlashAttention算子"
-echo "7. 测试RecurrentGatedDeltaRule算子"
-echo "8. 列出所有已注册的算子"
+echo "7. 列出所有已注册的算子"
+echo "8. 测试RecurrentGatedDeltaRule算子"
 
 read -r -p "请选择测试选项 (1-8): " choice
 
@@ -419,7 +419,7 @@ case $choice in
             *) echo "无效选择"; exit 1 ;;
         esac
         ;;
-    7)
+    8)
         recurrent_timestamp=$(date +%Y%m%d_%H%M%S)
         python3 tests/test_recurrent_gated_delta_rule.py \
             --device auto \
@@ -429,7 +429,7 @@ case $choice in
             --warmup 5 --iterations 20 --repeats 3 \
             --output "test_results/recurrent_gated_delta_rule_${recurrent_timestamp}.csv"
         ;;
-    8)
+    7)
         echo "列出所有已注册的算子..."
         python3 test_main.py --list
         ;;

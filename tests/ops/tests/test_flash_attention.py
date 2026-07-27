@@ -401,7 +401,7 @@ class FlashAttentionTestSuite(BaseTestSuite):
                         + case_index * len(n_ctx_values)
                         + n_ctx_index
                     )
-                    if quick and (case_index != 0 or n_ctx_index != 0):
+                    if quick and n_ctx_index != 0:
                         continue
                     if point_index % num_shards != shard_index:
                         continue

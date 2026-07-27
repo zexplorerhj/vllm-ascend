@@ -562,9 +562,7 @@ class PagedAttentionTestSuite(BaseTestSuite):
                         + fixed_seq_index * len(batch_sizes)
                         + batch_index
                     )
-                    if quick and (
-                        fixed_seq_index != 0 or batch_index != 0
-                    ):
+                    if quick and batch_index != 0:
                         continue
                     if point_index % num_shards != shard_index:
                         continue

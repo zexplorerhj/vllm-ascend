@@ -18,9 +18,35 @@ from operator_test_framework import (
     finalize_curve_coverage,
 )
 from linear.linear_fp8_operator import LinearFp8OperatorTest
+from linear.linear_fp8_npu_operator import LinearFp8NpuOperatorTest
+from linear.linear_mxfp8_npu_operator import LinearMxFp8NpuOperatorTest
 from linear.linear_operator import LinearOperatorTest
 
 LINEAR_BASE_ITERATIONS = 50
+LINEAR_PRECISION_TYPES = {
+    "fp16": PrecisionType.FP16,
+    "bf16": PrecisionType.BF16,
+    "fp8": PrecisionType.FP8,
+    "mxfp8": PrecisionType.MXFP8,
+}
+LINEAR_QUANTIZATION_SEMANTICS = {
+    "fp16": "none; FP16 activation/weight",
+    "bf16": "none; BF16 activation/weight",
+    "fp8": (
+        "E4M3 activation/weight; per-token activation and "
+        "per-output-channel weight FP32 scales"
+    ),
+    "mxfp8": (
+        "E4M3 activation/weight; group32 pair-packed E8M0 "
+        "activation/weight scales"
+    ),
+}
+LINEAR_OUTPUT_SEMANTICS = {
+    "fp16": "FP16,no_bias",
+    "bf16": "BF16,no_bias",
+    "fp8": "BF16,no_bias",
+    "mxfp8": "BF16,no_bias",
+}
 
 
 def estimate_linear_fp8_fresh_bytes(m: int, n: int, k: int) -> int:
@@ -30,10 +56,30 @@ def estimate_linear_fp8_fresh_bytes(m: int, n: int, k: int) -> int:
     return m * k + k * n + 2 * m * n + 4 * m + 4 * n
 
 
+def estimate_linear_mxfp8_fresh_bytes(m: int, n: int, k: int) -> int:
+    """Return retained bytes for one group-32 MXFP8/BF16 payload."""
+    if min(m, n, k) <= 0:
+        raise ValueError("Linear MXFP8 dimensions must be positive")
+    groups_per_row = (k + 31) // 32
+    return (
+        m * k
+        + k * n
+        + 2 * m * n
+        + groups_per_row * (m + n)
+    )
+
+
 class LinearTestSuite(BaseTestSuite):
     """Linear算子测试套件 - 基于torch.nn.functional.linear"""
     
-    def __init__(self, precision: str = "bf16", batch_size: int = 128, input_dim: int = 1024, output_dim: int = 4096):
+    def __init__(
+        self,
+        precision: str = "bf16",
+        batch_size: int = 128,
+        input_dim: int = 1024,
+        output_dim: int = 4096,
+        device: str = "auto",
+    ):
         """
         初始化Linear测试套件
         
@@ -45,14 +91,35 @@ class LinearTestSuite(BaseTestSuite):
         """
         super().__init__("Linear")
         self.precision = precision.lower()
+        if self.precision not in LINEAR_PRECISION_TYPES:
+            raise ValueError(f"unsupported Linear precision: {self.precision}")
         self.batch_size = batch_size
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.operator_test = (
-            LinearFp8OperatorTest()
-            if self.precision == "fp8"
-            else LinearOperatorTest()
+        self.requested_device = device
+        self.operator_test = self._operator_type_for_device(device)()
+
+    def _operator_type_for_device(self, device: str):
+        if self.precision == "fp8":
+            if device and device.startswith("npu"):
+                return LinearFp8NpuOperatorTest
+            return LinearFp8OperatorTest
+        if self.precision == "mxfp8":
+            return LinearMxFp8NpuOperatorTest
+        return LinearOperatorTest
+
+    def _select_operator_for_device(self, device: str) -> None:
+        managed_types = (
+            LinearOperatorTest,
+            LinearFp8OperatorTest,
+            LinearFp8NpuOperatorTest,
+            LinearMxFp8NpuOperatorTest,
         )
+        if not isinstance(self.operator_test, managed_types):
+            return
+        operator_type = self._operator_type_for_device(device)
+        if type(self.operator_test) is not operator_type:
+            self.operator_test = operator_type()
     
     def register_operator(self):
         """注册Linear算子到测试框架"""
@@ -208,12 +275,7 @@ class LinearTestSuite(BaseTestSuite):
             test_cases = self.create_profile_test_cases()
         
         # 确定精度类型
-        precision_map = {
-            "bf16": PrecisionType.BF16,
-            "fp16": PrecisionType.FP16,
-            "fp8": PrecisionType.FP8,
-        }
-        precision_type = precision_map[self.precision]
+        precision_type = LINEAR_PRECISION_TYPES[self.precision]
         
         return super().run_profile_test(
             test_cases=test_cases,
@@ -245,12 +307,7 @@ class LinearTestSuite(BaseTestSuite):
         
         # 确定精度类型
         if precision_type is None:
-            precision_map = {
-                "fp16": PrecisionType.FP16,
-                "bf16": PrecisionType.BF16,
-                "fp8": PrecisionType.FP8,
-            }
-            precision_type = precision_map.get(self.precision, PrecisionType.BF16)
+            precision_type = LINEAR_PRECISION_TYPES[self.precision]
         
         # 调用父类的V2性能测试方法
         return super().run_performance_test_suite_v2(
@@ -322,6 +379,20 @@ class LinearTestSuite(BaseTestSuite):
             if self.precision == "fp8":
                 if torch.cuda.is_available():
                     device = "cuda:0"
+                else:
+                    try:
+                        import torch_npu
+                        if torch_npu.npu.is_available():
+                            device = "npu:0"
+                    except (ImportError, AttributeError, RuntimeError):
+                        pass
+            elif self.precision == "mxfp8":
+                try:
+                    import torch_npu
+                    if torch_npu.npu.is_available():
+                        device = "npu:0"
+                except (ImportError, AttributeError, RuntimeError):
+                    pass
             else:
                 try:
                     import torch_npu
@@ -338,17 +409,33 @@ class LinearTestSuite(BaseTestSuite):
         if device == "auto":
             if self.precision == "fp8":
                 raise RuntimeError(
-                    "formal FP8 Linear curve requires CUDA SM90/H20"
+                    "formal FP8 Linear curve requires CUDA SM90/H20 or "
+                    "NPU Ascend 950PR"
+                )
+            if self.precision == "mxfp8":
+                raise RuntimeError(
+                    "formal MXFP8 Linear curve requires NPU Ascend 950PR"
                 )
             raise RuntimeError("formal Linear curve requires CUDA or NPU")
+        if self.precision == "mxfp8" and not device.startswith("npu"):
+            raise RuntimeError(
+                "formal MXFP8 Linear curve requires NPU Ascend 950PR"
+            )
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA device requested but unavailable: {device}")
 
+        self._select_operator_for_device(device)
         implementations = self.operator_test.get_formal_implementations(device)
         if len(implementations) != 1:
             if self.precision == "fp8":
                 raise RuntimeError(
-                    "formal FP8 Linear curve requires exact CUDA SM90/H20; "
+                    "formal FP8 Linear curve requires CUDA SM90/H20 or "
+                    "NPU Ascend 950PR; "
+                    f"device={device}, providers={implementations}"
+                )
+            if self.precision == "mxfp8":
+                raise RuntimeError(
+                    "formal MXFP8 Linear curve requires NPU Ascend 950PR; "
                     f"device={device}, providers={implementations}"
                 )
             raise RuntimeError(
@@ -356,11 +443,7 @@ class LinearTestSuite(BaseTestSuite):
                 f"{implementations}"
             )
         implementation = implementations[0]
-        precision_type = {
-            "fp16": PrecisionType.FP16,
-            "bf16": PrecisionType.BF16,
-            "fp8": PrecisionType.FP8,
-        }[self.precision]
+        precision_type = LINEAR_PRECISION_TYPES[self.precision]
         result_dir = self.framework.result_dir
         result_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -380,7 +463,8 @@ class LinearTestSuite(BaseTestSuite):
             "coverage_total_requested_points",
             "selection_covers_full_formal_matrix", "coverage_complete",
             "M", "N", "K",
-            "bias", "provider", "device", "precision", "avg_time_ms",
+            "bias", "provider", "device", "precision",
+            "quantization_semantics", "output_semantics", "avg_time_ms",
             "TFLOPS", "status", "error",
             *FRESH_ITERATION_PLAN_FIELDS,
             *provenance_fields,
@@ -395,6 +479,10 @@ class LinearTestSuite(BaseTestSuite):
                 estimated_unique_bytes_per_invocation=(
                     estimate_linear_fp8_fresh_bytes(size, size, size)
                     if self.precision == "fp8"
+                    else estimate_linear_mxfp8_fresh_bytes(
+                        size, size, size
+                    )
+                    if self.precision == "mxfp8"
                     else 6 * size * size
                 ),
             )
@@ -413,6 +501,12 @@ class LinearTestSuite(BaseTestSuite):
                 "provider": implementation,
                 "device": device,
                 "precision": self.precision.upper(),
+                "quantization_semantics": (
+                    LINEAR_QUANTIZATION_SEMANTICS[self.precision]
+                ),
+                "output_semantics": (
+                    LINEAR_OUTPUT_SEMANTICS[self.precision]
+                ),
                 "avg_time_ms": "",
                 "TFLOPS": "",
                 "status": "pending",
@@ -515,7 +609,12 @@ def main():
     from operator_test_framework import OperatorTestFramework
     
     parser = argparse.ArgumentParser(description='Linear 算子 Profile 测试')
-    parser.add_argument('--precision', choices=['fp16', 'bf16', 'fp8'], default='bf16', help='精度类型')
+    parser.add_argument(
+        '--precision',
+        choices=['fp16', 'bf16', 'fp8', 'mxfp8'],
+        default='bf16',
+        help='精度类型',
+    )
     parser.add_argument('--batch-size', type=int, default=128, help='批次大小')
     parser.add_argument('--input-dim', type=int, default=1024, help='输入维度')
     parser.add_argument('--output-dim', type=int, default=4096, help='输出维度')
@@ -562,7 +661,8 @@ def main():
         precision=args.precision,
         batch_size=args.batch_size,
         input_dim=args.input_dim,
-        output_dim=args.output_dim
+        output_dim=args.output_dim,
+        device=args.device,
     )
     
     # 设置框架并注册算子
@@ -612,12 +712,7 @@ def main():
         elif args.mode == "performance":
             print("🚀 运行 Linear V2 性能测试 (矩阵乘法优化)...")
             # 确定精度类型
-            precision_map = {
-                "fp16": PrecisionType.FP16,
-                "bf16": PrecisionType.BF16,
-                "fp8": PrecisionType.FP8,
-            }
-            precision_type = precision_map[args.precision]
+            precision_type = LINEAR_PRECISION_TYPES[args.precision]
             results = test_suite.run_performance_test_v2(
                 test_cases=test_cases,
                 precision_type=precision_type,

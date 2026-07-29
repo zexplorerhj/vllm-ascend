@@ -16,7 +16,7 @@ formal_usage() {
     cat >&2 <<'EOF'
 Usage:
   run_tests.sh --formal --operator OP --device DEVICE --output-dir DIR
-      [--precision fp8]
+      [--precision fp8|mxfp8]
       [--warmup W] [--iterations I] [--repeats R]
       [--stabilization-repeats S]
       [--task-queue unset|0|1|2]
@@ -137,9 +137,10 @@ dispatch_formal_operator() {
                 --mode bandwidth || command_status=$?
             ;;
         linear)
-            if [ "$formal_precision" = "fp8" ]; then
+            if [ -n "$formal_precision" ]; then
                 run_formal_entry tflops tests/test_linear.py \
-                    --mode tflops --precision fp8 || command_status=$?
+                    --mode tflops --precision "$formal_precision" \
+                    || command_status=$?
             else
                 for precision in fp16 bf16; do
                     run_formal_entry tflops tests/test_linear.py \
@@ -160,9 +161,10 @@ dispatch_formal_operator() {
             done
             ;;
         groupgemm)
-            if [ "$formal_precision" = "fp8" ]; then
+            if [ -n "$formal_precision" ]; then
                 run_formal_entry tflops tests/test_groupgemm.py \
-                    --mode tflops --precision fp8 || command_status=$?
+                    --mode tflops --precision "$formal_precision" \
+                    || command_status=$?
             else
                 for precision in bf16 int8; do
                     run_formal_entry tflops tests/test_groupgemm.py \
@@ -247,8 +249,8 @@ if [ "$#" -gt 0 ]; then
         *) formal_error "不支持的 operator: $formal_operator" ;;
     esac
     case "$formal_precision" in
-        ''|fp8) ;;
-        *) formal_error "--precision 仅支持 fp8" ;;
+        ''|fp8|mxfp8) ;;
+        *) formal_error "--precision 仅支持 fp8 或 mxfp8" ;;
     esac
     [ -n "$formal_device" ] || formal_error "必须指定 --device"
     is_formal_device "$formal_device" || \
@@ -259,8 +261,20 @@ if [ "$#" -gt 0 ]; then
             *) formal_error "FP8 formal 仅支持 linear、groupgemm 或 all" ;;
         esac
         case "$formal_device" in
-            cuda|cuda:[0-9]*) ;;
-            *) formal_error "FP8 formal 仅支持 CUDA SM90/H20" ;;
+            cuda|cuda:[0-9]*|npu|npu:[0-9]*) ;;
+            *)
+                formal_error \
+                    "FP8 formal 仅支持 CUDA SM90/H20 或 NPU Ascend 950PR"
+                ;;
+        esac
+    elif [ "$formal_precision" = "mxfp8" ]; then
+        case "$formal_operator" in
+            linear|groupgemm|all) ;;
+            *) formal_error "MXFP8 formal 仅支持 linear、groupgemm 或 all" ;;
+        esac
+        case "$formal_device" in
+            npu|npu:[0-9]*) ;;
+            *) formal_error "MXFP8 formal 仅支持 NPU Ascend 950PR" ;;
         esac
     fi
     [ -n "$formal_output_dir" ] || formal_error "必须指定 --output-dir"
@@ -325,7 +339,7 @@ if [ "$#" -gt 0 ]; then
 
     formal_status=0
     if [ "$formal_operator" = "all" ]; then
-        if [ "$formal_precision" = "fp8" ]; then
+        if [ -n "$formal_precision" ]; then
             formal_families=(linear groupgemm)
         else
             formal_families=(

@@ -18,30 +18,51 @@ from operator_test_framework import (
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest
 from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest
 from groupgemm.groupgemm_fp8 import GroupGemmFp8OperatorTest
+from groupgemm.groupgemm_fp8_npu import GroupGemmFp8NpuOperatorTest
+from groupgemm.groupgemm_mxfp8_npu import (
+    GroupGemmMxFp8NpuOperatorTest,
+)
+
+GROUPGEMM_PRECISION_TYPES = {
+    "int8": PrecisionType.INT8,
+    "bf16": PrecisionType.BF16,
+    "fp8": PrecisionType.FP8,
+    "mxfp8": PrecisionType.MXFP8,
+}
 
 
 class GroupGemmTestSuite(BaseTestSuite):
-    """GroupGemm算子测试套件 - 支持INT8、BF16和FP8精度"""
+    """GroupGemm算子测试套件 - 支持INT8、BF16、FP8和MXFP8精度"""
     
-    def __init__(self, precision: str = "int8", num_experts: int = 8, hidden_dim: int = 7168, out_channel: int = 4096, use_nz_format: bool = False):
+    def __init__(
+        self,
+        precision: str = "int8",
+        num_experts: int = 8,
+        hidden_dim: int = 7168,
+        out_channel: int = 4096,
+        use_nz_format: bool = False,
+        device: str = "auto",
+    ):
         """
         初始化GroupGemm测试套件
         
         Args:
-            precision: 精度类型，"int8"、"bf16" 或 "fp8"
+            precision: 精度类型，"int8"、"bf16"、"fp8" 或 "mxfp8"
             num_experts: 专家数量
             hidden_dim: 隐藏维度
             out_channel: 输出通道数
             use_nz_format: 是否使用NZ格式（仅对INT8有效）
         """
         precision = precision.lower()
-        if precision not in {"int8", "bf16", "fp8"}:
+        if precision not in GROUPGEMM_PRECISION_TYPES:
             raise ValueError(f"unsupported GroupGemm precision: {precision}")
         format_suffix = "_NZ" if use_nz_format else ""
         if precision == "bf16":
             precision_name = f"GroupGemm_BF16{format_suffix}"
         elif precision == "fp8":
             precision_name = "GroupGemm_FP8"
+        elif precision == "mxfp8":
+            precision_name = "GroupGemm_MXFP8"
         else:
             precision_name = f"GroupGemm{format_suffix}"
         super().__init__(precision_name)
@@ -50,40 +71,45 @@ class GroupGemmTestSuite(BaseTestSuite):
         self.hidden_dim = hidden_dim
         self.out_channel = out_channel
         self.use_nz_format = use_nz_format
-        self.operator_test = (
-            GroupGemmFp8OperatorTest(
-                num_experts=self.num_experts,
-                hidden_dim=self.hidden_dim,
-                out_channel=self.out_channel,
-                use_nz_format=self.use_nz_format,
-            )
-            if self.precision == "fp8"
-            else None
+        self.requested_device = device
+        self.operator_test = self._new_operator_for_device(device)
+
+    def _operator_type_for_device(self, device: str):
+        if self.precision == "fp8":
+            if device and device.startswith("npu"):
+                return GroupGemmFp8NpuOperatorTest
+            return GroupGemmFp8OperatorTest
+        if self.precision == "mxfp8":
+            return GroupGemmMxFp8NpuOperatorTest
+        if self.precision == "bf16":
+            return GroupGemmBF16OperatorTest
+        return GroupGemmOperatorTest
+
+    def _new_operator_for_device(self, device: str):
+        operator_type = self._operator_type_for_device(device)
+        return operator_type(
+            num_experts=self.num_experts,
+            hidden_dim=self.hidden_dim,
+            out_channel=self.out_channel,
+            use_nz_format=self.use_nz_format,
         )
+
+    def _select_operator_for_device(self, device: str) -> None:
+        managed_types = (
+            GroupGemmOperatorTest,
+            GroupGemmBF16OperatorTest,
+            GroupGemmFp8OperatorTest,
+            GroupGemmFp8NpuOperatorTest,
+            GroupGemmMxFp8NpuOperatorTest,
+        )
+        if not isinstance(self.operator_test, managed_types):
+            return
+        operator_type = self._operator_type_for_device(device)
+        if type(self.operator_test) is not operator_type:
+            self.operator_test = self._new_operator_for_device(device)
     
     def register_operator(self):
         """注册GroupGemm算子到测试框架"""
-        if self.precision == "fp8":
-            self.operator_test = GroupGemmFp8OperatorTest(
-                num_experts=self.num_experts,
-                hidden_dim=self.hidden_dim,
-                out_channel=self.out_channel,
-                use_nz_format=self.use_nz_format,
-            )
-        elif self.precision == "bf16":
-            self.operator_test = GroupGemmBF16OperatorTest(
-                num_experts=self.num_experts,
-                hidden_dim=self.hidden_dim,
-                out_channel=self.out_channel,
-                use_nz_format=self.use_nz_format
-            )
-        else:
-            self.operator_test = GroupGemmOperatorTest(
-                num_experts=self.num_experts,
-                hidden_dim=self.hidden_dim,
-                out_channel=self.out_channel,
-                use_nz_format=self.use_nz_format
-            )
         self.framework.register_operator(self.operator_test)
     
     def create_test_cases(self) -> List[Dict[str, Any]]:
@@ -205,10 +231,18 @@ class GroupGemmTestSuite(BaseTestSuite):
                 device = "cuda:0"
             elif npu_available:
                 device = "npu:0"
+            elif self.precision == "mxfp8":
+                raise RuntimeError(
+                    "MXFP8 GroupGemm TFLOPS 测试需要 NPU Ascend 950PR"
+                )
             elif torch.cuda.is_available():
                 device = "cuda:0"
             else:
                 raise RuntimeError("GroupGemm TFLOPS 测试需要 NPU 或 CUDA GPU")
+        elif self.precision == "mxfp8" and device.startswith("cuda"):
+            raise RuntimeError(
+                "MXFP8 GroupGemm TFLOPS 测试需要 NPU Ascend 950PR"
+            )
         elif device.startswith("npu") and not npu_available:
             raise RuntimeError(f"请求了 {device}，但 NPU 不可用")
         elif device.startswith("cuda") and not torch.cuda.is_available():
@@ -216,6 +250,7 @@ class GroupGemmTestSuite(BaseTestSuite):
         elif not (device.startswith("npu") or device.startswith("cuda")):
             raise ValueError(f"GroupGemm TFLOPS 测试不支持设备 {device}")
 
+        self._select_operator_for_device(device)
         implementations = self.operator_test.get_formal_implementations(device)
         if len(implementations) != 1:
             raise RuntimeError(
@@ -261,15 +296,11 @@ class GroupGemmTestSuite(BaseTestSuite):
             "int8": "INT8_TOPS",
             "bf16": "BF16_TFLOPS",
             "fp8": "FP8_TFLOPS",
+            "mxfp8": "MXFP8_TFLOPS",
         }[self.precision]
 
         # 确定精度类型
-        precision_map = {
-            "int8": PrecisionType.INT8,
-            "bf16": PrecisionType.BF16,
-            "fp8": PrecisionType.FP8,
-        }
-        precision_type = precision_map[self.precision]
+        precision_type = GROUPGEMM_PRECISION_TYPES[self.precision]
 
         results = []
         failures = []
@@ -292,8 +323,8 @@ class GroupGemmTestSuite(BaseTestSuite):
             "coverage_total_requested_points",
             "selection_covers_full_formal_matrix", "coverage_complete",
             "seq_len",
-            "num_experts", "hidden_dim", "out_channel", "implementation",
-            "kernel", "output_semantics",
+            "num_experts", "hidden_dim", "out_channel", "device", "precision",
+            "implementation", "kernel", "output_semantics",
             "avg_time_ms", "metric", "throughput_trillion_ops_s",
             "status", "error", *provenance_fields,
         ]
@@ -310,6 +341,8 @@ class GroupGemmTestSuite(BaseTestSuite):
                 "num_experts": num_experts,
                 "hidden_dim": hidden_dim,
                 "out_channel": out_channel,
+                "device": device,
+                "precision": self.precision.upper(),
                 "implementation": implementation,
                 "kernel": kernel,
                 "output_semantics": output_semantics,
@@ -346,12 +379,45 @@ class GroupGemmTestSuite(BaseTestSuite):
                 elif (
                     self.precision == "fp8"
                     and implementation
-                    == self.operator_test.CUDA_IMPLEMENTATION
+                    == getattr(
+                        self.operator_test,
+                        "CUDA_IMPLEMENTATION",
+                        None,
+                    )
                 ):
-                    kernel = "vllm_cutlass_scaled_mm_expert_loop"
+                    kernel = "vllm_cutlass_moe_mm_grouped"
                     output_semantics = (
                         "FP8(E4M3)xFP8(E4M3),"
                         "per-token*per-channel-scale->BF16"
+                    )
+                elif (
+                    self.precision == "fp8"
+                    and implementation
+                    == getattr(
+                        self.operator_test,
+                        "NPU_FP8_IMPLEMENTATION",
+                        None,
+                    )
+                ):
+                    kernel = "npu_grouped_matmul"
+                    output_semantics = (
+                        "FP8(E4M3)xFP8(E4M3),"
+                        "per-token-FP32*per-channel-FP32-scale"
+                        "->BF16,no_bias"
+                    )
+                elif (
+                    self.precision == "mxfp8"
+                    and implementation
+                    == getattr(
+                        self.operator_test,
+                        "NPU_MXFP8_IMPLEMENTATION",
+                        None,
+                    )
+                ):
+                    kernel = "npu_grouped_matmul"
+                    output_semantics = (
+                        "MXFP8(E4M3,group32)xMXFP8(E4M3,group32),"
+                        "per-group-E8M0-scale->BF16,no_bias,pure-GMM2"
                     )
                 else:
                     kernel = "npu_grouped_matmul"
@@ -472,6 +538,9 @@ class GroupGemmTestSuite(BaseTestSuite):
             "int8": "x=INT8, weight=INT8, scales=FP32/BF16, output=BF16",
             "bf16": "x=BF16, weight=BF16, bias=FP32, output=BF16",
             "fp8": "x=E4M3, weight=E4M3, scales=FP32, output=BF16",
+            "mxfp8": (
+                "x=E4M3, weight=E4M3, group32 scales=E8M0, output=BF16"
+            ),
         }
         
         print(f"GroupGemm {precision_display} 特有配置:")
@@ -480,11 +549,7 @@ class GroupGemmTestSuite(BaseTestSuite):
         print(f"数据类型: {data_types.get(self.precision, 'Unknown')}")
         
         # 确定精度类型
-        precision_type = {
-            "int8": PrecisionType.INT8,
-            "bf16": PrecisionType.BF16,
-            "fp8": PrecisionType.FP8,
-        }[self.precision]
+        precision_type = GROUPGEMM_PRECISION_TYPES[self.precision]
         
         # 调用基类的增强版本，传入 GroupGemm 特有的参数
         return super().run_profile_test(
@@ -504,7 +569,7 @@ def main():
     parser = argparse.ArgumentParser(description='GroupGemm 算子 Profile 测试')
     parser.add_argument(
         '--precision',
-        choices=['int8', 'bf16', 'fp8'],
+        choices=['int8', 'bf16', 'fp8', 'mxfp8'],
         default='int8',
         help='精度类型',
     )
@@ -550,7 +615,8 @@ def main():
         num_experts=args.num_experts,
         hidden_dim=args.hidden_dim,
         out_channel=args.out_channel,
-        use_nz_format=args.use_nz_format
+        use_nz_format=args.use_nz_format,
+        device=args.device,
     )
     
     # 设置框架并注册算子
@@ -559,8 +625,13 @@ def main():
     if args.precision == 'fp8':
         print(
             "🔧 使用 FP8 E4M3 精度测试 "
-            "(H20 formal 固定使用 vLLM CUTLASS scaled-mm expert loop，"
-            "输出 BF16)"
+            "(CUDA H20 使用 vLLM CUTLASS grouped MoE MM；NPU 950PR 使用 "
+            "npu_grouped_matmul pure-GMM2；输出 BF16)"
+        )
+    elif args.precision == 'mxfp8':
+        print(
+            "🔧 使用 MXFP8 E4M3/E8M0 group32 精度测试 "
+            "(NPU Ascend 950PR npu_grouped_matmul pure-GMM2，输出 BF16)"
         )
     elif args.precision == 'bf16':
         print(
@@ -615,11 +686,7 @@ def main():
         elif args.mode == "performance":
             print("🚀 运行 GroupGemm 性能测试...")
             # 确定精度类型
-            precision_type = {
-                "int8": PrecisionType.INT8,
-                "bf16": PrecisionType.BF16,
-                "fp8": PrecisionType.FP8,
-            }[args.precision]
+            precision_type = GROUPGEMM_PRECISION_TYPES[args.precision]
             results = test_suite.run_performance_test(
                 test_cases=test_cases,
                 precision_type=precision_type

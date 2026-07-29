@@ -146,6 +146,7 @@ class PrecisionType(Enum):
     BF16 = torch.bfloat16
     FP32 = torch.float32
     FP8 = torch.float8_e4m3fn
+    MXFP8 = "mxfp8"
     INT8 = torch.int8
 
 class DeviceType(Enum):

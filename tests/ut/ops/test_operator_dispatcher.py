@@ -145,7 +145,84 @@ def test_formal_fp8_opt_in_dispatches_only_h20_linear_and_groupgemm(
     ]
 
 
-def test_formal_default_npu_matrix_does_not_include_fp8(tmp_path):
+def test_formal_fp8_opt_in_dispatches_950pr_linear_and_groupgemm(
+    tmp_path,
+):
+    commands = _dry_run(
+        "--operator",
+        "all",
+        "--precision",
+        "fp8",
+        "--device",
+        "npu:0",
+        "--output-dir",
+        str(tmp_path / "950pr-fp8"),
+    )
+
+    assert [Path(command[1]).name for command in commands] == [
+        "test_linear.py",
+        "test_groupgemm.py",
+    ]
+    assert [
+        command[command.index("--precision") + 1] for command in commands
+    ] == ["fp8", "fp8"]
+
+
+def test_formal_mxfp8_opt_in_dispatches_950pr_linear_and_groupgemm(
+    tmp_path,
+):
+    commands = _dry_run(
+        "--operator",
+        "all",
+        "--precision",
+        "mxfp8",
+        "--device",
+        "npu:0",
+        "--output-dir",
+        str(tmp_path / "950pr-mxfp8"),
+    )
+
+    assert [Path(command[1]).name for command in commands] == [
+        "test_linear.py",
+        "test_groupgemm.py",
+    ]
+    assert [
+        command[command.index("--precision") + 1] for command in commands
+    ] == ["mxfp8", "mxfp8"]
+
+
+@pytest.mark.parametrize("device", ["auto", "cuda", "cuda:0"])
+def test_formal_mxfp8_rejects_non_npu_devices_without_dispatch(
+    tmp_path,
+    device,
+):
+    completed = subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "all",
+            "--precision",
+            "mxfp8",
+            "--device",
+            device,
+            "--output-dir",
+            str(tmp_path / "invalid-mxfp8"),
+            "--dry-run",
+        ],
+        cwd=OPS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "mxfp8" in completed.stderr.lower()
+    assert "npu" in completed.stderr.lower()
+    assert "DRY-RUN:" not in completed.stdout
+
+
+def test_formal_default_npu_matrix_does_not_include_opt_in_fp8(tmp_path):
     commands = _dry_run(
         "--operator",
         "all",
@@ -157,7 +234,7 @@ def test_formal_default_npu_matrix_does_not_include_fp8(tmp_path):
 
     assert len(commands) == 10
     assert all(
-        command[command.index("--precision") + 1] != "fp8"
+        command[command.index("--precision") + 1] not in {"fp8", "mxfp8"}
         for command in commands
         if "--precision" in command
     )

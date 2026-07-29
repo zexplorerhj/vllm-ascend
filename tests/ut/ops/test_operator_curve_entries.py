@@ -45,10 +45,24 @@ try:
 except ModuleNotFoundError:
     LinearFp8OperatorTest = None
 
+from linear.linear_fp8_npu_operator import (  # noqa: E402
+    LinearFp8NpuOperatorTest,
+)
+from linear.linear_mxfp8_npu_operator import (  # noqa: E402
+    LinearMxFp8NpuOperatorTest,
+)
+
 try:
     from groupgemm.groupgemm_fp8 import GroupGemmFp8OperatorTest
 except ModuleNotFoundError:
     GroupGemmFp8OperatorTest = None
+
+from groupgemm.groupgemm_fp8_npu import (  # noqa: E402
+    GroupGemmFp8NpuOperatorTest,
+)
+from groupgemm.groupgemm_mxfp8_npu import (  # noqa: E402
+    GroupGemmMxFp8NpuOperatorTest,
+)
 
 
 PROVENANCE = {
@@ -153,6 +167,12 @@ class _FakeOperator:
     CUDA_IMPLEMENTATION = (
         "cuda_vllm_cutlass_scaled_mm_fp8_bf16_expert_loop"
     )
+    NPU_FP8_IMPLEMENTATION = (
+        "npu_grouped_matmul_fp8_e4m3_per_token_per_channel_bf16"
+    )
+    NPU_MXFP8_IMPLEMENTATION = (
+        "npu_grouped_matmul_mxfp8_e4m3_e8m0_group32_bf16"
+    )
 
     def __init__(self, providers):
         self.providers = list(providers)
@@ -199,6 +219,16 @@ def _assert_success_rows(rows):
         assert row["status"] in ("ok", "success")
         for key, value in PROVENANCE.items():
             assert row[key] == value
+
+
+def _install_available_npu(monkeypatch):
+    fake_npu = SimpleNamespace(is_available=lambda: True)
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(npu=fake_npu),
+    )
 
 
 def _adaptive_provenance(framework):
@@ -263,6 +293,12 @@ def _assert_coverage(
         assert row["coverage_complete"] is complete
 
 
+def test_mxfp8_precision_token_is_not_an_fp8_enum_alias():
+    assert "MXFP8" in PrecisionType.__members__
+    assert PrecisionType.MXFP8 is not PrecisionType.FP8
+    assert PrecisionType.MXFP8.value == "mxfp8"
+
+
 def test_add_formal_point_uses_one_v2_call_and_provenance(
     monkeypatch, tmp_path
 ):
@@ -306,7 +342,7 @@ def test_linear_formal_point_is_bias_free_and_uses_one_v2_call(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     result = suite.run_tflops_test(
-        sizes=[16],
+        sizes=[64],
         device="cuda:0",
         num_warmup=10,
         num_iterations=50,
@@ -371,8 +407,142 @@ def test_linear_fp8_curve_selects_cutlass_provider_and_fp8_storage_plan(
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "precision",
+        "provider",
+        "expected_precision_name",
+        "expected_quantization_semantics",
+        "expected_output_semantics",
+    ),
+    [
+        (
+            "fp8",
+            "npu_quant_matmul_fp8_e4m3_per_token_per_channel_bf16",
+            "FP8",
+            (
+                "E4M3 activation/weight; per-token activation and "
+                "per-output-channel weight FP32 scales"
+            ),
+            "BF16,no_bias",
+        ),
+        (
+            "mxfp8",
+            "npu_quant_matmul_mxfp8_e4m3_e8m0_group32_bf16",
+            "MXFP8",
+            (
+                "E4M3 activation/weight; group32 pair-packed E8M0 "
+                "activation/weight scales"
+            ),
+            "BF16,no_bias",
+        ),
+    ],
+)
+def test_linear_950pr_curves_keep_precision_provider_and_artifacts_distinct(
+    monkeypatch,
+    tmp_path,
+    precision,
+    provider,
+    expected_precision_name,
+    expected_quantization_semantics,
+    expected_output_semantics,
+):
+    _install_available_npu(monkeypatch)
+    framework = _FakeFramework(tmp_path / precision)
+    suite = LinearTestSuite(precision=precision)
+    suite.framework = framework
+    suite.operator_test = _FakeOperator([provider])
+
+    result = suite.run_tflops_test(
+        sizes=[16],
+        device="npu:0",
+        num_warmup=1,
+        num_iterations=1,
+        num_repeats=1,
+        plot_results=True,
+    )
+
+    expected_stem = f"linear_tflops_{precision}_npu_0_"
+    expected_plot_stem = f"linear_tflops_curve_{precision}_npu_0_"
+    assert Path(result["csv_file"]).name.startswith(expected_stem)
+    assert Path(result["csv_file"]).suffix == ".csv"
+    assert Path(result["plot_file"]).name.startswith(expected_plot_stem)
+    assert Path(result["plot_file"]).suffix == ".png"
+    assert Path(result["plot_file"]).is_file()
+    assert framework.calls[0]["precision"] is getattr(
+        PrecisionType, expected_precision_name
+    )
+    assert result["rows"][0]["precision"] == expected_precision_name
+    assert result["rows"][0]["provider"] == provider
+    assert (
+        result["rows"][0]["quantization_semantics"]
+        == expected_quantization_semantics
+    )
+    assert (
+        result["rows"][0]["output_semantics"]
+        == expected_output_semantics
+    )
+    with Path(result["csv_file"]).open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        csv_row = next(csv.DictReader(handle))
+    assert csv_row["precision"] == expected_precision_name
+    assert csv_row["provider"] == provider
+    assert (
+        csv_row["quantization_semantics"]
+        == expected_quantization_semantics
+    )
+    assert csv_row["output_semantics"] == expected_output_semantics
+
+
+@pytest.mark.parametrize(
+    ("precision", "provider_type", "expected_precision"),
+    [
+        ("fp8", LinearFp8NpuOperatorTest, PrecisionType.FP8),
+        ("mxfp8", LinearMxFp8NpuOperatorTest, PrecisionType.MXFP8),
+    ],
+)
+def test_linear_950pr_precision_selects_its_own_npu_provider(
+    monkeypatch,
+    tmp_path,
+    precision,
+    provider_type,
+    expected_precision,
+):
+    _install_available_npu(monkeypatch)
+    monkeypatch.setattr(
+        provider_type,
+        "get_formal_implementations",
+        lambda self, device: [self.NPU_IMPLEMENTATION],
+    )
+    framework = _FakeFramework(tmp_path)
+    suite = LinearTestSuite(precision=precision)
+    suite.framework = framework
+
+    result = suite.run_tflops_test(
+        sizes=[64],
+        device="npu:0",
+        num_warmup=1,
+        num_iterations=1,
+        num_repeats=1,
+        plot_results=False,
+    )
+
+    assert type(suite.operator_test) is provider_type
+    assert framework.calls[0]["operator_test"] is suite.operator_test
+    assert framework.calls[0]["precision"] is expected_precision
+    assert result["rows"][0]["provider"] == provider_type.NPU_IMPLEMENTATION
+
+
 def test_linear_fp8_fresh_byte_estimate_uses_nonsquare_dimensions():
     assert estimate_linear_fp8_fresh_bytes(3, 5, 7) == 118
+
+
+def test_linear_mxfp8_fresh_byte_estimate_includes_group32_e8m0_scales():
+    import tests.test_linear as linear_curve
+
+    assert linear_curve.estimate_linear_mxfp8_fresh_bytes(3, 5, 64) == 558
 
 
 def test_linear_fp8_auto_device_selects_sm90_cuda_even_when_npu_is_available(
@@ -449,6 +619,60 @@ def test_linear_main_dispatches_fp8_precision_to_the_fp8_suite(
     assert captured["suite"].precision == "fp8"
     assert isinstance(captured["suite"].operator_test, LinearFp8OperatorTest)
     assert captured["kwargs"]["device"] == "auto"
+
+
+@pytest.mark.parametrize(
+    ("precision", "provider_type"),
+    [
+        ("fp8", LinearFp8NpuOperatorTest),
+        ("mxfp8", LinearMxFp8NpuOperatorTest),
+    ],
+)
+def test_linear_main_selects_950pr_provider_from_precision_and_npu_device(
+    monkeypatch,
+    tmp_path,
+    precision,
+    provider_type,
+):
+    import tests.test_linear as linear_curve
+
+    captured = {}
+
+    def fake_setup(self, framework):
+        self.framework = framework
+
+    def fake_run_tflops_test(self, **kwargs):
+        captured["suite"] = self
+        captured["kwargs"] = kwargs
+        return {"rows": []}
+
+    monkeypatch.setattr(LinearTestSuite, "setup", fake_setup)
+    monkeypatch.setattr(
+        LinearTestSuite,
+        "run_tflops_test",
+        fake_run_tflops_test,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_linear.py",
+            "--precision",
+            precision,
+            "--device",
+            "npu:0",
+            "--mode",
+            "tflops",
+            "--result-dir",
+            str(tmp_path),
+            "--no-plot",
+        ],
+    )
+
+    assert linear_curve.main() == 0
+    assert captured["suite"].precision == precision
+    assert type(captured["suite"].operator_test) is provider_type
+    assert captured["kwargs"]["device"] == "npu:0"
 
 
 def test_add_auto_iterations_match_effective_csv_count(
@@ -681,7 +905,7 @@ def test_groupgemm_formal_point_uses_i30_and_native_provider(
     )
 
 
-def test_groupgemm_fp8_curve_uses_formal_expert_loop_provider_and_semantics(
+def test_groupgemm_fp8_curve_uses_formal_grouped_provider_and_semantics(
     monkeypatch,
     tmp_path,
 ):
@@ -721,16 +945,156 @@ def test_groupgemm_fp8_curve_uses_formal_expert_loop_provider_and_semantics(
         10,
         30,
         3,
-        GroupGemmFp8OperatorTest.CUDA_IMPLEMENTATION,
+        "cuda_vllm_cutlass_grouped_gemm_fp8_bf16",
     )
     assert framework.calls[0]["precision"] is PrecisionType.FP8
     assert result["results"][0]["metric"] == "FP8_TFLOPS"
     assert result["results"][0]["kernel"] == (
-        "vllm_cutlass_scaled_mm_expert_loop"
+        "vllm_cutlass_moe_mm_grouped"
     )
     assert result["results"][0]["output_semantics"] == (
         "FP8(E4M3)xFP8(E4M3),per-token*per-channel-scale->BF16"
     )
+
+
+@pytest.mark.parametrize(
+    ("precision", "provider", "expected_precision", "expected_semantics"),
+    [
+        (
+            "fp8",
+            "npu_grouped_matmul_fp8_e4m3_per_token_per_channel_bf16",
+            "FP8",
+            (
+                "FP8(E4M3)xFP8(E4M3),"
+                "per-token-FP32*per-channel-FP32-scale->BF16,no_bias"
+            ),
+        ),
+        (
+            "mxfp8",
+            "npu_grouped_matmul_mxfp8_e4m3_e8m0_group32_bf16",
+            "MXFP8",
+            (
+                "MXFP8(E4M3,group32)xMXFP8(E4M3,group32),"
+                "per-group-E8M0-scale->BF16,no_bias,pure-GMM2"
+            ),
+        ),
+    ],
+)
+def test_groupgemm_950pr_curves_keep_precision_provider_and_artifacts_distinct(
+    monkeypatch,
+    tmp_path,
+    precision,
+    provider,
+    expected_precision,
+    expected_semantics,
+):
+    _install_available_npu(monkeypatch)
+    framework = _FakeFramework(tmp_path / precision)
+    suite = GroupGemmTestSuite(
+        precision=precision,
+        num_experts=2,
+        hidden_dim=64,
+        out_channel=32,
+    )
+    suite.framework = framework
+    suite.operator_test = _FakeOperator([provider])
+
+    result = suite.run_tflops_test(
+        seq_lens=[4],
+        num_experts=2,
+        hidden_dim=64,
+        out_channel=32,
+        device="npu:0",
+        num_warmup=1,
+        num_iterations=1,
+        num_repeats=1,
+        plot_results=True,
+    )
+
+    expected_stem = f"groupgemm_tflops_{precision}_npu_0_"
+    expected_plot_stem = f"groupgemm_tflops_curve_{precision}_npu_0_"
+    assert Path(result["csv_file"]).name.startswith(expected_stem)
+    assert Path(result["csv_file"]).suffix == ".csv"
+    assert Path(result["plot_file"]).name.startswith(expected_plot_stem)
+    assert Path(result["plot_file"]).suffix == ".png"
+    assert Path(result["plot_file"]).is_file()
+    assert framework.calls[0]["precision"] is getattr(
+        PrecisionType, expected_precision
+    )
+    row = result["results"][0]
+    assert row["precision"] == expected_precision
+    assert row["device"] == "npu:0"
+    assert row["implementation"] == provider
+    assert row["kernel"] == "npu_grouped_matmul"
+    assert row["output_semantics"] == expected_semantics
+    with Path(result["csv_file"]).open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        csv_row = next(csv.DictReader(handle))
+    assert csv_row["precision"] == expected_precision
+    assert csv_row["device"] == "npu:0"
+    assert csv_row["implementation"] == provider
+    assert csv_row["output_semantics"] == expected_semantics
+
+
+@pytest.mark.parametrize(
+    ("precision", "provider_type", "provider_attribute", "expected_precision"),
+    [
+        (
+            "fp8",
+            GroupGemmFp8NpuOperatorTest,
+            "NPU_FP8_IMPLEMENTATION",
+            PrecisionType.FP8,
+        ),
+        (
+            "mxfp8",
+            GroupGemmMxFp8NpuOperatorTest,
+            "NPU_MXFP8_IMPLEMENTATION",
+            PrecisionType.MXFP8,
+        ),
+    ],
+)
+def test_groupgemm_950pr_precision_selects_its_own_npu_provider(
+    monkeypatch,
+    tmp_path,
+    precision,
+    provider_type,
+    provider_attribute,
+    expected_precision,
+):
+    _install_available_npu(monkeypatch)
+    provider = getattr(provider_type, provider_attribute)
+    monkeypatch.setattr(
+        provider_type,
+        "get_formal_implementations",
+        lambda self, device: [provider],
+    )
+    framework = _FakeFramework(tmp_path)
+    suite = GroupGemmTestSuite(
+        precision=precision,
+        num_experts=2,
+        hidden_dim=64,
+        out_channel=32,
+    )
+    suite.framework = framework
+
+    result = suite.run_tflops_test(
+        seq_lens=[4],
+        num_experts=2,
+        hidden_dim=64,
+        out_channel=32,
+        device="npu:0",
+        num_warmup=1,
+        num_iterations=1,
+        num_repeats=1,
+        plot_results=False,
+    )
+
+    assert type(suite.operator_test) is provider_type
+    assert framework.calls[0]["operator_test"] is suite.operator_test
+    assert framework.calls[0]["precision"] is expected_precision
+    assert result["results"][0]["implementation"] == provider
 
 
 def test_groupgemm_fp8_auto_device_prefers_cuda_when_npu_is_available(
@@ -816,6 +1180,63 @@ def test_groupgemm_main_accepts_fp8_cli_and_builds_fp8_suite(
     assert captured["suite"].precision == "fp8"
     assert isinstance(captured["suite"].operator_test, GroupGemmFp8OperatorTest)
     assert captured["kwargs"]["device"] == "auto"
+
+
+@pytest.mark.parametrize(
+    ("precision", "provider_type"),
+    [
+        ("fp8", GroupGemmFp8NpuOperatorTest),
+        ("mxfp8", GroupGemmMxFp8NpuOperatorTest),
+    ],
+)
+def test_groupgemm_main_selects_950pr_provider_from_precision_and_npu_device(
+    monkeypatch,
+    tmp_path,
+    precision,
+    provider_type,
+):
+    import tests.test_groupgemm as groupgemm_curve
+
+    captured = {}
+
+    def fake_setup(self, framework):
+        self.framework = framework
+
+    def fake_run_tflops_test(self, **kwargs):
+        captured["suite"] = self
+        captured["kwargs"] = kwargs
+        return {"results": []}
+
+    monkeypatch.setattr(GroupGemmTestSuite, "setup", fake_setup)
+    monkeypatch.setattr(
+        GroupGemmTestSuite,
+        "run_tflops_test",
+        fake_run_tflops_test,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_groupgemm.py",
+            "--precision",
+            precision,
+            "--device",
+            "npu:0",
+            "--mode",
+            "tflops",
+            "--result-dir",
+            str(tmp_path),
+            "--no-plot",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        groupgemm_curve.main()
+
+    assert exit_info.value.code == 0
+    assert captured["suite"].precision == precision
+    assert type(captured["suite"].operator_test) is provider_type
+    assert captured["kwargs"]["device"] == "npu:0"
 
 
 def test_paged_attention_two_matrices_make_one_v2_call_per_point(

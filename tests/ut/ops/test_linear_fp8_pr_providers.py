@@ -640,17 +640,103 @@ def test_mxfp4_provider_prepares_native_packed_storage_and_exact_quant_kwargs(
     assert prepared["A"].dtype is torch.uint8
     assert prepared["B"].shape == (32, 32)
     assert prepared["B"].dtype is torch.uint8
-    assert prepared["B"].is_contiguous()
     assert prepared["scale_a"].shape == (16, 1, 2)
     assert prepared["scale_a"].dtype is torch.uint8
     assert prepared["scale_b"].shape == (1, 32, 2)
     assert prepared["scale_b"].dtype is torch.uint8
-    assert prepared["scale_b"].is_contiguous()
     assert prepared["x_dtype"] == 296
     assert prepared["scale_dtype"] == 293
     assert "input" not in prepared
     assert "weight" not in prepared
     assert "output" not in prepared
+
+
+def test_mxfp4_weight_and_scale_preserve_corresponding_transpose_views(
+    monkeypatch,
+):
+    operator = _mxfp4_operator()
+    quantized_outputs = []
+
+    def fake_dynamic_mx_quant(
+        source,
+        *,
+        dst_type,
+        block_size,
+        round_mode,
+    ):
+        del dst_type, block_size, round_mode
+        packed = torch.empty(
+            *source.shape[:-1],
+            source.shape[-1] // 2,
+            dtype=torch.uint8,
+        )
+        packed.flatten().copy_(
+            torch.arange(packed.numel(), dtype=torch.int64)
+            .remainder(251)
+            .to(torch.uint8)
+        )
+        scale = torch.empty(
+            *source.shape[:-1],
+            source.shape[-1] // 64,
+            2,
+            dtype=torch.uint8,
+        )
+        scale.flatten().copy_(
+            torch.arange(scale.numel(), dtype=torch.int64)
+            .remainder(251)
+            .to(torch.uint8)
+        )
+        quantized_outputs.append((packed, scale))
+        return packed, scale
+
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: MXFP4_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_dynamic_mx_quant_callable",
+        lambda: fake_dynamic_mx_quant,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_quant_matmul_callable",
+        lambda: lambda *args, **kwargs: None,
+    )
+
+    prepared = operator._prepare_data_for_core_operator(
+        operator.generate_test_data(
+            batch_size=16,
+            input_dim=64,
+            output_dim=32,
+            bias=False,
+        ),
+        "cpu",
+        PrecisionType.MXFP4,
+        MXFP4_IMPLEMENTATION,
+    )
+    weight_packed, weight_scale = quantized_outputs[1]
+    expected_weight_view = weight_packed.transpose(0, 1)
+    expected_scale_view = weight_scale.transpose(0, 1)
+
+    assert prepared["B"].shape == (32, 32)
+    assert prepared["B"].stride() == (1, 32)
+    assert prepared["B"]._base is weight_packed
+    assert (
+        prepared["B"].untyped_storage().data_ptr()
+        == weight_packed.untyped_storage().data_ptr()
+    )
+    torch.testing.assert_close(prepared["B"], expected_weight_view)
+
+    assert prepared["scale_b"].shape == (1, 32, 2)
+    assert prepared["scale_b"].stride() == (2, 2, 1)
+    assert prepared["scale_b"]._base is weight_scale
+    assert (
+        prepared["scale_b"].untyped_storage().data_ptr()
+        == weight_scale.untyped_storage().data_ptr()
+    )
+    torch.testing.assert_close(prepared["scale_b"], expected_scale_view)
 
 
 def test_mxfp4_timed_dispatch_is_one_native_call_and_retains_bf16_output():

@@ -125,9 +125,9 @@ class LinearMxFp4NpuOperatorTest(LinearFp8NpuBaseOperatorTest):
             "implementation": implementation,
             "op": self._quant_matmul_callable(),
             "A": activation_packed,
-            "B": weight_packed_nk.transpose(0, 1).contiguous(),
+            "B": weight_packed_nk.transpose(0, 1),
             "scale_a": activation_scale,
-            "scale_b": weight_scale_nk.transpose(0, 1).contiguous(),
+            "scale_b": weight_scale_nk.transpose(0, 1),
             "x_dtype": self.MXFP4_DTYPE_CODE,
             "scale_dtype": self.E8M0_DTYPE_CODE,
         }

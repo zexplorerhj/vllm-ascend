@@ -14,6 +14,7 @@
 
 from pathlib import Path
 import sys
+from types import ModuleType
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +29,10 @@ from flashattention.base import FlashAttentionOperatorTest  # noqa: E402
 from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest  # noqa: E402
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest  # noqa: E402
 from linear.linear_operator import LinearOperatorTest  # noqa: E402
-from operator_test_framework import OperatorTestFramework  # noqa: E402
+from operator_test_framework import (  # noqa: E402
+    OperatorTestFramework,
+    PrecisionType,
+)
 from paged_attention.base import PagedAttentionOperatorTest  # noqa: E402
 from paged_attention.cuda_impl import FlashInferPagedKVImpl  # noqa: E402
 from recurrent_gated_delta_rule.base import (  # noqa: E402
@@ -36,6 +40,11 @@ from recurrent_gated_delta_rule.base import (  # noqa: E402
 )
 from rmsnorm.rmsnorm_operator import RMSNormOperatorTest  # noqa: E402
 import rmsnorm.rmsnorm_operator as rmsnorm_module  # noqa: E402
+
+try:
+    import fp8_utils
+except ModuleNotFoundError:
+    fp8_utils = None
 
 
 @pytest.mark.parametrize(
@@ -146,6 +155,110 @@ def test_only_phase_invariant_out_providers_declare_direct_timing_contract(
         prepared,
         "default",
     ) is expected
+
+
+def _fp8_utils():
+    assert fp8_utils is not None, "FP8 utility module must be available"
+    return fp8_utils
+
+
+def test_fp8_precision_is_a_distinct_e4m3_precision():
+    assert PrecisionType.FP8.value is torch.float8_e4m3fn
+    assert len({precision.value for precision in PrecisionType}) == len(
+        PrecisionType
+    )
+
+
+def test_fp8_per_row_quantization_uses_unit_scale_for_zero_rows():
+    utils = _fp8_utils()
+    source = torch.tensor([[0.0, 0.0], [-2.0, 4.0]])
+
+    quantized, scales = utils.quantize_fp8_per_row(source)
+
+    assert quantized.dtype is torch.float8_e4m3fn
+    assert scales.dtype is torch.float32
+    assert scales.shape == (2, 1)
+    torch.testing.assert_close(
+        scales,
+        torch.tensor([[1.0], [4.0 / torch.finfo(torch.float8_e4m3fn).max]]),
+    )
+    assert torch.isfinite(scales).all()
+    torch.testing.assert_close(
+        quantized.float() * scales,
+        source,
+        rtol=0.05,
+        atol=0.02,
+    )
+
+
+def test_fp8_weight_quantization_uses_unit_scale_for_zero_channels():
+    utils = _fp8_utils()
+    weight_nk = torch.tensor([[0.0, 0.0], [-2.0, 4.0]])
+
+    quantized, scales = utils.quantize_fp8_weight_per_channel(weight_nk)
+
+    assert quantized.dtype is torch.float8_e4m3fn
+    assert scales.dtype is torch.float32
+    assert scales.shape == (2, 1)
+    torch.testing.assert_close(
+        scales,
+        torch.tensor([[1.0], [4.0 / torch.finfo(torch.float8_e4m3fn).max]]),
+    )
+    assert torch.isfinite(scales).all()
+    torch.testing.assert_close(
+        quantized.float() * scales,
+        weight_nk,
+        rtol=0.05,
+        atol=0.02,
+    )
+
+
+def test_fp8_resolvers_return_the_required_vllm_cutlass_operators(
+    monkeypatch,
+):
+    utils = _fp8_utils()
+    scaled_mm = lambda: None
+    grouped_mm = lambda: None
+    vllm_module = ModuleType("vllm")
+    custom_ops_module = ModuleType("vllm._custom_ops")
+    custom_ops_module.cutlass_moe_mm = grouped_mm
+    vllm_module._custom_ops = custom_ops_module
+
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", custom_ops_module)
+    monkeypatch.setattr(
+        torch.ops,
+        "_C",
+        SimpleNamespace(cutlass_scaled_mm=scaled_mm),
+    )
+
+    assert utils.resolve_vllm_cutlass_scaled_mm() is scaled_mm
+    assert utils.resolve_vllm_cutlass_grouped_mm() is grouped_mm
+
+
+@pytest.mark.parametrize(
+    ("resolver_name", "expected_message"),
+    [
+        ("resolve_vllm_cutlass_scaled_mm", "cutlass_scaled_mm"),
+        ("resolve_vllm_cutlass_grouped_mm", "cutlass_moe_mm"),
+    ],
+)
+def test_fp8_resolvers_explain_when_the_vllm_operator_is_missing(
+    monkeypatch,
+    resolver_name,
+    expected_message,
+):
+    utils = _fp8_utils()
+    vllm_module = ModuleType("vllm")
+    custom_ops_module = ModuleType("vllm._custom_ops")
+    vllm_module._custom_ops = custom_ops_module
+
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", custom_ops_module)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        getattr(utils, resolver_name)()
 
 
 @pytest.mark.parametrize(

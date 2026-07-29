@@ -259,9 +259,14 @@ class GroupGemmFp8OperatorTest(BaseGroupGemmOperatorTest):
             dtype=torch.int64,
             device=device,
         )
+        swap_ab = input_source.shape[0] <= 64
         problem_sizes = torch.tensor(
             [
-                [rows, out_channel, hidden_dim]
+                (
+                    [out_channel, rows, hidden_dim]
+                    if swap_ab
+                    else [rows, out_channel, hidden_dim]
+                )
                 for rows in counts
             ],
             dtype=torch.int32,
@@ -275,7 +280,7 @@ class GroupGemmFp8OperatorTest(BaseGroupGemmOperatorTest):
         )
         b_strides = torch.full(
             (len(counts),),
-            weight_fp8_ekn.stride(0),
+            weight_fp8_ekn[0].stride(1),
             dtype=torch.int64,
             device=device,
         )
@@ -324,6 +329,32 @@ class GroupGemmFp8OperatorTest(BaseGroupGemmOperatorTest):
             True,
         )
         return prepared_data["output"]
+
+    def calculate_bandwidth(
+        self,
+        data: Dict[str, Any],
+        avg_time_ms: float,
+    ) -> Optional[float]:
+        if avg_time_ms <= 0:
+            return None
+        seq_len = int(data.get("seq_len", 0))
+        num_experts = int(data.get("num_experts", 0))
+        hidden_dim = int(data.get("hidden_dim", 0))
+        out_channel = int(data.get("out_channel", 0))
+        if min(seq_len, num_experts, hidden_dim, out_channel) <= 0:
+            return None
+
+        input_bytes = seq_len * hidden_dim
+        weight_bytes = num_experts * hidden_dim * out_channel
+        output_bytes = 2 * seq_len * out_channel
+        scale_bytes = 4 * (seq_len + num_experts * out_channel)
+        total_bytes = (
+            input_bytes
+            + weight_bytes
+            + output_bytes
+            + scale_bytes
+        )
+        return total_bytes / ((avg_time_ms / 1000.0) * 1e9)
 
     def _declares_preallocated_output_contract(
         self,

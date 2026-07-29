@@ -233,13 +233,124 @@ def test_groupgemm_fp8_provider_prepares_grouped_cutlass_layout(monkeypatch):
     assert prepared["expert_offsets"].tolist() == [0, 16]
     assert prepared["problem_sizes"].dtype is torch.int32
     assert prepared["problem_sizes"].tolist() == [
-        [16, 32, 16],
-        [16, 32, 16],
+        [32, 16, 16],
+        [32, 16, 16],
     ]
     assert prepared["a_strides"].dtype is torch.int64
     assert prepared["a_strides"].tolist() == [16, 16]
-    assert prepared["b_strides"].tolist() == [512, 512]
+    assert prepared["b_strides"].tolist() == [16, 16]
     assert prepared["c_strides"].tolist() == [32, 32]
+
+
+def test_groupgemm_fp8_grouped_b_strides_use_cutlass_leading_dimension(
+    monkeypatch,
+):
+    operator = GroupGemmFp8OperatorTest(
+        num_experts=3,
+        hidden_dim=32,
+        out_channel=48,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_grouped_mm",
+        lambda: lambda *args: None,
+    )
+
+    prepared = operator._prepare_data_for_core_operator(
+        operator.generate_test_data(
+            seq_len=96,
+            num_experts=3,
+            hidden_dim=32,
+            out_channel=48,
+        ),
+        "cpu",
+        PrecisionType.FP8,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+
+    assert prepared["B"].stride(0) == 32 * 48
+    assert prepared["B"][0].stride(1) == 32
+    assert prepared["b_strides"].tolist() == [32, 32, 32]
+
+
+@pytest.mark.parametrize(
+    ("total_rows", "expected_problem_sizes"),
+    [
+        (
+            64,
+            [
+                [48, 32, 16],
+                [48, 32, 16],
+            ],
+        ),
+        (
+            128,
+            [
+                [64, 48, 16],
+                [64, 48, 16],
+            ],
+        ),
+    ],
+)
+def test_groupgemm_fp8_grouped_problem_sizes_follow_sm90_swap_ab_threshold(
+    monkeypatch,
+    total_rows,
+    expected_problem_sizes,
+):
+    operator = GroupGemmFp8OperatorTest(
+        num_experts=2,
+        hidden_dim=16,
+        out_channel=48,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_grouped_mm",
+        lambda: lambda *args: None,
+    )
+
+    prepared = operator._prepare_data_for_core_operator(
+        operator.generate_test_data(
+            seq_len=total_rows,
+            num_experts=2,
+            hidden_dim=16,
+            out_channel=48,
+        ),
+        "cpu",
+        PrecisionType.FP8,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+
+    assert prepared["problem_sizes"].tolist() == expected_problem_sizes
+
+
+def test_groupgemm_fp8_bandwidth_includes_fp32_scale_traffic():
+    operator = GroupGemmFp8OperatorTest(
+        num_experts=2,
+        hidden_dim=5,
+        out_channel=7,
+    )
+    data = operator.generate_test_data(
+        seq_len=3,
+        num_experts=2,
+        hidden_dim=5,
+        out_channel=7,
+    )
+
+    bandwidth = operator.calculate_bandwidth(data, 2.0)
+
+    # Bytes: A=3*5, B=2*5*7, BF16 C=2*3*7,
+    # FP32 scales=4*(3 + 2*7), for a hand-derived total of 195 bytes.
+    assert bandwidth == pytest.approx(195 / (0.002 * 1e9))
 
 
 def test_groupgemm_fp8_diagnostic_provider_calls_one_cached_grouped_kernel(

@@ -16,6 +16,7 @@ formal_usage() {
     cat >&2 <<'EOF'
 Usage:
   run_tests.sh --formal --operator OP --device DEVICE --output-dir DIR
+      [--precision fp8]
       [--warmup W] [--iterations I] [--repeats R]
       [--stabilization-repeats S]
       [--task-queue unset|0|1|2]
@@ -118,11 +119,16 @@ dispatch_formal_operator() {
                 --mode bandwidth || command_status=$?
             ;;
         linear)
-            for precision in fp16 bf16; do
+            if [ "$formal_precision" = "fp8" ]; then
                 run_formal_entry tflops tests/test_linear.py \
-                    --mode tflops --precision "$precision" \
-                    || command_status=$?
-            done
+                    --mode tflops --precision fp8 || command_status=$?
+            else
+                for precision in fp16 bf16; do
+                    run_formal_entry tflops tests/test_linear.py \
+                        --mode tflops --precision "$precision" \
+                        || command_status=$?
+                done
+            fi
             ;;
         rmsnorm)
             run_formal_entry general tests/test_rmsnorm.py \
@@ -136,11 +142,16 @@ dispatch_formal_operator() {
             done
             ;;
         groupgemm)
-            for precision in bf16 int8; do
+            if [ "$formal_precision" = "fp8" ]; then
                 run_formal_entry tflops tests/test_groupgemm.py \
-                    --mode tflops --precision "$precision" \
-                    || command_status=$?
-            done
+                    --mode tflops --precision fp8 || command_status=$?
+            else
+                for precision in bf16 int8; do
+                    run_formal_entry tflops tests/test_groupgemm.py \
+                        --mode tflops --precision "$precision" \
+                        || command_status=$?
+                done
+            fi
             ;;
         paged_attention)
             run_formal_entry general tests/test_paged_attention.py \
@@ -164,6 +175,7 @@ if [ "$#" -gt 0 ]; then
     formal_operator=""
     formal_device=""
     formal_output_dir=""
+    formal_precision=""
     formal_warmup=""
     formal_iterations=""
     formal_repeats=5
@@ -176,12 +188,13 @@ if [ "$#" -gt 0 ]; then
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --operator|--device|--output-dir|--warmup|--iterations|--repeats|--stabilization-repeats|--task-queue|--shard-index|--num-shards)
+            --operator|--device|--output-dir|--precision|--warmup|--iterations|--repeats|--stabilization-repeats|--task-queue|--shard-index|--num-shards)
                 [ "$#" -ge 2 ] || formal_error "$1 缺少值"
                 case "$1" in
                     --operator) formal_operator=$2 ;;
                     --device) formal_device=$2 ;;
                     --output-dir) formal_output_dir=$2 ;;
+                    --precision) formal_precision=$2 ;;
                     --warmup) formal_warmup=$2 ;;
                     --iterations) formal_iterations=$2 ;;
                     --repeats) formal_repeats=$2 ;;
@@ -215,11 +228,25 @@ if [ "$#" -gt 0 ]; then
         add|linear|rmsnorm|flashattention|groupgemm|paged_attention|recurrent|all) ;;
         *) formal_error "不支持的 operator: $formal_operator" ;;
     esac
+    case "$formal_precision" in
+        ''|fp8) ;;
+        *) formal_error "--precision 仅支持 fp8" ;;
+    esac
     [ -n "$formal_device" ] || formal_error "必须指定 --device"
     case "$formal_device" in
         auto|cuda|npu|cuda:[0-9]*|npu:[0-9]*) ;;
         *) formal_error "不支持的 device: $formal_device" ;;
     esac
+    if [ "$formal_precision" = "fp8" ]; then
+        case "$formal_operator" in
+            linear|groupgemm|all) ;;
+            *) formal_error "FP8 formal 仅支持 linear、groupgemm 或 all" ;;
+        esac
+        case "$formal_device" in
+            cuda|cuda:[0-9]*) ;;
+            *) formal_error "FP8 formal 仅支持 CUDA SM90/H20" ;;
+        esac
+    fi
     [ -n "$formal_output_dir" ] || formal_error "必须指定 --output-dir"
     case "$formal_output_dir" in
         /*) ;;
@@ -282,9 +309,15 @@ if [ "$#" -gt 0 ]; then
 
     formal_status=0
     if [ "$formal_operator" = "all" ]; then
-        for formal_family in \
-            add linear rmsnorm flashattention groupgemm \
-            paged_attention recurrent; do
+        if [ "$formal_precision" = "fp8" ]; then
+            formal_families=(linear groupgemm)
+        else
+            formal_families=(
+                add linear rmsnorm flashattention groupgemm
+                paged_attention recurrent
+            )
+        fi
+        for formal_family in "${formal_families[@]}"; do
             dispatch_formal_operator "$formal_family" || formal_status=1
         done
     else

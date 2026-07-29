@@ -180,3 +180,25 @@ equivalent.
 `--quick` only selects the first shape of each canonical sub-curve.  It does
 not change warmup, iteration, or repeat counts, and its rows can never claim
 full formal coverage.
+
+### H20 FP8 formal curves
+
+FP8 curves are an explicit CUDA-only opt-in for H20/SM90; they are never part
+of the default NPU or `all` formal matrix.  Select them with:
+
+```bash
+./run_tests.sh --formal --operator all --precision fp8 --device cuda:0 \
+    --output-dir h20-fp8-results
+```
+
+This dispatches exactly the FP8 Linear and FP8 GroupGemm entries.  Both use
+W8A8 E4M3: activations have one FP32 dequantization scale per token
+(`[M, 1]`), and weights have one FP32 scale per output channel (`[1, N]` for
+Linear and `[E, N]` for GroupGemm).  Outputs are BF16 and bias is disabled.
+
+Each fresh payload performs quantization and builds CUTLASS metadata before
+the Event-timed region.  The timed providers only invoke the low-level
+caller-owned-output CUTLASS operation, and the framework audits strict output
+aliasing and storage independence.  The H20 formal GroupGemm provider is the
+`cuda_vllm_cutlass_scaled_mm_fp8_bf16_expert_loop`; the grouped CUTLASS
+provider is diagnostic-only and is not mixed into formal curves.

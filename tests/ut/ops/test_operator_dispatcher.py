@@ -120,6 +120,49 @@ def test_formal_all_quick_dispatches_every_precision_without_shapes(tmp_path):
             )
 
 
+def test_formal_fp8_opt_in_dispatches_only_h20_linear_and_groupgemm(
+    tmp_path,
+):
+    commands = _dry_run(
+        "--operator",
+        "all",
+        "--precision",
+        "fp8",
+        "--device",
+        "cuda:0",
+        "--output-dir",
+        str(tmp_path / "h20-fp8"),
+    )
+
+    assert len(commands) == 2
+    assert [Path(command[1]).name for command in commands] == [
+        "test_linear.py",
+        "test_groupgemm.py",
+    ]
+    assert [command[command.index("--precision") + 1] for command in commands] == [
+        "fp8",
+        "fp8",
+    ]
+
+
+def test_formal_default_npu_matrix_does_not_include_fp8(tmp_path):
+    commands = _dry_run(
+        "--operator",
+        "all",
+        "--device",
+        "npu:0",
+        "--output-dir",
+        str(tmp_path / "npu-default"),
+    )
+
+    assert len(commands) == 10
+    assert all(
+        command[command.index("--precision") + 1] != "fp8"
+        for command in commands
+        if "--precision" in command
+    )
+
+
 def test_formal_quick_forwards_explicit_protocol_and_shard(tmp_path):
     output_dir = tmp_path / "group"
     commands = _dry_run(

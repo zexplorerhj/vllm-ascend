@@ -128,12 +128,12 @@ class _BaseGroupGemmFp8NpuOperatorTest(BaseGroupGemmOperatorTest):
 
     def get_precision_config(self) -> Dict[str, Any]:
         return {
-            "input_dtype": torch.float8_e4m3fn,
-            "weight_dtype": torch.float8_e4m3fn,
+            "input_dtype": self._quantized_storage_dtype(),
+            "weight_dtype": self._quantized_storage_dtype(),
             "scale_dtype": self._scale_storage_dtype(),
             "output_dtype": torch.bfloat16,
-            "input_dtype_size": 1,
-            "weight_dtype_size": 1,
+            "input_dtype_size": self._quantized_element_size(),
+            "weight_dtype_size": self._quantized_element_size(),
             "output_dtype_size": 2,
         }
 
@@ -205,8 +205,8 @@ class _BaseGroupGemmFp8NpuOperatorTest(BaseGroupGemmOperatorTest):
         *,
         activation: torch.Tensor,
         weight_enk: torch.Tensor,
-        expected_activation_shape: Tuple[int, int],
-        expected_weight_shape: Tuple[int, int, int],
+        expected_activation_shape: Tuple[int, ...],
+        expected_weight_shape: Tuple[int, ...],
     ) -> None:
         if tuple(activation.shape) != expected_activation_shape:
             raise RuntimeError(
@@ -219,14 +219,41 @@ class _BaseGroupGemmFp8NpuOperatorTest(BaseGroupGemmOperatorTest):
                 f"{self.QUANTIZATION_API} returned weight shape "
                 f"{tuple(weight_enk.shape)}, expected {expected_weight_shape}"
             )
+        expected_dtype = self._quantized_storage_dtype()
         if (
-            activation.dtype != torch.float8_e4m3fn
-            or weight_enk.dtype != torch.float8_e4m3fn
+            activation.dtype != expected_dtype
+            or weight_enk.dtype != expected_dtype
         ):
             raise RuntimeError(
-                f"{self.QUANTIZATION_API} must return E4M3 activation and "
-                f"weight, got {activation.dtype}/{weight_enk.dtype}"
+                f"{self.QUANTIZATION_API} must return "
+                f"{expected_dtype} activation and weight storage, got "
+                f"{activation.dtype}/{weight_enk.dtype}"
             )
+
+    def _quantization_kwargs(self) -> Dict[str, Any]:
+        return {"dst_type": torch.float8_e4m3fn}
+
+    def _expected_quantized_shapes(
+        self,
+        *,
+        seq_len: int,
+        num_experts: int,
+        hidden_dim: int,
+        out_channel: int,
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        return (
+            (seq_len, hidden_dim),
+            (num_experts, out_channel, hidden_dim),
+        )
+
+    def _quantized_storage_dtype(self) -> torch.dtype:
+        return torch.float8_e4m3fn
+
+    def _quantized_element_size(self) -> float:
+        return 1
+
+    def _materialize_weight(self, weight_enk: torch.Tensor) -> torch.Tensor:
+        return weight_enk.transpose(1, 2).contiguous()
 
     def _normalize_scales(
         self,
@@ -271,8 +298,8 @@ class _BaseGroupGemmFp8NpuOperatorTest(BaseGroupGemmOperatorTest):
             )
         if self.use_nz_format:
             raise ValueError(
-                f"{self.PROVIDER_LABEL} requires ND E4M3 weight layout; "
-                "NZ format is unsupported"
+                f"{self.PROVIDER_LABEL} requires the native ND quantized "
+                "weight layout; NZ format is unsupported"
             )
 
         counts = self._group_counts(data)
@@ -297,23 +324,28 @@ class _BaseGroupGemmFp8NpuOperatorTest(BaseGroupGemmOperatorTest):
         # Dynamic quantization reduces the final K dimension. Convert the
         # framework's [E,K,N] source to [E,N,K] before one batched call.
         weight_source_enk = weight_source_ekn.transpose(1, 2).contiguous()
+        quantization_kwargs = self._quantization_kwargs()
         activation, activation_scale = quantize(
             input_source,
-            dst_type=torch.float8_e4m3fn,
+            **quantization_kwargs,
         )
         weight_enk, weight_scale_en = quantize(
             weight_source_enk,
-            dst_type=torch.float8_e4m3fn,
+            **quantization_kwargs,
+        )
+        expected_activation_shape, expected_weight_shape = (
+            self._expected_quantized_shapes(
+                seq_len=seq_len,
+                num_experts=num_experts,
+                hidden_dim=hidden_dim,
+                out_channel=out_channel,
+            )
         )
         self._validate_quantized_values(
             activation=activation,
             weight_enk=weight_enk,
-            expected_activation_shape=(seq_len, hidden_dim),
-            expected_weight_shape=(
-                num_experts,
-                out_channel,
-                hidden_dim,
-            ),
+            expected_activation_shape=expected_activation_shape,
+            expected_weight_shape=expected_weight_shape,
         )
         activation_scale, weight_scale = self._normalize_scales(
             activation_scale=activation_scale,
@@ -323,7 +355,7 @@ class _BaseGroupGemmFp8NpuOperatorTest(BaseGroupGemmOperatorTest):
             hidden_dim=hidden_dim,
             out_channel=out_channel,
         )
-        weight = weight_enk.transpose(1, 2).contiguous()
+        weight = self._materialize_weight(weight_enk)
         group_list = self._copy_to_device(
             data["group_list"],
             device=device,
@@ -382,8 +414,11 @@ class _BaseGroupGemmFp8NpuOperatorTest(BaseGroupGemmOperatorTest):
         if min(seq_len, num_experts, hidden_dim, out_channel) <= 0:
             return None
 
-        input_bytes = seq_len * hidden_dim
-        weight_bytes = num_experts * hidden_dim * out_channel
+        element_size = self._quantized_element_size()
+        input_bytes = seq_len * hidden_dim * element_size
+        weight_bytes = (
+            num_experts * hidden_dim * out_channel * element_size
+        )
         output_bytes = 2 * seq_len * out_channel
         scale_bytes = self._scale_payload_bytes(
             seq_len=seq_len,

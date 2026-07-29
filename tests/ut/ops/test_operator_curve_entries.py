@@ -71,6 +71,9 @@ from groupgemm.groupgemm_fp8_npu import (  # noqa: E402
 from groupgemm.groupgemm_mxfp8_npu import (  # noqa: E402
     GroupGemmMxFp8NpuOperatorTest,
 )
+from groupgemm.groupgemm_mxfp4_npu import (  # noqa: E402
+    GroupGemmMxFp4NpuOperatorTest,
+)
 
 
 PROVENANCE = {
@@ -180,6 +183,9 @@ class _FakeOperator:
     )
     NPU_MXFP8_IMPLEMENTATION = (
         "npu_grouped_matmul_mxfp8_e4m3_e8m0_group32_bf16"
+    )
+    NPU_MXFP4_IMPLEMENTATION = (
+        "npu_grouped_matmul_mxfp4_e2m1_e8m0_group32_bf16"
     )
 
     def __init__(self, providers):
@@ -1295,6 +1301,15 @@ def test_groupgemm_fp8_curve_uses_formal_expert_loop_provider_and_semantics(
                 "per-group-E8M0-scale->BF16,no_bias,pure-GMM2"
             ),
         ),
+        (
+            "mxfp4",
+            "npu_grouped_matmul_mxfp4_e2m1_e8m0_group32_bf16",
+            "MXFP4",
+            (
+                "MXFP4(E2M1,group32)xMXFP4(E2M1,group32),"
+                "per-group-E8M0-scale->BF16,no_bias,pure-GMM2"
+            ),
+        ),
     ],
 )
 def test_groupgemm_950pr_curves_keep_precision_provider_and_artifacts_distinct(
@@ -1369,6 +1384,12 @@ def test_groupgemm_950pr_curves_keep_precision_provider_and_artifacts_distinct(
             GroupGemmMxFp8NpuOperatorTest,
             "NPU_MXFP8_IMPLEMENTATION",
             PrecisionType.MXFP8,
+        ),
+        (
+            "mxfp4",
+            GroupGemmMxFp4NpuOperatorTest,
+            "NPU_MXFP4_IMPLEMENTATION",
+            PrecisionType.MXFP4,
         ),
     ],
 )
@@ -1504,6 +1525,7 @@ def test_groupgemm_main_accepts_fp8_cli_and_builds_fp8_suite(
     [
         ("fp8", GroupGemmFp8NpuOperatorTest),
         ("mxfp8", GroupGemmMxFp8NpuOperatorTest),
+        ("mxfp4", GroupGemmMxFp4NpuOperatorTest),
     ],
 )
 def test_groupgemm_main_selects_950pr_provider_from_precision_and_npu_device(

@@ -28,6 +28,9 @@ from add.add_operator import AddOperatorTest  # noqa: E402
 from flashattention.base import FlashAttentionOperatorTest  # noqa: E402
 from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest  # noqa: E402
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest  # noqa: E402
+from groupgemm.groupgemm_mxfp4_npu import (  # noqa: E402
+    GroupGemmMxFp4NpuOperatorTest,
+)
 from linear.linear_operator import LinearOperatorTest  # noqa: E402
 from linear.linear_mxfp4_npu_operator import (  # noqa: E402
     LinearMxFp4NpuOperatorTest,
@@ -128,6 +131,15 @@ except ModuleNotFoundError:
         (
             GroupGemmBF16OperatorTest,
             {"_implementation": "npu_grouped_matmul"},
+            False,
+        ),
+        (
+            GroupGemmMxFp4NpuOperatorTest,
+            {
+                "_implementation": (
+                    GroupGemmMxFp4NpuOperatorTest.NPU_MXFP4_IMPLEMENTATION
+                )
+            },
             False,
         ),
         (

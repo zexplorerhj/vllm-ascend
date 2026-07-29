@@ -22,17 +22,21 @@ from groupgemm.groupgemm_fp8_npu import GroupGemmFp8NpuOperatorTest
 from groupgemm.groupgemm_mxfp8_npu import (
     GroupGemmMxFp8NpuOperatorTest,
 )
+from groupgemm.groupgemm_mxfp4_npu import (
+    GroupGemmMxFp4NpuOperatorTest,
+)
 
 GROUPGEMM_PRECISION_TYPES = {
     "int8": PrecisionType.INT8,
     "bf16": PrecisionType.BF16,
     "fp8": PrecisionType.FP8,
     "mxfp8": PrecisionType.MXFP8,
+    "mxfp4": PrecisionType.MXFP4,
 }
 
 
 class GroupGemmTestSuite(BaseTestSuite):
-    """GroupGemm算子测试套件 - 支持INT8、BF16、FP8和MXFP8精度"""
+    """GroupGemm算子测试套件 - 支持INT8、BF16、FP8、MXFP8和MXFP4精度"""
     
     def __init__(
         self,
@@ -47,7 +51,8 @@ class GroupGemmTestSuite(BaseTestSuite):
         初始化GroupGemm测试套件
         
         Args:
-            precision: 精度类型，"int8"、"bf16"、"fp8" 或 "mxfp8"
+            precision: 精度类型，"int8"、"bf16"、"fp8"、"mxfp8" 或
+                "mxfp4"
             num_experts: 专家数量
             hidden_dim: 隐藏维度
             out_channel: 输出通道数
@@ -63,6 +68,8 @@ class GroupGemmTestSuite(BaseTestSuite):
             precision_name = "GroupGemm_FP8"
         elif precision == "mxfp8":
             precision_name = "GroupGemm_MXFP8"
+        elif precision == "mxfp4":
+            precision_name = "GroupGemm_MXFP4"
         else:
             precision_name = f"GroupGemm{format_suffix}"
         super().__init__(precision_name)
@@ -81,6 +88,8 @@ class GroupGemmTestSuite(BaseTestSuite):
             return GroupGemmFp8OperatorTest
         if self.precision == "mxfp8":
             return GroupGemmMxFp8NpuOperatorTest
+        if self.precision == "mxfp4":
+            return GroupGemmMxFp4NpuOperatorTest
         if self.precision == "bf16":
             return GroupGemmBF16OperatorTest
         return GroupGemmOperatorTest
@@ -101,6 +110,7 @@ class GroupGemmTestSuite(BaseTestSuite):
             GroupGemmFp8OperatorTest,
             GroupGemmFp8NpuOperatorTest,
             GroupGemmMxFp8NpuOperatorTest,
+            GroupGemmMxFp4NpuOperatorTest,
         )
         if not isinstance(self.operator_test, managed_types):
             return
@@ -231,17 +241,22 @@ class GroupGemmTestSuite(BaseTestSuite):
                 device = "cuda:0"
             elif npu_available:
                 device = "npu:0"
-            elif self.precision == "mxfp8":
+            elif self.precision in {"mxfp8", "mxfp4"}:
                 raise RuntimeError(
-                    "MXFP8 GroupGemm TFLOPS 测试需要 NPU Ascend 950PR"
+                    f"{self.precision.upper()} GroupGemm TFLOPS 测试"
+                    "需要 NPU Ascend 950PR"
                 )
             elif torch.cuda.is_available():
                 device = "cuda:0"
             else:
                 raise RuntimeError("GroupGemm TFLOPS 测试需要 NPU 或 CUDA GPU")
-        elif self.precision == "mxfp8" and device.startswith("cuda"):
+        elif (
+            self.precision in {"mxfp8", "mxfp4"}
+            and device.startswith("cuda")
+        ):
             raise RuntimeError(
-                "MXFP8 GroupGemm TFLOPS 测试需要 NPU Ascend 950PR"
+                f"{self.precision.upper()} GroupGemm TFLOPS 测试"
+                "需要 NPU Ascend 950PR"
             )
         elif device.startswith("npu") and not npu_available:
             raise RuntimeError(f"请求了 {device}，但 NPU 不可用")
@@ -297,6 +312,7 @@ class GroupGemmTestSuite(BaseTestSuite):
             "bf16": "BF16_TFLOPS",
             "fp8": "FP8_TFLOPS",
             "mxfp8": "MXFP8_TFLOPS",
+            "mxfp4": "MXFP4_TFLOPS",
         }[self.precision]
 
         # 确定精度类型
@@ -417,6 +433,20 @@ class GroupGemmTestSuite(BaseTestSuite):
                     kernel = "npu_grouped_matmul"
                     output_semantics = (
                         "MXFP8(E4M3,group32)xMXFP8(E4M3,group32),"
+                        "per-group-E8M0-scale->BF16,no_bias,pure-GMM2"
+                    )
+                elif (
+                    self.precision == "mxfp4"
+                    and implementation
+                    == getattr(
+                        self.operator_test,
+                        "NPU_MXFP4_IMPLEMENTATION",
+                        None,
+                    )
+                ):
+                    kernel = "npu_grouped_matmul"
+                    output_semantics = (
+                        "MXFP4(E2M1,group32)xMXFP4(E2M1,group32),"
                         "per-group-E8M0-scale->BF16,no_bias,pure-GMM2"
                     )
                 else:
@@ -541,6 +571,10 @@ class GroupGemmTestSuite(BaseTestSuite):
             "mxfp8": (
                 "x=E4M3, weight=E4M3, group32 scales=E8M0, output=BF16"
             ),
+            "mxfp4": (
+                "x=E2M1x2, weight=E2M1x2, group32 scales=E8M0, "
+                "output=BF16"
+            ),
         }
         
         print(f"GroupGemm {precision_display} 特有配置:")
@@ -569,7 +603,7 @@ def main():
     parser = argparse.ArgumentParser(description='GroupGemm 算子 Profile 测试')
     parser.add_argument(
         '--precision',
-        choices=['int8', 'bf16', 'fp8', 'mxfp8'],
+        choices=['int8', 'bf16', 'fp8', 'mxfp8', 'mxfp4'],
         default='int8',
         help='精度类型',
     )
@@ -632,6 +666,11 @@ def main():
     elif args.precision == 'mxfp8':
         print(
             "🔧 使用 MXFP8 E4M3/E8M0 group32 精度测试 "
+            "(NPU Ascend 950PR npu_grouped_matmul pure-GMM2，输出 BF16)"
+        )
+    elif args.precision == 'mxfp4':
+        print(
+            "🔧 使用 MXFP4 E2M1/E8M0 group32 精度测试 "
             "(NPU Ascend 950PR npu_grouped_matmul pure-GMM2，输出 BF16)"
         )
     elif args.precision == 'bf16':

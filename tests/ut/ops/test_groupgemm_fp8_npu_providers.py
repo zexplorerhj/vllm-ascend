@@ -15,16 +15,23 @@ from groupgemm.groupgemm_fp8_npu import (  # noqa: E402
 from groupgemm.groupgemm_mxfp8_npu import (  # noqa: E402
     GroupGemmMxFp8NpuOperatorTest,
 )
+from groupgemm.groupgemm_mxfp4_npu import (  # noqa: E402
+    GroupGemmMxFp4NpuOperatorTest,
+)
 import groupgemm.groupgemm_fp8_npu as fp8_npu_module  # noqa: E402
 import groupgemm.groupgemm_mxfp8_npu as mxfp8_npu_module  # noqa: E402
+import groupgemm.groupgemm_mxfp4_npu as mxfp4_npu_module  # noqa: E402
 
 
 class FakeNpuRuntime:
-    float8_e8m0fnu = "fake-e8m0"
+    float4_e2m1fn_x2 = 296
+    float8_e8m0fnu = 293
 
     def __init__(self):
         self.dynamic_quant_inputs = []
         self.dynamic_mx_quant_inputs = []
+        self.dynamic_mx_quant_calls = []
+        self.dynamic_mx_quant_outputs = []
         self.grouped_matmul_calls = []
 
     def npu_dynamic_quant(self, source, *, dst_type):
@@ -32,14 +39,45 @@ class FakeNpuRuntime:
         scale = torch.ones(source.shape[:-1], dtype=torch.float32)
         return source.to(dst_type), scale
 
-    def npu_dynamic_mx_quant(self, source, *, dst_type):
+    def npu_dynamic_mx_quant(
+        self,
+        source,
+        *,
+        dst_type,
+        block_size=None,
+        round_mode=None,
+    ):
         self.dynamic_mx_quant_inputs.append(source)
+        self.dynamic_mx_quant_calls.append(
+            {
+                "source": source,
+                "dst_type": dst_type,
+                "block_size": block_size,
+                "round_mode": round_mode,
+            }
+        )
         scale_shape = (*source.shape[:-1], source.shape[-1] // 64, 2)
-        scale = torch.arange(
-            int(torch.tensor(scale_shape).prod()),
-            dtype=torch.uint8,
-        ).reshape(scale_shape)
-        return source.to(dst_type), scale
+        scale = torch.empty(scale_shape, dtype=torch.uint8)
+        scale.flatten().copy_(
+            torch.arange(scale.numel(), dtype=torch.int64)
+            .remainder(251)
+            .to(torch.uint8)
+        )
+        if dst_type == self.float4_e2m1fn_x2:
+            quantized = torch.empty(
+                *source.shape[:-1],
+                source.shape[-1] // 2,
+                dtype=torch.uint8,
+            )
+            quantized.flatten().copy_(
+                torch.arange(quantized.numel(), dtype=torch.int64)
+                .remainder(251)
+                .to(torch.uint8)
+            )
+        else:
+            quantized = source.to(dst_type)
+        self.dynamic_mx_quant_outputs.append((quantized, scale))
+        return quantized, scale
 
     def npu_grouped_matmul(self, **kwargs):
         self.grouped_matmul_calls.append(kwargs)
@@ -195,6 +233,98 @@ def test_mxfp8_provider_uses_e8m0_group32_layout_and_pure_gmm2(
     assert not hasattr(runtime, "npu_grouped_matmul_swiglu_quant_v2")
 
 
+def test_mxfp4_provider_preserves_native_packed_views_and_calls_one_gmm(
+    monkeypatch,
+):
+    runtime = FakeNpuRuntime()
+    operator = GroupGemmMxFp4NpuOperatorTest(
+        num_experts=2,
+        hidden_dim=64,
+        out_channel=32,
+    )
+    _patch_runtime(monkeypatch, mxfp4_npu_module, operator, runtime)
+    data = operator.generate_test_data(
+        seq_len=4,
+        num_experts=2,
+        hidden_dim=64,
+        out_channel=32,
+    )
+
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "npu:0",
+        PrecisionType.MXFP4,
+        operator.NPU_MXFP4_IMPLEMENTATION,
+    )
+    output = operator._execute_core_operator(
+        prepared,
+        operator.NPU_MXFP4_IMPLEMENTATION,
+    )
+
+    assert [
+        (
+            tuple(call["source"].shape),
+            call["source"].dtype,
+            call["source"].is_contiguous(),
+            call["dst_type"],
+            call["block_size"],
+            call["round_mode"],
+        )
+        for call in runtime.dynamic_mx_quant_calls
+    ] == [
+        ((4, 64), torch.bfloat16, True, 296, 32, "round"),
+        ((2, 32, 64), torch.bfloat16, True, 296, 32, "round"),
+    ]
+    assert prepared["x"].shape == (4, 32)
+    assert prepared["x"].dtype is torch.uint8
+    assert prepared["x"].stride() == (32, 1)
+    assert prepared["per_token_scale"].shape == (4, 1, 2)
+    assert prepared["per_token_scale"].dtype is torch.uint8
+
+    weight_packed_enk, weight_scale_enk = (
+        runtime.dynamic_mx_quant_outputs[1]
+    )
+    assert prepared["weight"].shape == (2, 32, 32)
+    assert prepared["weight"].dtype is torch.uint8
+    assert prepared["weight"].stride() == (1024, 1, 32)
+    assert prepared["weight"]._base is weight_packed_enk
+    assert prepared["weight"].untyped_storage().data_ptr() == (
+        weight_packed_enk.untyped_storage().data_ptr()
+    )
+    assert prepared["weight_scale"].shape == (2, 1, 32, 2)
+    assert prepared["weight_scale"].dtype is torch.uint8
+    assert prepared["weight_scale"].stride() == (64, 2, 2, 1)
+    assert prepared["weight_scale"]._base is weight_scale_enk
+    assert prepared["weight_scale"].untyped_storage().data_ptr() == (
+        weight_scale_enk.untyped_storage().data_ptr()
+    )
+    assert prepared["group_list"].tolist() == [2, 2]
+    assert output.shape == (4, 32)
+    assert output.dtype is torch.bfloat16
+
+    assert len(runtime.grouped_matmul_calls) == 1
+    call = runtime.grouped_matmul_calls[0]
+    assert call == {
+        "x": [prepared["x"]],
+        "weight": [prepared["weight"]],
+        "scale": [prepared["weight_scale"]],
+        "bias": None,
+        "per_token_scale": [prepared["per_token_scale"]],
+        "split_item": 2,
+        "group_list_type": 1,
+        "group_type": 0,
+        "group_list": prepared["group_list"],
+        "output_dtype": torch.bfloat16,
+        "x_dtype": 296,
+        "weight_dtype": 296,
+        "scale_dtype": 293,
+        "per_token_scale_dtype": 293,
+    }
+    assert len(call["x"]) == len(call["weight"]) == 1
+    assert "group_sizes" not in call
+    assert not hasattr(runtime, "npu_grouped_matmul_swiglu_quant_v2")
+
+
 @pytest.mark.parametrize(
     ("provider_class", "module", "implementation"),
     [
@@ -211,6 +341,14 @@ def test_mxfp8_provider_uses_e8m0_group32_layout_and_pure_gmm2(
             mxfp8_npu_module,
             (
                 "npu_grouped_matmul_mxfp8_e4m3_"
+                "e8m0_group32_bf16"
+            ),
+        ),
+        (
+            GroupGemmMxFp4NpuOperatorTest,
+            mxfp4_npu_module,
+            (
+                "npu_grouped_matmul_mxfp4_e2m1_"
                 "e8m0_group32_bf16"
             ),
         ),
@@ -262,21 +400,84 @@ def test_npu_fp8_provider_rejects_nonprefix_950pr_device_name(monkeypatch):
     assert operator.get_formal_implementations("npu:0") == []
 
 
-def test_plain_and_mxfp8_providers_advertise_distinct_precision_tokens():
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        type(
+            "MissingDynamicMxQuant",
+            (),
+            {
+                "float4_e2m1fn_x2": 296,
+                "float8_e8m0fnu": 293,
+                "npu_grouped_matmul": lambda *args, **kwargs: None,
+            },
+        )(),
+        type(
+            "MissingGroupedMatmul",
+            (),
+            {
+                "float4_e2m1fn_x2": 296,
+                "float8_e8m0fnu": 293,
+                "npu_dynamic_mx_quant": lambda *args, **kwargs: None,
+            },
+        )(),
+        type(
+            "MissingMxFp4Dtype",
+            (),
+            {
+                "float8_e8m0fnu": 293,
+                "npu_dynamic_mx_quant": lambda *args, **kwargs: None,
+                "npu_grouped_matmul": lambda *args, **kwargs: None,
+            },
+        )(),
+        type(
+            "MissingE8M0Dtype",
+            (),
+            {
+                "float4_e2m1fn_x2": 296,
+                "npu_dynamic_mx_quant": lambda *args, **kwargs: None,
+                "npu_grouped_matmul": lambda *args, **kwargs: None,
+            },
+        )(),
+    ],
+)
+def test_mxfp4_provider_gate_requires_native_symbols_and_dtype_codes(
+    monkeypatch,
+    runtime,
+):
+    operator = GroupGemmMxFp4NpuOperatorTest()
+    monkeypatch.setattr(mxfp4_npu_module, "torch_npu", runtime)
+    monkeypatch.setattr(
+        operator,
+        "_npu_device_name",
+        lambda device: "Ascend950PR_957b",
+    )
+
+    assert operator.get_formal_implementations("npu:0") == []
+
+
+def test_fp8_mxfp8_and_mxfp4_advertise_distinct_precision_tokens():
     plain = GroupGemmFp8NpuOperatorTest()
-    mx = GroupGemmMxFp8NpuOperatorTest()
+    mxfp8 = GroupGemmMxFp8NpuOperatorTest()
+    mxfp4 = GroupGemmMxFp4NpuOperatorTest()
 
     assert plain.supported_precisions == [PrecisionType.FP8]
-    assert mx.supported_precisions == [PrecisionType.MXFP8]
+    assert mxfp8.supported_precisions == [PrecisionType.MXFP8]
+    assert mxfp4.supported_precisions == [PrecisionType.MXFP4]
 
 
-def test_fp8_and_mxfp8_bandwidth_account_for_their_scale_layouts():
+def test_quantized_groupgemm_bandwidth_accounts_for_packed_mxfp4_data():
     plain = GroupGemmFp8NpuOperatorTest(
         num_experts=2,
         hidden_dim=64,
         out_channel=32,
     )
     mx = GroupGemmMxFp8NpuOperatorTest(
+        num_experts=2,
+        hidden_dim=64,
+        out_channel=32,
+    )
+    mxfp4 = GroupGemmMxFp4NpuOperatorTest(
         num_experts=2,
         hidden_dim=64,
         out_channel=32,
@@ -293,4 +494,7 @@ def test_fp8_and_mxfp8_bandwidth_account_for_their_scale_layouts():
     )
     assert mx.calculate_bandwidth(data, 1.0) == pytest.approx(
         4744 / 1e6
+    )
+    assert mxfp4.calculate_bandwidth(data, 1.0) == pytest.approx(
+        2568 / 1e6
     )

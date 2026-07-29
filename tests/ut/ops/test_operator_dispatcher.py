@@ -191,7 +191,7 @@ def test_formal_mxfp8_opt_in_dispatches_950pr_linear_and_groupgemm(
     ] == ["mxfp8", "mxfp8"]
 
 
-def test_formal_mxfp4_opt_in_dispatches_only_950pr_linear(tmp_path):
+def test_formal_mxfp4_opt_in_dispatches_950pr_linear_and_groupgemm(tmp_path):
     commands = _dry_run(
         "--operator",
         "all",
@@ -203,9 +203,13 @@ def test_formal_mxfp4_opt_in_dispatches_only_950pr_linear(tmp_path):
         str(tmp_path / "950pr-mxfp4"),
     )
 
-    assert len(commands) == 1
-    assert Path(commands[0][1]).name == "test_linear.py"
-    assert commands[0][commands[0].index("--precision") + 1] == "mxfp4"
+    assert [Path(command[1]).name for command in commands] == [
+        "test_linear.py",
+        "test_groupgemm.py",
+    ]
+    assert [
+        command[command.index("--precision") + 1] for command in commands
+    ] == ["mxfp4", "mxfp4"]
 
 
 @pytest.mark.parametrize(
@@ -297,31 +301,21 @@ def test_formal_default_npu_matrix_does_not_include_opt_in_fp8(tmp_path):
     )
 
 
-def test_formal_mxfp4_rejects_groupgemm_without_dispatch(tmp_path):
-    completed = subprocess.run(
-        [
-            "bash",
-            str(DISPATCHER),
-            "--formal",
-            "--operator",
-            "groupgemm",
-            "--precision",
-            "mxfp4",
-            "--device",
-            "npu:0",
-            "--output-dir",
-            str(tmp_path / "invalid-mxfp4-groupgemm"),
-            "--dry-run",
-        ],
-        cwd=OPS_ROOT,
-        capture_output=True,
-        text=True,
+def test_formal_mxfp4_groupgemm_dispatches_its_own_entry(tmp_path):
+    commands = _dry_run(
+        "--operator",
+        "groupgemm",
+        "--precision",
+        "mxfp4",
+        "--device",
+        "npu:0",
+        "--output-dir",
+        str(tmp_path / "mxfp4-groupgemm"),
     )
 
-    assert completed.returncode != 0
-    assert "mxfp4" in completed.stderr.lower()
-    assert "linear" in completed.stderr.lower()
-    assert "DRY-RUN:" not in completed.stdout
+    assert len(commands) == 1
+    assert Path(commands[0][1]).name == "test_groupgemm.py"
+    assert commands[0][commands[0].index("--precision") + 1] == "mxfp4"
 
 
 def test_formal_quick_forwards_explicit_protocol_and_shard(tmp_path):

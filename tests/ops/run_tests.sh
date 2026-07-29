@@ -279,8 +279,8 @@ if [ "$#" -gt 0 ]; then
         esac
     elif [ "$formal_precision" = "mxfp4" ]; then
         case "$formal_operator" in
-            linear|all) ;;
-            *) formal_error "MXFP4 formal 仅支持 linear 或 all" ;;
+            linear|groupgemm|all) ;;
+            *) formal_error "MXFP4 formal 仅支持 linear、groupgemm 或 all" ;;
         esac
         case "$formal_device" in
             npu|npu:[0-9]*) ;;
@@ -350,11 +350,7 @@ if [ "$#" -gt 0 ]; then
     formal_status=0
     if [ "$formal_operator" = "all" ]; then
         if [ -n "$formal_precision" ]; then
-            if [ "$formal_precision" = "mxfp4" ]; then
-                formal_families=(linear)
-            else
-                formal_families=(linear groupgemm)
-            fi
+            formal_families=(linear groupgemm)
         else
             formal_families=(
                 add linear rmsnorm flashattention groupgemm

@@ -33,8 +33,14 @@ from tests.test_rmsnorm import (  # noqa: E402
     RMSNormTestSuite,
     estimate_rmsnorm_fresh_bytes,
 )
+from operator_test_framework import PrecisionType  # noqa: E402
 import recurrent_gated_delta_rule.benchmark as recurrent_benchmark  # noqa: E402
 import tests.test_recurrent_gated_delta_rule  # noqa: E402,F401
+
+try:
+    from linear.linear_fp8_operator import LinearFp8OperatorTest
+except ModuleNotFoundError:
+    LinearFp8OperatorTest = None
 
 
 PROVENANCE = {
@@ -311,6 +317,84 @@ def test_linear_formal_point_is_bias_free_and_uses_one_v2_call(
         selected=1,
         complete=False,
     )
+
+
+def test_linear_fp8_curve_selects_cutlass_provider_and_fp8_storage_plan(
+    monkeypatch,
+    tmp_path,
+):
+    assert LinearFp8OperatorTest is not None, (
+        "Linear FP8 provider must be available"
+    )
+    framework = _FakeFramework(tmp_path)
+    suite = LinearTestSuite(precision="fp8")
+    suite.framework = framework
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    result = suite.run_tflops_test(
+        sizes=[16],
+        device="cuda:0",
+        num_warmup=10,
+        num_iterations=50,
+        num_repeats=3,
+        plot_results=False,
+    )
+
+    assert isinstance(suite.operator_test, LinearFp8OperatorTest)
+    _assert_formal_call(
+        framework.calls[0],
+        10,
+        50,
+        3,
+        LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+    )
+    assert framework.calls[0]["precision"] is PrecisionType.FP8
+    assert framework.calls[0]["data"]["bias"] is False
+    assert result["rows"][0]["estimated_unique_bytes_per_invocation"] == (
+        4 * 16**2 + 8 * 16
+    )
+
+
+def test_linear_main_dispatches_fp8_precision_to_the_fp8_suite(
+    monkeypatch,
+    tmp_path,
+):
+    import tests.test_linear as linear_curve
+
+    captured = {}
+
+    def fake_setup(self, framework):
+        self.framework = framework
+
+    def fake_run_tflops_test(self, **kwargs):
+        captured["suite"] = self
+        captured["kwargs"] = kwargs
+        return {"rows": []}
+
+    monkeypatch.setattr(LinearTestSuite, "setup", fake_setup)
+    monkeypatch.setattr(
+        LinearTestSuite,
+        "run_tflops_test",
+        fake_run_tflops_test,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_linear.py",
+            "--precision",
+            "fp8",
+            "--mode",
+            "tflops",
+            "--result-dir",
+            str(tmp_path),
+            "--no-plot",
+        ],
+    )
+
+    assert linear_curve.main() == 0
+    assert captured["suite"].precision == "fp8"
+    assert isinstance(captured["suite"].operator_test, LinearFp8OperatorTest)
 
 
 def test_add_auto_iterations_match_effective_csv_count(

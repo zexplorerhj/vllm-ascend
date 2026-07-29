@@ -46,6 +46,11 @@ try:
 except ModuleNotFoundError:
     fp8_utils = None
 
+try:
+    from linear.linear_fp8_operator import LinearFp8OperatorTest
+except ModuleNotFoundError:
+    LinearFp8OperatorTest = None
+
 
 @pytest.mark.parametrize(
     ("operator_factory", "prepared", "expected"),
@@ -160,6 +165,149 @@ def test_only_phase_invariant_out_providers_declare_direct_timing_contract(
 def _fp8_utils():
     assert fp8_utils is not None, "FP8 utility module must be available"
     return fp8_utils
+
+
+def _linear_fp8_operator():
+    assert LinearFp8OperatorTest is not None, (
+        "Linear FP8 provider must be available"
+    )
+    return LinearFp8OperatorTest()
+
+
+def test_linear_fp8_provider_prepares_column_major_weight_and_scales(
+    monkeypatch,
+):
+    operator = _linear_fp8_operator()
+    data = operator.generate_test_data(
+        batch_size=3,
+        input_dim=16,
+        output_dim=32,
+        bias=False,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: (
+            LinearFp8OperatorTest.CUDA_IMPLEMENTATION
+        ),
+    )
+
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+    )
+
+    assert prepared["A"].shape == (3, 16)
+    assert prepared["A"].dtype is torch.float8_e4m3fn
+    assert prepared["B"].shape == (16, 32)
+    assert prepared["B"].dtype is torch.float8_e4m3fn
+    assert prepared["B"].stride() == (1, 16)
+    assert prepared["scale_a"].shape == (3, 1)
+    assert prepared["scale_a"].dtype is torch.float32
+    assert prepared["scale_b"].shape == (1, 32)
+    assert prepared["scale_b"].dtype is torch.float32
+    assert prepared["output"].shape == (3, 32)
+    assert prepared["output"].dtype is torch.bfloat16
+    assert "bias" not in prepared
+
+
+def test_linear_fp8_provider_calls_cutlass_with_caller_output_first(
+    monkeypatch,
+):
+    operator = _linear_fp8_operator()
+    data = operator.generate_test_data(
+        batch_size=2,
+        input_dim=16,
+        output_dim=32,
+        bias=False,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: (
+            LinearFp8OperatorTest.CUDA_IMPLEMENTATION
+        ),
+    )
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+    )
+    calls = []
+
+    def fake_cutlass_scaled_mm(*args):
+        calls.append(args)
+        args[0].zero_()
+
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_scaled_mm",
+        lambda: fake_cutlass_scaled_mm,
+    )
+
+    result = operator._execute_core_operator(
+        prepared,
+        LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+    )
+
+    assert result is prepared["output"]
+    assert calls == [
+        (
+            prepared["output"],
+            prepared["A"],
+            prepared["B"],
+            prepared["scale_a"],
+            prepared["scale_b"],
+            None,
+        )
+    ]
+
+
+def test_linear_fp8_provider_declares_the_strict_output_contract():
+    operator = _linear_fp8_operator()
+
+    assert operator.get_formal_implementations("cuda:0") == [
+        LinearFp8OperatorTest.CUDA_IMPLEMENTATION
+    ]
+    assert operator.get_formal_implementations("npu:0") == []
+    assert operator._declares_preallocated_output_contract(
+        {"implementation": LinearFp8OperatorTest.CUDA_IMPLEMENTATION},
+        "default",
+    )
+    assert not operator._declares_preallocated_output_contract(
+        {"implementation": "torch_mm"},
+        "default",
+    )
+
+
+def test_linear_fp8_provider_rejects_unaligned_cutlass_dimensions(
+    monkeypatch,
+):
+    operator = _linear_fp8_operator()
+    data = operator.generate_test_data(
+        batch_size=2,
+        input_dim=15,
+        output_dim=16,
+        bias=False,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: (
+            LinearFp8OperatorTest.CUDA_IMPLEMENTATION
+        ),
+    )
+
+    with pytest.raises(ValueError, match="K and N.*16"):
+        operator._prepare_data_for_core_operator(
+            data,
+            "cpu",
+            PrecisionType.FP8,
+            LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+        )
 
 
 def test_fp8_precision_is_a_distinct_e4m3_precision():

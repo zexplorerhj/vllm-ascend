@@ -17,9 +17,17 @@ from operator_test_framework import (
     build_curve_selection_provenance,
     finalize_curve_coverage,
 )
+from linear.linear_fp8_operator import LinearFp8OperatorTest
 from linear.linear_operator import LinearOperatorTest
 
 LINEAR_BASE_ITERATIONS = 50
+
+
+def estimate_linear_fp8_fresh_bytes(m: int, n: int, k: int) -> int:
+    """Return retained bytes for one FP8 W8A8/BF16 Linear payload."""
+    if min(m, n, k) <= 0:
+        raise ValueError("Linear FP8 dimensions must be positive")
+    return m * k + k * n + 2 * m * n + 4 * m + 4 * n
 
 
 class LinearTestSuite(BaseTestSuite):
@@ -40,7 +48,11 @@ class LinearTestSuite(BaseTestSuite):
         self.batch_size = batch_size
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.operator_test = LinearOperatorTest()
+        self.operator_test = (
+            LinearFp8OperatorTest()
+            if self.precision == "fp8"
+            else LinearOperatorTest()
+        )
     
     def register_operator(self):
         """注册Linear算子到测试框架"""
@@ -199,6 +211,7 @@ class LinearTestSuite(BaseTestSuite):
         precision_map = {
             "bf16": PrecisionType.BF16,
             "fp16": PrecisionType.FP16,
+            "fp8": PrecisionType.FP8,
         }
         precision_type = precision_map[self.precision]
         
@@ -235,6 +248,7 @@ class LinearTestSuite(BaseTestSuite):
             precision_map = {
                 "fp16": PrecisionType.FP16,
                 "bf16": PrecisionType.BF16,
+                "fp8": PrecisionType.FP8,
             }
             precision_type = precision_map.get(self.precision, PrecisionType.BF16)
         
@@ -332,6 +346,7 @@ class LinearTestSuite(BaseTestSuite):
         precision_type = {
             "fp16": PrecisionType.FP16,
             "bf16": PrecisionType.BF16,
+            "fp8": PrecisionType.FP8,
         }[self.precision]
         result_dir = self.framework.result_dir
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -364,7 +379,11 @@ class LinearTestSuite(BaseTestSuite):
                 num_warmup=num_warmup,
                 requested_iterations=num_iterations,
                 base_iterations=LINEAR_BASE_ITERATIONS,
-                estimated_unique_bytes_per_invocation=6 * size * size,
+                estimated_unique_bytes_per_invocation=(
+                    estimate_linear_fp8_fresh_bytes(size, size, size)
+                    if self.precision == "fp8"
+                    else 6 * size * size
+                ),
             )
             effective_iterations = int(
                 iteration_plan["effective_iterations"]
@@ -483,7 +502,7 @@ def main():
     from operator_test_framework import OperatorTestFramework
     
     parser = argparse.ArgumentParser(description='Linear 算子 Profile 测试')
-    parser.add_argument('--precision', choices=['fp16', 'bf16'], default='bf16', help='精度类型')
+    parser.add_argument('--precision', choices=['fp16', 'bf16', 'fp8'], default='bf16', help='精度类型')
     parser.add_argument('--batch-size', type=int, default=128, help='批次大小')
     parser.add_argument('--input-dim', type=int, default=1024, help='输入维度')
     parser.add_argument('--output-dim', type=int, default=4096, help='输出维度')
@@ -583,6 +602,7 @@ def main():
             precision_map = {
                 "fp16": PrecisionType.FP16,
                 "bf16": PrecisionType.BF16,
+                "fp8": PrecisionType.FP8,
             }
             precision_type = precision_map[args.precision]
             results = test_suite.run_performance_test_v2(

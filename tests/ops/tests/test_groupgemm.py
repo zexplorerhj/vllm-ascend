@@ -17,35 +17,60 @@ from operator_test_framework import (
 )
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest
 from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest
+from groupgemm.groupgemm_fp8 import GroupGemmFp8OperatorTest
 
 
 class GroupGemmTestSuite(BaseTestSuite):
-    """GroupGemm算子测试套件 - 支持INT8和BF16精度"""
+    """GroupGemm算子测试套件 - 支持INT8、BF16和FP8精度"""
     
     def __init__(self, precision: str = "int8", num_experts: int = 8, hidden_dim: int = 7168, out_channel: int = 4096, use_nz_format: bool = False):
         """
         初始化GroupGemm测试套件
         
         Args:
-            precision: 精度类型，"int8" 或 "bf16"
+            precision: 精度类型，"int8"、"bf16" 或 "fp8"
             num_experts: 专家数量
             hidden_dim: 隐藏维度
             out_channel: 输出通道数
             use_nz_format: 是否使用NZ格式（仅对INT8有效）
         """
+        precision = precision.lower()
+        if precision not in {"int8", "bf16", "fp8"}:
+            raise ValueError(f"unsupported GroupGemm precision: {precision}")
         format_suffix = "_NZ" if use_nz_format else ""
-        precision_name = f"GroupGemm_BF16{format_suffix}" if precision.lower() == "bf16" else f"GroupGemm{format_suffix}"
+        if precision == "bf16":
+            precision_name = f"GroupGemm_BF16{format_suffix}"
+        elif precision == "fp8":
+            precision_name = "GroupGemm_FP8"
+        else:
+            precision_name = f"GroupGemm{format_suffix}"
         super().__init__(precision_name)
-        self.precision = precision.lower()
+        self.precision = precision
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.out_channel = out_channel
         self.use_nz_format = use_nz_format
-        self.operator_test = None
+        self.operator_test = (
+            GroupGemmFp8OperatorTest(
+                num_experts=self.num_experts,
+                hidden_dim=self.hidden_dim,
+                out_channel=self.out_channel,
+                use_nz_format=self.use_nz_format,
+            )
+            if self.precision == "fp8"
+            else None
+        )
     
     def register_operator(self):
         """注册GroupGemm算子到测试框架"""
-        if self.precision == "bf16":
+        if self.precision == "fp8":
+            self.operator_test = GroupGemmFp8OperatorTest(
+                num_experts=self.num_experts,
+                hidden_dim=self.hidden_dim,
+                out_channel=self.out_channel,
+                use_nz_format=self.use_nz_format,
+            )
+        elif self.precision == "bf16":
             self.operator_test = GroupGemmBF16OperatorTest(
                 num_experts=self.num_experts,
                 hidden_dim=self.hidden_dim,
@@ -176,7 +201,9 @@ class GroupGemmTestSuite(BaseTestSuite):
             pass
 
         if device in (None, "auto"):
-            if npu_available:
+            if self.precision == "fp8" and torch.cuda.is_available():
+                device = "cuda:0"
+            elif npu_available:
                 device = "npu:0"
             elif torch.cuda.is_available():
                 device = "cuda:0"
@@ -230,14 +257,19 @@ class GroupGemmTestSuite(BaseTestSuite):
             ),
         )
 
-        metric_name = "INT8_TOPS" if self.precision == "int8" else "BF16_TFLOPS"
+        metric_name = {
+            "int8": "INT8_TOPS",
+            "bf16": "BF16_TFLOPS",
+            "fp8": "FP8_TFLOPS",
+        }[self.precision]
 
         # 确定精度类型
         precision_map = {
             "int8": PrecisionType.INT8,
             "bf16": PrecisionType.BF16,
+            "fp8": PrecisionType.FP8,
         }
-        precision_type = precision_map.get(self.precision, PrecisionType.BF16)
+        precision_type = precision_map[self.precision]
 
         results = []
         failures = []
@@ -310,6 +342,16 @@ class GroupGemmTestSuite(BaseTestSuite):
                     kernel = "vllm_cutlass_scaled_mm"
                     output_semantics = (
                         "INT8xINT8,per-token*per-channel-scale->BF16"
+                    )
+                elif (
+                    self.precision == "fp8"
+                    and implementation
+                    == self.operator_test.CUDA_IMPLEMENTATION
+                ):
+                    kernel = "vllm_cutlass_scaled_mm_expert_loop"
+                    output_semantics = (
+                        "FP8(E4M3)xFP8(E4M3),"
+                        "per-token*per-channel-scale->BF16"
                     )
                 else:
                     kernel = "npu_grouped_matmul"
@@ -428,7 +470,8 @@ class GroupGemmTestSuite(BaseTestSuite):
         precision_display = self.precision.upper()
         data_types = {
             "int8": "x=INT8, weight=INT8, scales=FP32/BF16, output=BF16",
-            "bf16": "x=BF16, weight=BF16, bias=FP32, output=BF16"
+            "bf16": "x=BF16, weight=BF16, bias=FP32, output=BF16",
+            "fp8": "x=E4M3, weight=E4M3, scales=FP32, output=BF16",
         }
         
         print(f"GroupGemm {precision_display} 特有配置:")
@@ -437,7 +480,11 @@ class GroupGemmTestSuite(BaseTestSuite):
         print(f"数据类型: {data_types.get(self.precision, 'Unknown')}")
         
         # 确定精度类型
-        precision_type = PrecisionType.BF16 if self.precision == "bf16" else PrecisionType.INT8
+        precision_type = {
+            "int8": PrecisionType.INT8,
+            "bf16": PrecisionType.BF16,
+            "fp8": PrecisionType.FP8,
+        }[self.precision]
         
         # 调用基类的增强版本，传入 GroupGemm 特有的参数
         return super().run_profile_test(
@@ -455,7 +502,12 @@ def main():
     from operator_test_framework import OperatorTestFramework
     
     parser = argparse.ArgumentParser(description='GroupGemm 算子 Profile 测试')
-    parser.add_argument('--precision', choices=['int8', 'bf16'], default='int8', help='精度类型')
+    parser.add_argument(
+        '--precision',
+        choices=['int8', 'bf16', 'fp8'],
+        default='int8',
+        help='精度类型',
+    )
     parser.add_argument('--num-experts', type=int, default=8, help='专家数量')
     parser.add_argument('--hidden-dim', type=int, default=7168, help='隐藏维度')
     parser.add_argument('--out-channel', type=int, default=4096, help='输出通道')
@@ -504,7 +556,13 @@ def main():
     # 设置框架并注册算子
     test_suite.setup(framework)
     
-    if args.precision == 'bf16':
+    if args.precision == 'fp8':
+        print(
+            "🔧 使用 FP8 E4M3 精度测试 "
+            "(H20 formal 固定使用 vLLM CUTLASS scaled-mm expert loop，"
+            "输出 BF16)"
+        )
+    elif args.precision == 'bf16':
         print(
             "🔧 使用 BF16 精度测试 "
             "(NPU grouped_matmul 与 CUDA balanced bmm 均为 no-bias "
@@ -557,7 +615,11 @@ def main():
         elif args.mode == "performance":
             print("🚀 运行 GroupGemm 性能测试...")
             # 确定精度类型
-            precision_type = PrecisionType.INT8 if args.precision == "int8" else PrecisionType.BF16
+            precision_type = {
+                "int8": PrecisionType.INT8,
+                "bf16": PrecisionType.BF16,
+                "fp8": PrecisionType.FP8,
+            }[args.precision]
             results = test_suite.run_performance_test(
                 test_cases=test_cases,
                 precision_type=precision_type

@@ -45,6 +45,11 @@ try:
 except ModuleNotFoundError:
     LinearFp8OperatorTest = None
 
+try:
+    from groupgemm.groupgemm_fp8 import GroupGemmFp8OperatorTest
+except ModuleNotFoundError:
+    GroupGemmFp8OperatorTest = None
+
 
 PROVENANCE = {
     "framework_api": (
@@ -145,6 +150,9 @@ class _FakeOperator:
     CUDA_BF16_IMPLEMENTATION = "cuda_bmm_balanced_grouped_mm_jagged_bf16"
     CUDA_INT8_IMPLEMENTATION = "cuda_vllm_cutlass_scaled_mm_bf16"
     CUDA_INT8_FALLBACK_IMPLEMENTATION = "cuda_raw_int32_debug_fallback"
+    CUDA_IMPLEMENTATION = (
+        "cuda_vllm_cutlass_scaled_mm_fp8_bf16_expert_loop"
+    )
 
     def __init__(self, providers):
         self.providers = list(providers)
@@ -671,6 +679,143 @@ def test_groupgemm_formal_point_uses_i30_and_native_provider(
         selected=1,
         complete=False,
     )
+
+
+def test_groupgemm_fp8_curve_uses_formal_expert_loop_provider_and_semantics(
+    monkeypatch,
+    tmp_path,
+):
+    assert GroupGemmFp8OperatorTest is not None, (
+        "GroupGemm FP8 provider must be available"
+    )
+    framework = _FakeFramework(tmp_path)
+    suite = GroupGemmTestSuite(
+        precision="fp8",
+        num_experts=2,
+        hidden_dim=16,
+        out_channel=32,
+    )
+    suite.framework = framework
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device: (9, 0),
+    )
+
+    result = suite.run_tflops_test(
+        seq_lens=[4],
+        num_experts=2,
+        hidden_dim=16,
+        out_channel=32,
+        device="cuda:0",
+        num_warmup=10,
+        num_iterations=30,
+        num_repeats=3,
+        plot_results=False,
+    )
+
+    assert isinstance(suite.operator_test, GroupGemmFp8OperatorTest)
+    _assert_formal_call(
+        framework.calls[0],
+        10,
+        30,
+        3,
+        GroupGemmFp8OperatorTest.CUDA_IMPLEMENTATION,
+    )
+    assert framework.calls[0]["precision"] is PrecisionType.FP8
+    assert result["results"][0]["metric"] == "FP8_TFLOPS"
+    assert result["results"][0]["kernel"] == (
+        "vllm_cutlass_scaled_mm_expert_loop"
+    )
+    assert result["results"][0]["output_semantics"] == (
+        "FP8(E4M3)xFP8(E4M3),per-token*per-channel-scale->BF16"
+    )
+
+
+def test_groupgemm_fp8_auto_device_prefers_cuda_when_npu_is_available(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _FakeFramework(tmp_path)
+    suite = GroupGemmTestSuite(
+        precision="fp8",
+        num_experts=1,
+        hidden_dim=16,
+        out_channel=16,
+    )
+    suite.framework = framework
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            npu=SimpleNamespace(is_available=lambda: True),
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device: (9, 0),
+    )
+
+    suite.run_tflops_test(
+        seq_lens=[1],
+        device="auto",
+        num_warmup=1,
+        num_iterations=1,
+        num_repeats=1,
+        plot_results=False,
+    )
+
+    assert framework.calls[0]["device"] == "cuda:0"
+
+
+def test_groupgemm_main_accepts_fp8_cli_and_builds_fp8_suite(
+    monkeypatch,
+    tmp_path,
+):
+    import tests.test_groupgemm as groupgemm_curve
+
+    captured = {}
+
+    def fake_setup(self, framework):
+        self.framework = framework
+
+    def fake_run_tflops_test(self, **kwargs):
+        captured["suite"] = self
+        captured["kwargs"] = kwargs
+        return {"results": []}
+
+    monkeypatch.setattr(GroupGemmTestSuite, "setup", fake_setup)
+    monkeypatch.setattr(
+        GroupGemmTestSuite,
+        "run_tflops_test",
+        fake_run_tflops_test,
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_groupgemm.py",
+            "--precision",
+            "fp8",
+            "--mode",
+            "tflops",
+            "--result-dir",
+            str(tmp_path),
+            "--no-plot",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        groupgemm_curve.main()
+
+    assert exit_info.value.code == 0
+    assert captured["suite"].precision == "fp8"
+    assert isinstance(captured["suite"].operator_test, GroupGemmFp8OperatorTest)
+    assert captured["kwargs"]["device"] == "auto"
 
 
 def test_paged_attention_two_matrices_make_one_v2_call_per_point(

@@ -51,6 +51,11 @@ try:
 except ModuleNotFoundError:
     LinearFp8OperatorTest = None
 
+try:
+    from groupgemm.groupgemm_fp8 import GroupGemmFp8OperatorTest
+except ModuleNotFoundError:
+    GroupGemmFp8OperatorTest = None
+
 
 @pytest.mark.parametrize(
     ("operator_factory", "prepared", "expected"),
@@ -172,6 +177,326 @@ def _linear_fp8_operator():
         "Linear FP8 provider must be available"
     )
     return LinearFp8OperatorTest()
+
+
+def _groupgemm_fp8_operator():
+    assert GroupGemmFp8OperatorTest is not None, (
+        "GroupGemm FP8 provider must be available"
+    )
+    return GroupGemmFp8OperatorTest(
+        num_experts=2,
+        hidden_dim=16,
+        out_channel=32,
+    )
+
+
+def test_groupgemm_fp8_provider_prepares_grouped_cutlass_layout(monkeypatch):
+    operator = _groupgemm_fp8_operator()
+    data = operator.generate_test_data(
+        seq_len=32,
+        num_experts=2,
+        hidden_dim=16,
+        out_channel=32,
+    )
+    grouped_mm = lambda *args: None
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_grouped_mm",
+        lambda: grouped_mm,
+    )
+
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+
+    assert prepared["op"] is grouped_mm
+    assert prepared["A"].shape == (32, 16)
+    assert prepared["A"].dtype is torch.float8_e4m3fn
+    assert prepared["B"].shape == (2, 16, 32)
+    assert prepared["B"].dtype is torch.float8_e4m3fn
+    assert prepared["B"].stride() == (512, 1, 16)
+    assert prepared["scale_a"].shape == (32, 1)
+    assert prepared["scale_a"].dtype is torch.float32
+    assert prepared["scale_b"].shape == (2, 32)
+    assert prepared["scale_b"].dtype is torch.float32
+    assert prepared["output"].shape == (32, 32)
+    assert prepared["output"].dtype is torch.bfloat16
+    assert prepared["expert_offsets"].dtype is torch.int64
+    assert prepared["expert_offsets"].tolist() == [0, 16]
+    assert prepared["problem_sizes"].dtype is torch.int32
+    assert prepared["problem_sizes"].tolist() == [
+        [16, 32, 16],
+        [16, 32, 16],
+    ]
+    assert prepared["a_strides"].dtype is torch.int64
+    assert prepared["a_strides"].tolist() == [16, 16]
+    assert prepared["b_strides"].tolist() == [512, 512]
+    assert prepared["c_strides"].tolist() == [32, 32]
+
+
+def test_groupgemm_fp8_diagnostic_provider_calls_one_cached_grouped_kernel(
+    monkeypatch,
+):
+    operator = _groupgemm_fp8_operator()
+    calls = []
+
+    def fake_grouped_mm(*args):
+        calls.append(args)
+        args[0].zero_()
+
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_grouped_mm",
+        lambda: fake_grouped_mm,
+    )
+    prepared = operator._prepare_data_for_core_operator(
+        operator.generate_test_data(
+            seq_len=32,
+            num_experts=2,
+            hidden_dim=16,
+            out_channel=32,
+        ),
+        "cpu",
+        PrecisionType.FP8,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_grouped_mm",
+        lambda: pytest.fail("timed execute must not resolve grouped CUTLASS"),
+    )
+
+    result = operator._execute_core_operator(
+        prepared,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+
+    assert result is prepared["output"]
+    assert calls == [
+        (
+            prepared["output"],
+            prepared["A"],
+            prepared["B"],
+            prepared["scale_a"],
+            prepared["scale_b"],
+            prepared["expert_offsets"],
+            prepared["problem_sizes"],
+            prepared["a_strides"],
+            prepared["b_strides"],
+            prepared["c_strides"],
+            True,
+            True,
+        )
+    ]
+
+
+def test_groupgemm_fp8_formal_provider_calls_cached_kernel_per_expert(
+    monkeypatch,
+):
+    operator = _groupgemm_fp8_operator()
+    calls = []
+
+    def fake_scaled_mm(*args):
+        calls.append(args)
+        args[0].zero_()
+
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: operator.CUDA_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_scaled_mm",
+        lambda: fake_scaled_mm,
+    )
+    prepared = operator._prepare_data_for_core_operator(
+        operator.generate_test_data(
+            seq_len=5,
+            num_experts=2,
+            hidden_dim=16,
+            out_channel=32,
+        ),
+        "cpu",
+        PrecisionType.FP8,
+        operator.CUDA_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_scaled_mm",
+        lambda: pytest.fail("timed execute must not resolve scaled CUTLASS"),
+    )
+
+    result = operator._execute_core_operator(
+        prepared,
+        operator.CUDA_IMPLEMENTATION,
+    )
+
+    assert result is prepared["output"]
+    assert calls == [
+        (prepared["expert_outputs"][0], *prepared["expert_inputs"][0]),
+        (prepared["expert_outputs"][1], *prepared["expert_inputs"][1]),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected_formal"),
+    [
+        ((9, 0), True),
+        ((8, 9), False),
+        ((9, 1), False),
+    ],
+)
+def test_groupgemm_fp8_provider_is_formal_only_on_exact_requested_sm90(
+    monkeypatch,
+    capability,
+    expected_formal,
+):
+    operator = _groupgemm_fp8_operator()
+    requested_devices = []
+
+    def fake_get_device_capability(device):
+        requested_devices.append(device)
+        return capability
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        fake_get_device_capability,
+    )
+
+    formal = operator.get_formal_implementations("cuda:3")
+
+    assert requested_devices == ["cuda:3"]
+    assert formal == (
+        [operator.CUDA_IMPLEMENTATION] if expected_formal else []
+    )
+    if expected_formal:
+        assert operator.get_available_implementations("cuda:3") == [
+            operator.CUDA_IMPLEMENTATION,
+            operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+        ]
+        assert operator._declares_preallocated_output_contract(
+            {"_implementation": operator.CUDA_IMPLEMENTATION},
+        )
+        assert operator._declares_preallocated_output_contract(
+            {"_implementation": operator.CUDA_DIAGNOSTIC_IMPLEMENTATION},
+        )
+    else:
+        with pytest.raises(ValueError, match="SM90"):
+            operator._resolve_implementation("cuda:3", "default")
+
+
+def test_groupgemm_fp8_fresh_payloads_have_independent_disjoint_storage(
+    monkeypatch,
+):
+    operator = _groupgemm_fp8_operator()
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: operator.CUDA_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_scaled_mm",
+        lambda: lambda *args: args[0].zero_(),
+    )
+    data = operator.generate_test_data(
+        seq_len=5,
+        num_experts=2,
+        hidden_dim=16,
+        out_channel=32,
+    )
+
+    prepared_payloads = [
+        operator._prepare_data_for_core_operator(
+            data,
+            "cpu",
+            PrecisionType.FP8,
+            operator.CUDA_IMPLEMENTATION,
+        )
+        for _ in range(3)
+    ]
+    input_sets = [
+        OperatorTestFramework._prepared_input_values(prepared)
+        for prepared in prepared_payloads
+    ]
+    output_sets = [
+        OperatorTestFramework._prepared_output_values(prepared)
+        for prepared in prepared_payloads
+    ]
+
+    assert OperatorTestFramework._verify_independent_storage_sets(
+        input_sets,
+        "cpu",
+        "FP8 GroupGemm input",
+    ) == (3, 12)
+    assert OperatorTestFramework._verify_independent_storage_sets(
+        output_sets,
+        "cpu",
+        "FP8 GroupGemm output",
+    ) == (3, 3)
+    OperatorTestFramework._verify_disjoint_storage_domains(
+        input_sets,
+        output_sets,
+        "cpu",
+        "FP8 GroupGemm input/output",
+    )
+    warmup_outputs = [
+        operator._execute_core_operator(
+            prepared,
+            operator.CUDA_IMPLEMENTATION,
+        )
+        for prepared in prepared_payloads
+    ]
+    assert OperatorTestFramework._count_preallocated_output_aliases(
+        prepared_payloads,
+        warmup_outputs,
+        "cpu",
+    ) == 3
+
+
+def test_groupgemm_fp8_grouped_diagnostic_rejects_h20_small_expert_rows(
+    monkeypatch,
+):
+    operator = _groupgemm_fp8_operator()
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_grouped_mm",
+        lambda: lambda *args: None,
+    )
+    data = operator.generate_test_data(
+        seq_len=16,
+        num_experts=2,
+        hidden_dim=16,
+        out_channel=32,
+    )
+
+    with pytest.raises(ValueError, match="at least 16.*16-aligned"):
+        operator._prepare_data_for_core_operator(
+            data,
+            "cpu",
+            PrecisionType.FP8,
+            operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+        )
 
 
 def test_linear_fp8_provider_prepares_column_major_weight_and_scales(

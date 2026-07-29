@@ -202,7 +202,7 @@ def test_groupgemm_fp8_provider_prepares_grouped_cutlass_layout(monkeypatch):
     monkeypatch.setattr(
         operator,
         "_resolve_implementation",
-        lambda device, implementation: operator.CUDA_GROUPED_IMPLEMENTATION,
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
     monkeypatch.setattr(
         operator,
@@ -214,7 +214,7 @@ def test_groupgemm_fp8_provider_prepares_grouped_cutlass_layout(monkeypatch):
         data,
         "cpu",
         PrecisionType.FP8,
-        operator.CUDA_GROUPED_IMPLEMENTATION,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
 
     assert prepared["op"] is grouped_mm
@@ -253,7 +253,7 @@ def test_groupgemm_fp8_grouped_b_strides_use_cutlass_leading_dimension(
     monkeypatch.setattr(
         operator,
         "_resolve_implementation",
-        lambda device, implementation: operator.CUDA_GROUPED_IMPLEMENTATION,
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
     monkeypatch.setattr(
         operator,
@@ -270,7 +270,7 @@ def test_groupgemm_fp8_grouped_b_strides_use_cutlass_leading_dimension(
         ),
         "cpu",
         PrecisionType.FP8,
-        operator.CUDA_GROUPED_IMPLEMENTATION,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
 
     assert prepared["B"].stride(0) == 32 * 48
@@ -310,7 +310,7 @@ def test_groupgemm_fp8_grouped_problem_sizes_follow_sm90_swap_ab_threshold(
     monkeypatch.setattr(
         operator,
         "_resolve_implementation",
-        lambda device, implementation: operator.CUDA_GROUPED_IMPLEMENTATION,
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
     monkeypatch.setattr(
         operator,
@@ -327,7 +327,7 @@ def test_groupgemm_fp8_grouped_problem_sizes_follow_sm90_swap_ab_threshold(
         ),
         "cpu",
         PrecisionType.FP8,
-        operator.CUDA_GROUPED_IMPLEMENTATION,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
 
     assert prepared["problem_sizes"].tolist() == expected_problem_sizes
@@ -353,7 +353,7 @@ def test_groupgemm_fp8_bandwidth_includes_fp32_scale_traffic():
     assert bandwidth == pytest.approx(195 / (0.002 * 1e9))
 
 
-def test_groupgemm_fp8_formal_provider_calls_one_cached_grouped_kernel(
+def test_groupgemm_fp8_diagnostic_provider_calls_one_cached_grouped_kernel(
     monkeypatch,
 ):
     operator = _groupgemm_fp8_operator()
@@ -366,7 +366,7 @@ def test_groupgemm_fp8_formal_provider_calls_one_cached_grouped_kernel(
     monkeypatch.setattr(
         operator,
         "_resolve_implementation",
-        lambda device, implementation: operator.CUDA_IMPLEMENTATION,
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
     monkeypatch.setattr(
         operator,
@@ -382,7 +382,7 @@ def test_groupgemm_fp8_formal_provider_calls_one_cached_grouped_kernel(
         ),
         "cpu",
         PrecisionType.FP8,
-        operator.CUDA_IMPLEMENTATION,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
     monkeypatch.setattr(
         operator,
@@ -392,7 +392,7 @@ def test_groupgemm_fp8_formal_provider_calls_one_cached_grouped_kernel(
 
     result = operator._execute_core_operator(
         prepared,
-        operator.CUDA_IMPLEMENTATION,
+        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
 
     assert result is prepared["output"]
@@ -414,7 +414,7 @@ def test_groupgemm_fp8_formal_provider_calls_one_cached_grouped_kernel(
     ]
 
 
-def test_groupgemm_fp8_diagnostic_provider_calls_cached_kernel_per_expert(
+def test_groupgemm_fp8_formal_provider_calls_cached_kernel_per_expert(
     monkeypatch,
 ):
     operator = _groupgemm_fp8_operator()
@@ -427,7 +427,7 @@ def test_groupgemm_fp8_diagnostic_provider_calls_cached_kernel_per_expert(
     monkeypatch.setattr(
         operator,
         "_resolve_implementation",
-        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+        lambda device, implementation: operator.CUDA_IMPLEMENTATION,
     )
     monkeypatch.setattr(
         operator,
@@ -443,7 +443,7 @@ def test_groupgemm_fp8_diagnostic_provider_calls_cached_kernel_per_expert(
         ),
         "cpu",
         PrecisionType.FP8,
-        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+        operator.CUDA_IMPLEMENTATION,
     )
     monkeypatch.setattr(
         operator,
@@ -453,7 +453,7 @@ def test_groupgemm_fp8_diagnostic_provider_calls_cached_kernel_per_expert(
 
     result = operator._execute_core_operator(
         prepared,
-        operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+        operator.CUDA_IMPLEMENTATION,
     )
 
     assert result is prepared["output"]
@@ -523,11 +523,6 @@ def test_groupgemm_fp8_fresh_payloads_have_independent_disjoint_storage(
     monkeypatch.setattr(
         operator,
         "_cutlass_scaled_mm",
-        lambda: pytest.fail("formal provider must not resolve scaled CUTLASS"),
-    )
-    monkeypatch.setattr(
-        operator,
-        "_cutlass_grouped_mm",
         lambda: lambda *args: args[0].zero_(),
     )
     data = operator.generate_test_data(
@@ -559,7 +554,7 @@ def test_groupgemm_fp8_fresh_payloads_have_independent_disjoint_storage(
         input_sets,
         "cpu",
         "FP8 GroupGemm input",
-    ) == (3, 27)
+    ) == (3, 12)
     assert OperatorTestFramework._verify_independent_storage_sets(
         output_sets,
         "cpu",
@@ -585,14 +580,14 @@ def test_groupgemm_fp8_fresh_payloads_have_independent_disjoint_storage(
     ) == 3
 
 
-def test_groupgemm_fp8_grouped_provider_supports_h20_small_expert_rows(
+def test_groupgemm_fp8_grouped_diagnostic_rejects_h20_small_expert_rows(
     monkeypatch,
 ):
     operator = _groupgemm_fp8_operator()
     monkeypatch.setattr(
         operator,
         "_resolve_implementation",
-        lambda device, implementation: operator.CUDA_GROUPED_IMPLEMENTATION,
+        lambda device, implementation: operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
     )
     monkeypatch.setattr(
         operator,
@@ -606,20 +601,13 @@ def test_groupgemm_fp8_grouped_provider_supports_h20_small_expert_rows(
         out_channel=32,
     )
 
-    prepared = operator._prepare_data_for_core_operator(
-        data,
-        "cpu",
-        PrecisionType.FP8,
-        operator.CUDA_GROUPED_IMPLEMENTATION,
-    )
-
-    assert prepared["_implementation"] == (
-        operator.CUDA_GROUPED_IMPLEMENTATION
-    )
-    assert prepared["problem_sizes"].tolist() == [
-        [32, 8, 16],
-        [32, 8, 16],
-    ]
+    with pytest.raises(ValueError, match="at least 16.*16-aligned"):
+        operator._prepare_data_for_core_operator(
+            data,
+            "cpu",
+            PrecisionType.FP8,
+            operator.CUDA_DIAGNOSTIC_IMPLEMENTATION,
+        )
 
 
 def test_linear_fp8_provider_prepares_column_major_weight_and_scales(

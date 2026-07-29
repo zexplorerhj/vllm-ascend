@@ -24,8 +24,11 @@ class GroupGemmFp8OperatorTest(BaseGroupGemmOperatorTest):
         "cuda_vllm_cutlass_scaled_mm_fp8_bf16_expert_loop"
     )
 
-    CUDA_IMPLEMENTATION = CUDA_GROUPED_IMPLEMENTATION
-    CUDA_DIAGNOSTIC_IMPLEMENTATION = CUDA_EXPERT_LOOP_IMPLEMENTATION
+    # H20 grouped GEMM fails internally for the first formal point
+    # (M=64, E=8, eight rows per expert). Keep one provider across the full
+    # formal matrix and expose grouped GEMM only as an explicit diagnostic.
+    CUDA_IMPLEMENTATION = CUDA_EXPERT_LOOP_IMPLEMENTATION
+    CUDA_DIAGNOSTIC_IMPLEMENTATION = CUDA_GROUPED_IMPLEMENTATION
 
     def __init__(
         self,
@@ -171,7 +174,18 @@ class GroupGemmFp8OperatorTest(BaseGroupGemmOperatorTest):
                 "FP8 CUTLASS GroupGemm requires K and N to be multiples "
                 f"of 16; got K={hidden_dim}, N={out_channel}"
             )
-        if implementation == self.CUDA_GROUPED_IMPLEMENTATION:
+        if implementation == self.CUDA_DIAGNOSTIC_IMPLEMENTATION:
+            invalid_experts = [
+                expert
+                for expert, rows in enumerate(counts)
+                if rows < 16 or rows % 16 != 0
+            ]
+            if invalid_experts:
+                raise ValueError(
+                    "H20 grouped FP8 diagnostic requires every expert row "
+                    "count to be at least 16 and 16-aligned; "
+                    f"invalid experts={invalid_experts}, rows={counts}"
+                )
             operator = self._cutlass_grouped_mm()
         else:
             operator = self._cutlass_scaled_mm()
@@ -216,7 +230,7 @@ class GroupGemmFp8OperatorTest(BaseGroupGemmOperatorTest):
             "scale_b": weight_scale_en,
             "output": output,
         }
-        if implementation == self.CUDA_EXPERT_LOOP_IMPLEMENTATION:
+        if implementation == self.CUDA_IMPLEMENTATION:
             expert_inputs = []
             expert_outputs = []
             start = 0
@@ -292,10 +306,7 @@ class GroupGemmFp8OperatorTest(BaseGroupGemmOperatorTest):
         implementation: str = "default",
     ) -> torch.Tensor:
         del implementation
-        if (
-            prepared_data["_implementation"]
-            == self.CUDA_EXPERT_LOOP_IMPLEMENTATION
-        ):
+        if prepared_data["_implementation"] == self.CUDA_IMPLEMENTATION:
             for expert_output, expert_input in zip(
                 prepared_data["expert_outputs"],
                 prepared_data["expert_inputs"],

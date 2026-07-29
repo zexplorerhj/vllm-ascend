@@ -905,7 +905,7 @@ def test_groupgemm_formal_point_uses_i30_and_native_provider(
     )
 
 
-def test_groupgemm_fp8_curve_uses_formal_grouped_provider_and_semantics(
+def test_groupgemm_fp8_curve_uses_formal_expert_loop_provider_and_semantics(
     monkeypatch,
     tmp_path,
 ):
@@ -945,12 +945,12 @@ def test_groupgemm_fp8_curve_uses_formal_grouped_provider_and_semantics(
         10,
         30,
         3,
-        "cuda_vllm_cutlass_grouped_gemm_fp8_bf16",
+        "cuda_vllm_cutlass_scaled_mm_fp8_bf16_expert_loop",
     )
     assert framework.calls[0]["precision"] is PrecisionType.FP8
     assert result["results"][0]["metric"] == "FP8_TFLOPS"
     assert result["results"][0]["kernel"] == (
-        "vllm_cutlass_moe_mm_grouped"
+        "vllm_cutlass_scaled_mm_expert_loop"
     )
     assert result["results"][0]["output_semantics"] == (
         "FP8(E4M3)xFP8(E4M3),per-token*per-channel-scale->BF16"

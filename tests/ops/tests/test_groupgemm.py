@@ -385,7 +385,7 @@ class GroupGemmTestSuite(BaseTestSuite):
                         None,
                     )
                 ):
-                    kernel = "vllm_cutlass_moe_mm_grouped"
+                    kernel = "vllm_cutlass_scaled_mm_expert_loop"
                     output_semantics = (
                         "FP8(E4M3)xFP8(E4M3),"
                         "per-token*per-channel-scale->BF16"

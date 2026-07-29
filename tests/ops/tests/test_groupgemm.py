@@ -625,7 +625,8 @@ def main():
     if args.precision == 'fp8':
         print(
             "🔧 使用 FP8 E4M3 精度测试 "
-            "(CUDA H20 使用 vLLM CUTLASS grouped MoE MM；NPU 950PR 使用 "
+            "(CUDA H20 使用 vLLM CUTLASS scaled-MM expert loop，"
+            "grouped MoE MM 仅用于诊断；NPU 950PR 使用 "
             "npu_grouped_matmul pure-GMM2；输出 BF16)"
         )
     elif args.precision == 'mxfp8':

@@ -221,6 +221,7 @@ def test_formal_quantized_linear_keeps_entry_owned_sparse_grid(
         "--tflops-step",
         "--tflops-sizes",
     }.intersection(command)
+    assert "--tflops-iterations" not in command
 
 
 @pytest.mark.parametrize("device", ["auto", "cuda", "cuda:0"])

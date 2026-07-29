@@ -651,6 +651,123 @@ def test_linear_quantized_formal_grid_has_34_unique_ascending_points():
 
 
 @pytest.mark.parametrize("precision", ["fp8", "mxfp8"])
+def test_linear_quantized_default_selects_complete_34_point_formal_grid(
+    monkeypatch,
+    tmp_path,
+    precision,
+):
+    _install_available_npu(monkeypatch)
+    framework = _FakeFramework(tmp_path / precision)
+    suite = LinearTestSuite(precision=precision)
+    suite.framework = framework
+    suite.operator_test = _FakeOperator([f"npu_{precision}"])
+    monkeypatch.setattr(
+        framework,
+        "performance_provenance",
+        lambda metrics: _adaptive_provenance(framework),
+    )
+
+    result = suite.run_tflops_test(
+        sizes=None,
+        device="npu:0",
+        num_warmup=10,
+        num_iterations=None,
+        num_repeats=5,
+        plot_results=False,
+    )
+
+    assert [
+        call["data"]["batch_size"] for call in framework.calls
+    ] == LINEAR_QUANTIZED_FORMAL_SIZES
+    assert [row["M"] for row in result["rows"]] == (
+        LINEAR_QUANTIZED_FORMAL_SIZES
+    )
+    _assert_coverage(
+        result["rows"],
+        mode="full_formal_shape_matrix",
+        source="default_formal",
+        total=34,
+        requested=34,
+        selected=34,
+        selection_complete=True,
+        complete=True,
+    )
+
+
+def test_linear_quantized_quick_selects_first_of_34_formal_points(
+    monkeypatch,
+    tmp_path,
+):
+    _install_available_npu(monkeypatch)
+    framework = _FakeFramework(tmp_path)
+    suite = LinearTestSuite(precision="mxfp8")
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["npu_mxfp8"])
+
+    result = suite.run_tflops_test(
+        sizes=None,
+        device="npu:0",
+        num_warmup=10,
+        num_iterations=None,
+        num_repeats=5,
+        plot_results=False,
+        quick=True,
+    )
+
+    assert [call["data"]["batch_size"] for call in framework.calls] == [256]
+    assert [row["point_index"] for row in result["rows"]] == [0]
+    _assert_coverage(
+        result["rows"],
+        mode="quick_shape_subset",
+        source="default_formal",
+        total=34,
+        requested=34,
+        selected=1,
+        selection_complete=False,
+        complete=False,
+    )
+
+
+def test_linear_quantized_shard_selects_from_34_point_formal_grid(
+    monkeypatch,
+    tmp_path,
+):
+    _install_available_npu(monkeypatch)
+    framework = _FakeFramework(tmp_path)
+    suite = LinearTestSuite(precision="fp8")
+    suite.framework = framework
+    suite.operator_test = _FakeOperator(["npu_fp8"])
+
+    result = suite.run_tflops_test(
+        sizes=None,
+        device="npu:0",
+        num_warmup=10,
+        num_iterations=None,
+        num_repeats=5,
+        plot_results=False,
+        shard_index=1,
+        num_shards=4,
+    )
+
+    assert [
+        call["data"]["batch_size"] for call in framework.calls
+    ] == LINEAR_QUANTIZED_FORMAL_SIZES[1::4]
+    assert [row["point_index"] for row in result["rows"]] == list(
+        range(1, 34, 4)
+    )
+    _assert_coverage(
+        result["rows"],
+        mode="formal_shape_shard",
+        source="default_formal",
+        total=34,
+        requested=34,
+        selected=9,
+        selection_complete=False,
+        complete=False,
+    )
+
+
+@pytest.mark.parametrize("precision", ["fp8", "mxfp8"])
 def test_linear_quantized_large_points_share_mxfp8_bounded_invocation_plan(
     monkeypatch,
     tmp_path,
@@ -689,6 +806,15 @@ def test_linear_quantized_large_points_share_mxfp8_bounded_invocation_plan(
         <= 40 * 1024**3
         for row in result["rows"]
     )
+    for row, call in zip(result["rows"], framework.calls):
+        expected_warmup = call["num_warmup"]
+        expected_iterations = call["num_iterations"]
+        assert row["warmup"] == row["effective_warmup"] == expected_warmup
+        assert (
+            row["iterations"]
+            == row["effective_iterations"]
+            == expected_iterations
+        )
 
 
 def test_linear_fp8_auto_device_selects_sm90_cuda_even_when_npu_is_available(
@@ -765,6 +891,7 @@ def test_linear_main_dispatches_fp8_precision_to_the_fp8_suite(
     assert captured["suite"].precision == "fp8"
     assert isinstance(captured["suite"].operator_test, LinearFp8OperatorTest)
     assert captured["kwargs"]["device"] == "auto"
+    assert captured["kwargs"]["num_iterations"] is None
 
 
 @pytest.mark.parametrize(

@@ -33,6 +33,24 @@ formal_error() {
     exit 2
 }
 
+is_formal_device() {
+    case "$1" in
+        auto|cuda|npu)
+            return 0
+            ;;
+        cuda:*|npu:*)
+            local device_index=${1#*:}
+            case "$device_index" in
+                ''|*[!0-9]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 run_formal_command() {
     if [ "$formal_dry_run" -eq 1 ]; then
         printf 'DRY-RUN:'
@@ -233,10 +251,8 @@ if [ "$#" -gt 0 ]; then
         *) formal_error "--precision 仅支持 fp8" ;;
     esac
     [ -n "$formal_device" ] || formal_error "必须指定 --device"
-    case "$formal_device" in
-        auto|cuda|npu|cuda:[0-9]*|npu:[0-9]*) ;;
-        *) formal_error "不支持的 device: $formal_device" ;;
-    esac
+    is_formal_device "$formal_device" || \
+        formal_error "不支持的 device: $formal_device"
     if [ "$formal_precision" = "fp8" ]; then
         case "$formal_operator" in
             linear|groupgemm|all) ;;

@@ -227,6 +227,46 @@ def test_formal_dispatcher_rejects_invalid_shard_without_running_python(
     assert "DRY-RUN:" not in completed.stdout
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cuda:",
+        "cuda:0junk",
+        "cuda:1.2",
+        "cuda:-1",
+        "npu:",
+        "npu:0junk",
+        "npu:1.2",
+        "npu:-1",
+    ],
+)
+def test_formal_dispatcher_rejects_malformed_accelerator_device_suffix(
+    tmp_path,
+    device,
+):
+    completed = subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "add",
+            "--device",
+            device,
+            "--output-dir",
+            str(tmp_path),
+            "--dry-run",
+        ],
+        cwd=OPS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "device" in completed.stderr.lower()
+    assert "DRY-RUN:" not in completed.stdout
+
+
 def test_formal_dispatcher_unsets_task_queue_by_default(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

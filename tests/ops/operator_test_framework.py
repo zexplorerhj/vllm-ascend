@@ -318,6 +318,12 @@ FRESH_ITERATION_PLAN_FIELDS = (
     "fresh_storage_soft_target_bytes",
     "estimated_fresh_storage_bytes_per_repeat",
     "fresh_storage_soft_target_overflow",
+    "requested_warmup",
+    "effective_warmup",
+    "minimum_warmup",
+    "minimum_iterations",
+    "fresh_storage_hard_limit_bytes",
+    "fresh_storage_hard_limit_overflow",
 )
 
 DEFAULT_FRESH_STORAGE_SOFT_TARGET_BYTES = 4 * 1024**3
@@ -426,6 +432,106 @@ def build_fresh_iteration_plan(
         "fresh_storage_soft_target_overflow": (
             estimated_total_bytes > fresh_storage_soft_target_bytes
         ),
+    }
+
+
+def build_memory_bounded_fresh_invocation_plan(
+    *,
+    requested_warmup: int,
+    requested_iterations: Optional[int],
+    base_iterations: int,
+    estimated_unique_bytes_per_invocation: int,
+    fresh_storage_hard_limit_bytes: int,
+    minimum_warmup: int = 2,
+    minimum_iterations: int = 1,
+) -> Dict[str, Any]:
+    """Choose a fresh-address invocation plan within a hard byte limit."""
+    integer_arguments = {
+        "requested_warmup": requested_warmup,
+        "base_iterations": base_iterations,
+        "estimated_unique_bytes_per_invocation": (
+            estimated_unique_bytes_per_invocation
+        ),
+        "fresh_storage_hard_limit_bytes": (
+            fresh_storage_hard_limit_bytes
+        ),
+        "minimum_warmup": minimum_warmup,
+        "minimum_iterations": minimum_iterations,
+    }
+    for name, value in integer_arguments.items():
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive non-bool int")
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive non-bool int")
+    if requested_iterations is not None and (
+        not isinstance(requested_iterations, int)
+        or isinstance(requested_iterations, bool)
+        or requested_iterations <= 0
+    ):
+        raise ValueError(
+            "requested_iterations must be None or a positive non-bool int"
+        )
+
+    capacity = (
+        fresh_storage_hard_limit_bytes
+        // estimated_unique_bytes_per_invocation
+    )
+    if requested_iterations is None:
+        total = min(requested_warmup + base_iterations, capacity)
+        effective_warmup = min(
+            requested_warmup,
+            max(minimum_warmup, total // 5),
+        )
+        effective_iterations = total - effective_warmup
+        selection_policy = "adaptive_unique_storage_hard_limit"
+    else:
+        effective_warmup = requested_warmup
+        effective_iterations = requested_iterations
+        selection_policy = "explicit_fixed"
+
+    estimated_total_bytes = (
+        effective_warmup + effective_iterations
+    ) * estimated_unique_bytes_per_invocation
+    if (
+        effective_warmup < minimum_warmup
+        or effective_iterations < minimum_iterations
+        or estimated_total_bytes > fresh_storage_hard_limit_bytes
+    ):
+        raise ValueError("fresh-storage hard limit cannot satisfy protocol")
+
+    adaptive_capacity_iterations = max(
+        0,
+        capacity - effective_warmup,
+    )
+    return {
+        "iteration_selection_policy": selection_policy,
+        "requested_iterations": (
+            requested_iterations
+            if requested_iterations is not None
+            else "auto"
+        ),
+        "base_iterations": base_iterations,
+        "effective_iterations": effective_iterations,
+        "adaptive_capacity_iterations": adaptive_capacity_iterations,
+        "adaptive_iterations_cap": base_iterations,
+        "estimated_unique_bytes_per_invocation": (
+            estimated_unique_bytes_per_invocation
+        ),
+        "fresh_storage_soft_target_bytes": (
+            fresh_storage_hard_limit_bytes
+        ),
+        "estimated_fresh_storage_bytes_per_repeat": (
+            estimated_total_bytes
+        ),
+        "fresh_storage_soft_target_overflow": False,
+        "requested_warmup": requested_warmup,
+        "effective_warmup": effective_warmup,
+        "minimum_warmup": minimum_warmup,
+        "minimum_iterations": minimum_iterations,
+        "fresh_storage_hard_limit_bytes": (
+            fresh_storage_hard_limit_bytes
+        ),
+        "fresh_storage_hard_limit_overflow": False,
     }
 
 

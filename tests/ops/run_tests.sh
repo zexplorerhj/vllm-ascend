@@ -137,6 +137,7 @@ dispatch_formal_operator() {
                 --mode bandwidth || command_status=$?
             ;;
         linear)
+            # The Linear entry owns its precision-specific formal grid.
             if [ -n "$formal_precision" ]; then
                 run_formal_entry tflops tests/test_linear.py \
                     --mode tflops --precision "$formal_precision" \

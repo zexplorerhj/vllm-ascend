@@ -28,6 +28,7 @@ from tests.test_add import AddTestSuite  # noqa: E402
 from tests.test_flash_attention import FlashAttentionTestSuite  # noqa: E402
 from tests.test_groupgemm import GroupGemmTestSuite  # noqa: E402
 from tests.test_linear import (  # noqa: E402
+    LINEAR_QUANTIZED_FORMAL_SIZES,
     LinearTestSuite,
     estimate_linear_fp8_fresh_bytes,
 )
@@ -36,7 +37,11 @@ from tests.test_rmsnorm import (  # noqa: E402
     RMSNormTestSuite,
     estimate_rmsnorm_fresh_bytes,
 )
-from operator_test_framework import PrecisionType  # noqa: E402
+from operator_test_framework import (  # noqa: E402
+    FRESH_ITERATION_PLAN_FIELDS,
+    PrecisionType,
+    build_memory_bounded_fresh_invocation_plan,
+)
 import recurrent_gated_delta_rule.benchmark as recurrent_benchmark  # noqa: E402
 import tests.test_recurrent_gated_delta_rule  # noqa: E402,F401
 
@@ -456,7 +461,7 @@ def test_linear_950pr_curves_keep_precision_provider_and_artifacts_distinct(
     result = suite.run_tflops_test(
         sizes=[16],
         device="npu:0",
-        num_warmup=1,
+        num_warmup=2,
         num_iterations=1,
         num_repeats=1,
         plot_results=True,
@@ -523,7 +528,7 @@ def test_linear_950pr_precision_selects_its_own_npu_provider(
     result = suite.run_tflops_test(
         sizes=[64],
         device="npu:0",
-        num_warmup=1,
+        num_warmup=2,
         num_iterations=1,
         num_repeats=1,
         plot_results=False,
@@ -543,6 +548,147 @@ def test_linear_mxfp8_fresh_byte_estimate_includes_group32_e8m0_scales():
     import tests.test_linear as linear_curve
 
     assert linear_curve.estimate_linear_mxfp8_fresh_bytes(3, 5, 64) == 558
+
+
+@pytest.mark.parametrize(
+    ("bytes_per_invocation", "expected_warmup", "expected_iterations"),
+    [
+        (272_629_760, 10, 50),
+        (1_090_519_040, 7, 32),
+        (4_362_076_160, 2, 7),
+    ],
+)
+def test_memory_bounded_plan_preserves_fresh_storage_within_40_gib(
+    bytes_per_invocation,
+    expected_warmup,
+    expected_iterations,
+):
+    plan = build_memory_bounded_fresh_invocation_plan(
+        requested_warmup=10,
+        requested_iterations=None,
+        base_iterations=50,
+        estimated_unique_bytes_per_invocation=bytes_per_invocation,
+        fresh_storage_hard_limit_bytes=40 * 1024**3,
+    )
+
+    assert plan["effective_warmup"] == expected_warmup
+    assert plan["effective_iterations"] == expected_iterations
+    assert (
+        plan["estimated_fresh_storage_bytes_per_repeat"]
+        <= 40 * 1024**3
+    )
+    assert set(FRESH_ITERATION_PLAN_FIELDS) <= plan.keys()
+    assert plan["fresh_storage_hard_limit_overflow"] is False
+
+
+@pytest.mark.parametrize(
+    ("argument", "invalid_value"),
+    [
+        ("requested_warmup", True),
+        ("requested_warmup", 0),
+        ("requested_iterations", False),
+        ("requested_iterations", 0),
+        ("base_iterations", True),
+        ("base_iterations", 0),
+        ("estimated_unique_bytes_per_invocation", True),
+        ("estimated_unique_bytes_per_invocation", 0),
+        ("fresh_storage_hard_limit_bytes", True),
+        ("fresh_storage_hard_limit_bytes", 0),
+        ("minimum_warmup", True),
+        ("minimum_warmup", 0),
+        ("minimum_iterations", True),
+        ("minimum_iterations", 0),
+    ],
+)
+def test_memory_bounded_plan_rejects_bool_and_nonpositive_integers(
+    argument,
+    invalid_value,
+):
+    arguments = {
+        "requested_warmup": 10,
+        "requested_iterations": None,
+        "base_iterations": 50,
+        "estimated_unique_bytes_per_invocation": 1024,
+        "fresh_storage_hard_limit_bytes": 40 * 1024**3,
+        "minimum_warmup": 2,
+        "minimum_iterations": 1,
+    }
+    arguments[argument] = invalid_value
+
+    with pytest.raises(ValueError, match="non-bool int|positive"):
+        build_memory_bounded_fresh_invocation_plan(**arguments)
+
+
+@pytest.mark.parametrize("requested_iterations", [None, 50])
+def test_memory_bounded_plan_rejects_unsatisfiable_hard_limit(
+    requested_iterations,
+):
+    with pytest.raises(
+        ValueError,
+        match="fresh-storage hard limit cannot satisfy protocol",
+    ):
+        build_memory_bounded_fresh_invocation_plan(
+            requested_warmup=10,
+            requested_iterations=requested_iterations,
+            base_iterations=50,
+            estimated_unique_bytes_per_invocation=4_362_076_160,
+            fresh_storage_hard_limit_bytes=2 * 4_362_076_160,
+        )
+
+
+def test_linear_quantized_formal_grid_has_34_unique_ascending_points():
+    assert LINEAR_QUANTIZED_FORMAL_SIZES == [
+        *range(256, 4096 + 1, 128),
+        8192,
+        16384,
+        32768,
+    ]
+    assert len(LINEAR_QUANTIZED_FORMAL_SIZES) == 34
+    assert len(set(LINEAR_QUANTIZED_FORMAL_SIZES)) == 34
+    assert LINEAR_QUANTIZED_FORMAL_SIZES == sorted(
+        LINEAR_QUANTIZED_FORMAL_SIZES
+    )
+
+
+@pytest.mark.parametrize("precision", ["fp8", "mxfp8"])
+def test_linear_quantized_large_points_share_mxfp8_bounded_invocation_plan(
+    monkeypatch,
+    tmp_path,
+    precision,
+):
+    _install_available_npu(monkeypatch)
+    framework = _FakeFramework(tmp_path / precision)
+    suite = LinearTestSuite(precision=precision)
+    suite.framework = framework
+    suite.operator_test = _FakeOperator([f"npu_{precision}"])
+    monkeypatch.setattr(
+        framework,
+        "performance_provenance",
+        lambda metrics: _adaptive_provenance(framework),
+    )
+
+    result = suite.run_tflops_test(
+        sizes=[8192, 16384, 32768],
+        device="npu:0",
+        num_warmup=10,
+        num_iterations=None,
+        num_repeats=5,
+        plot_results=False,
+    )
+
+    assert [
+        (call["num_warmup"], call["num_iterations"])
+        for call in framework.calls
+    ] == [(10, 50), (7, 32), (2, 7)]
+    assert [
+        row["estimated_unique_bytes_per_invocation"]
+        for row in result["rows"]
+    ] == [272_629_760, 1_090_519_040, 4_362_076_160]
+    assert all(
+        row["estimated_fresh_storage_bytes_per_repeat"]
+        <= 40 * 1024**3
+        for row in result["rows"]
+    )
 
 
 def test_linear_fp8_auto_device_selects_sm90_cuda_even_when_npu_is_available(
@@ -569,7 +715,7 @@ def test_linear_fp8_auto_device_selects_sm90_cuda_even_when_npu_is_available(
     suite.run_tflops_test(
         sizes=[16],
         device="auto",
-        num_warmup=1,
+        num_warmup=2,
         num_iterations=1,
         num_repeats=1,
         plot_results=False,

@@ -14,6 +14,7 @@ from operator_test_framework import (
     PERFORMANCE_PROVENANCE_FIELDS,
     PrecisionType,
     build_fresh_iteration_plan,
+    build_memory_bounded_fresh_invocation_plan,
     build_curve_selection_provenance,
     finalize_curve_coverage,
 )
@@ -23,6 +24,13 @@ from linear.linear_mxfp8_npu_operator import LinearMxFp8NpuOperatorTest
 from linear.linear_operator import LinearOperatorTest
 
 LINEAR_BASE_ITERATIONS = 50
+LINEAR_QUANTIZED_FORMAL_SIZES = [
+    *range(256, 4096 + 1, 128),
+    8192,
+    16384,
+    32768,
+]
+LINEAR_FRESH_STORAGE_HARD_LIMIT_BYTES = 40 * 1024**3
 LINEAR_PRECISION_TYPES = {
     "fp16": PrecisionType.FP16,
     "bf16": PrecisionType.BF16,
@@ -343,15 +351,21 @@ class LinearTestSuite(BaseTestSuite):
             raise ValueError(
                 "shard index must satisfy 0 <= index < num_shards"
             )
-        formal_sizes = list(range(256, 4096 + 1, 128))
-        if formal_sizes[-1] != 4096:
-            formal_sizes.append(4096)
+        default_formal_sizes = list(range(256, 4096 + 1, 128))
+        formal_sizes = (
+            list(LINEAR_QUANTIZED_FORMAL_SIZES)
+            if self.precision in {"fp8", "mxfp8"}
+            else default_formal_sizes
+        )
         if sizes is None:
             if start <= 0 or end < start or step <= 0:
                 raise ValueError("require 0 < start <= end and step > 0")
-            sizes = list(range(start, end + 1, step))
-            if sizes[-1] != end:
-                sizes.append(end)
+            if (start, end, step) == (256, 4096, 128):
+                sizes = list(formal_sizes)
+            else:
+                sizes = list(range(start, end + 1, step))
+                if sizes[-1] != end:
+                    sizes.append(end)
         else:
             sizes = list(sizes)
         if not sizes or any(size <= 0 for size in sizes):
@@ -472,20 +486,35 @@ class LinearTestSuite(BaseTestSuite):
         rows = []
         failures = []
         for point_index, size in indexed_sizes:
-            iteration_plan = build_fresh_iteration_plan(
-                num_warmup=num_warmup,
-                requested_iterations=num_iterations,
-                base_iterations=LINEAR_BASE_ITERATIONS,
-                estimated_unique_bytes_per_invocation=(
-                    estimate_linear_fp8_fresh_bytes(size, size, size)
-                    if self.precision == "fp8"
-                    else estimate_linear_mxfp8_fresh_bytes(
-                        size, size, size
+            if self.precision in {"fp8", "mxfp8"}:
+                iteration_plan = (
+                    build_memory_bounded_fresh_invocation_plan(
+                        requested_warmup=num_warmup,
+                        requested_iterations=num_iterations,
+                        base_iterations=LINEAR_BASE_ITERATIONS,
+                        estimated_unique_bytes_per_invocation=(
+                            estimate_linear_mxfp8_fresh_bytes(
+                                size, size, size
+                            )
+                        ),
+                        fresh_storage_hard_limit_bytes=(
+                            LINEAR_FRESH_STORAGE_HARD_LIMIT_BYTES
+                        ),
                     )
-                    if self.precision == "mxfp8"
-                    else 6 * size * size
-                ),
-            )
+                )
+                effective_warmup = int(
+                    iteration_plan["effective_warmup"]
+                )
+            else:
+                iteration_plan = build_fresh_iteration_plan(
+                    num_warmup=num_warmup,
+                    requested_iterations=num_iterations,
+                    base_iterations=LINEAR_BASE_ITERATIONS,
+                    estimated_unique_bytes_per_invocation=(
+                        6 * size * size
+                    ),
+                )
+                effective_warmup = num_warmup
             effective_iterations = int(
                 iteration_plan["effective_iterations"]
             )
@@ -511,7 +540,7 @@ class LinearTestSuite(BaseTestSuite):
                 "TFLOPS": "",
                 "status": "pending",
                 "error": "",
-                "warmup": num_warmup,
+                "warmup": effective_warmup,
                 "iterations": effective_iterations,
                 "repeats": num_repeats,
                 **iteration_plan,
@@ -530,7 +559,7 @@ class LinearTestSuite(BaseTestSuite):
                         device=device,
                         precision=precision_type,
                         implementation=implementation,
-                        num_warmup=num_warmup,
+                        num_warmup=effective_warmup,
                         num_iterations=effective_iterations,
                         num_repeats=num_repeats,
                         retain_outputs=True,

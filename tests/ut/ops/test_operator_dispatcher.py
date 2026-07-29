@@ -191,6 +191,38 @@ def test_formal_mxfp8_opt_in_dispatches_950pr_linear_and_groupgemm(
     ] == ["mxfp8", "mxfp8"]
 
 
+@pytest.mark.parametrize(
+    ("precision", "device"),
+    [("fp8", "cuda:0"), ("mxfp8", "npu:0")],
+)
+def test_formal_quantized_linear_keeps_entry_owned_sparse_grid(
+    tmp_path,
+    precision,
+    device,
+):
+    commands = _dry_run(
+        "--operator",
+        "linear",
+        "--precision",
+        precision,
+        "--device",
+        device,
+        "--output-dir",
+        str(tmp_path / precision),
+    )
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert Path(command[1]).name == "test_linear.py"
+    assert command[command.index("--precision") + 1] == precision
+    assert not {
+        "--tflops-start",
+        "--tflops-end",
+        "--tflops-step",
+        "--tflops-sizes",
+    }.intersection(command)
+
+
 @pytest.mark.parametrize("device", ["auto", "cuda", "cuda:0"])
 def test_formal_mxfp8_rejects_non_npu_devices_without_dispatch(
     tmp_path,

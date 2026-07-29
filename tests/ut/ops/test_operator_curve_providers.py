@@ -191,6 +191,11 @@ def test_linear_fp8_provider_prepares_column_major_weight_and_scales(
             LinearFp8OperatorTest.CUDA_IMPLEMENTATION
         ),
     )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_scaled_mm",
+        lambda: lambda *args: None,
+    )
 
     prepared = operator._prepare_data_for_core_operator(
         data,
@@ -217,6 +222,17 @@ def test_linear_fp8_provider_calls_cutlass_with_caller_output_first(
     monkeypatch,
 ):
     operator = _linear_fp8_operator()
+    calls = []
+
+    def fake_cutlass_scaled_mm(*args):
+        calls.append(args)
+        args[0].zero_()
+
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_scaled_mm",
+        lambda: fake_cutlass_scaled_mm,
+    )
     data = operator.generate_test_data(
         batch_size=2,
         input_dim=16,
@@ -236,16 +252,10 @@ def test_linear_fp8_provider_calls_cutlass_with_caller_output_first(
         PrecisionType.FP8,
         LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
     )
-    calls = []
-
-    def fake_cutlass_scaled_mm(*args):
-        calls.append(args)
-        args[0].zero_()
-
     monkeypatch.setattr(
         operator,
         "_cutlass_scaled_mm",
-        lambda: fake_cutlass_scaled_mm,
+        lambda: pytest.fail("timed execute must not resolve the CUTLASS op"),
     )
 
     result = operator._execute_core_operator(
@@ -253,6 +263,7 @@ def test_linear_fp8_provider_calls_cutlass_with_caller_output_first(
         LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
     )
 
+    assert prepared["op"] is fake_cutlass_scaled_mm
     assert result is prepared["output"]
     assert calls == [
         (
@@ -266,8 +277,13 @@ def test_linear_fp8_provider_calls_cutlass_with_caller_output_first(
     ]
 
 
-def test_linear_fp8_provider_declares_the_strict_output_contract():
+def test_linear_fp8_provider_declares_the_strict_output_contract(monkeypatch):
     operator = _linear_fp8_operator()
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device: (9, 0),
+    )
 
     assert operator.get_formal_implementations("cuda:0") == [
         LinearFp8OperatorTest.CUDA_IMPLEMENTATION
@@ -281,6 +297,47 @@ def test_linear_fp8_provider_declares_the_strict_output_contract():
         {"implementation": "torch_mm"},
         "default",
     )
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        ((9, 0), True),
+        ((8, 9), False),
+        ((9, 1), False),
+    ],
+)
+def test_linear_fp8_provider_is_formal_only_on_exact_sm90(
+    monkeypatch,
+    capability,
+    expected,
+):
+    operator = _linear_fp8_operator()
+    requested_devices = []
+
+    def fake_get_device_capability(device):
+        requested_devices.append(device)
+        return capability
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        fake_get_device_capability,
+    )
+
+    implementations = operator.get_formal_implementations("cuda:3")
+
+    assert requested_devices == ["cuda:3"]
+    assert implementations == (
+        [LinearFp8OperatorTest.CUDA_IMPLEMENTATION] if expected else []
+    )
+    if expected:
+        assert operator._resolve_implementation("cuda:3", "default") == (
+            LinearFp8OperatorTest.CUDA_IMPLEMENTATION
+        )
+    else:
+        with pytest.raises(ValueError, match="SM90"):
+            operator._resolve_implementation("cuda:3", "default")
 
 
 def test_linear_fp8_provider_rejects_unaligned_cutlass_dimensions(
@@ -307,6 +364,104 @@ def test_linear_fp8_provider_rejects_unaligned_cutlass_dimensions(
             "cpu",
             PrecisionType.FP8,
             LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+        )
+
+
+def test_linear_fp8_fresh_payloads_satisfy_framework_storage_contract(
+    monkeypatch,
+):
+    operator = _linear_fp8_operator()
+    calls = []
+
+    def fake_cutlass_scaled_mm(*args):
+        calls.append(args)
+        args[0].fill_(len(calls))
+
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, implementation: (
+            LinearFp8OperatorTest.CUDA_IMPLEMENTATION
+        ),
+    )
+    monkeypatch.setattr(
+        operator,
+        "_cutlass_scaled_mm",
+        lambda: fake_cutlass_scaled_mm,
+    )
+    data = operator.generate_test_data(
+        batch_size=3,
+        input_dim=16,
+        output_dim=32,
+        bias=False,
+    )
+
+    prepared_payloads = [
+        operator._prepare_data_for_core_operator(
+            data,
+            "cpu",
+            PrecisionType.FP8,
+            LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+        )
+        for _ in range(3)
+    ]
+    input_sets = [
+        OperatorTestFramework._prepared_input_values(prepared)
+        for prepared in prepared_payloads
+    ]
+    output_sets = [
+        OperatorTestFramework._prepared_output_values(prepared)
+        for prepared in prepared_payloads
+    ]
+
+    assert OperatorTestFramework._verify_independent_storage_sets(
+        input_sets,
+        "cpu",
+        "FP8 Linear input",
+    ) == (3, 12)
+    assert OperatorTestFramework._verify_independent_storage_sets(
+        output_sets,
+        "cpu",
+        "FP8 Linear output",
+    ) == (3, 3)
+    OperatorTestFramework._verify_disjoint_storage_domains(
+        input_sets,
+        output_sets,
+        "cpu",
+        "FP8 Linear input/output",
+    )
+
+    warmup_outputs = [
+        operator._execute_core_operator(
+            prepared,
+            LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+        )
+        for prepared in prepared_payloads
+    ]
+    assert OperatorTestFramework._count_preallocated_output_aliases(
+        prepared_payloads,
+        warmup_outputs,
+        "cpu",
+    ) == 3
+
+    OperatorTestFramework._dispatch_prepared_payloads(
+        prepared_payloads,
+        operator._execute_core_operator,
+        LinearFp8OperatorTest.CUDA_IMPLEMENTATION,
+        None,
+    )
+
+    assert len(calls) == 6
+    for index, prepared in enumerate(prepared_payloads):
+        assert warmup_outputs[index] is prepared["output"]
+        assert calls[index][0] is prepared["output"]
+        assert calls[index + 3][0] is prepared["output"]
+        assert calls[index][1:] == (
+            prepared["A"],
+            prepared["B"],
+            prepared["scale_a"],
+            prepared["scale_b"],
+            None,
         )
 
 

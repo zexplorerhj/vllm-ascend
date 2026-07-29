@@ -27,7 +27,10 @@ sys.path.insert(0, str(OPS_ROOT))
 from tests.test_add import AddTestSuite  # noqa: E402
 from tests.test_flash_attention import FlashAttentionTestSuite  # noqa: E402
 from tests.test_groupgemm import GroupGemmTestSuite  # noqa: E402
-from tests.test_linear import LinearTestSuite  # noqa: E402
+from tests.test_linear import (  # noqa: E402
+    LinearTestSuite,
+    estimate_linear_fp8_fresh_bytes,
+)
 from tests.test_paged_attention import PagedAttentionTestSuite  # noqa: E402
 from tests.test_rmsnorm import (  # noqa: E402
     RMSNormTestSuite,
@@ -330,6 +333,11 @@ def test_linear_fp8_curve_selects_cutlass_provider_and_fp8_storage_plan(
     suite = LinearTestSuite(precision="fp8")
     suite.framework = framework
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device: (9, 0),
+    )
 
     result = suite.run_tflops_test(
         sizes=[16],
@@ -350,9 +358,46 @@ def test_linear_fp8_curve_selects_cutlass_provider_and_fp8_storage_plan(
     )
     assert framework.calls[0]["precision"] is PrecisionType.FP8
     assert framework.calls[0]["data"]["bias"] is False
-    assert result["rows"][0]["estimated_unique_bytes_per_invocation"] == (
-        4 * 16**2 + 8 * 16
+    assert result["rows"][0]["provider"] == (
+        LinearFp8OperatorTest.CUDA_IMPLEMENTATION
     )
+
+
+def test_linear_fp8_fresh_byte_estimate_uses_nonsquare_dimensions():
+    assert estimate_linear_fp8_fresh_bytes(3, 5, 7) == 118
+
+
+def test_linear_fp8_auto_device_selects_sm90_cuda_even_when_npu_is_available(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _FakeFramework(tmp_path)
+    suite = LinearTestSuite(precision="fp8")
+    suite.framework = framework
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            npu=SimpleNamespace(is_available=lambda: True),
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device: (9, 0),
+    )
+
+    suite.run_tflops_test(
+        sizes=[16],
+        device="auto",
+        num_warmup=1,
+        num_iterations=1,
+        num_repeats=1,
+        plot_results=False,
+    )
+
+    assert framework.calls[0]["device"] == "cuda:0"
 
 
 def test_linear_main_dispatches_fp8_precision_to_the_fp8_suite(
@@ -395,6 +440,7 @@ def test_linear_main_dispatches_fp8_precision_to_the_fp8_suite(
     assert linear_curve.main() == 0
     assert captured["suite"].precision == "fp8"
     assert isinstance(captured["suite"].operator_test, LinearFp8OperatorTest)
+    assert captured["kwargs"]["device"] == "auto"
 
 
 def test_add_auto_iterations_match_effective_csv_count(

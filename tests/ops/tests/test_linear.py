@@ -319,25 +319,38 @@ class LinearTestSuite(BaseTestSuite):
         )
 
         if device == "auto":
-            try:
-                import torch_npu
-                if torch_npu.npu.is_available():
-                    device = "npu:0"
-            except (ImportError, AttributeError, RuntimeError):
-                pass
-            if device == "auto" and torch.cuda.is_available():
-                device = "cuda:0"
+            if self.precision == "fp8":
+                if torch.cuda.is_available():
+                    device = "cuda:0"
+            else:
+                try:
+                    import torch_npu
+                    if torch_npu.npu.is_available():
+                        device = "npu:0"
+                except (ImportError, AttributeError, RuntimeError):
+                    pass
+                if device == "auto" and torch.cuda.is_available():
+                    device = "cuda:0"
         elif device == "cuda":
             device = "cuda:0"
         elif device == "npu":
             device = "npu:0"
         if device == "auto":
+            if self.precision == "fp8":
+                raise RuntimeError(
+                    "formal FP8 Linear curve requires CUDA SM90/H20"
+                )
             raise RuntimeError("formal Linear curve requires CUDA or NPU")
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA device requested but unavailable: {device}")
 
         implementations = self.operator_test.get_formal_implementations(device)
         if len(implementations) != 1:
+            if self.precision == "fp8":
+                raise RuntimeError(
+                    "formal FP8 Linear curve requires exact CUDA SM90/H20; "
+                    f"device={device}, providers={implementations}"
+                )
             raise RuntimeError(
                 f"expected one formal Linear provider for {device}, got "
                 f"{implementations}"
@@ -506,7 +519,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=128, help='批次大小')
     parser.add_argument('--input-dim', type=int, default=1024, help='输入维度')
     parser.add_argument('--output-dim', type=int, default=4096, help='输出维度')
-    parser.add_argument('--device', default='npu:0', help='测试设备')
+    parser.add_argument('--device', default='auto', help='测试设备')
     parser.add_argument('--iterations', type=int, default=10, help='迭代次数')
     parser.add_argument(
         '--mode',

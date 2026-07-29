@@ -108,6 +108,7 @@ class LinearFp8OperatorTest(BaseOperatorTest):
                 "FP8 CUTLASS scaled-mm requires K and N to be multiples "
                 f"of 16; got K={input_dim}, N={output_dim}"
             )
+        cutlass_scaled_mm = self._cutlass_scaled_mm()
 
         input_source = data["input"].to(
             device=device,
@@ -125,6 +126,7 @@ class LinearFp8OperatorTest(BaseOperatorTest):
         )
         return {
             "implementation": implementation,
+            "op": cutlass_scaled_mm,
             "A": activation_fp8,
             "B": weight_fp8_nk.t(),
             "scale_a": activation_scale,
@@ -147,10 +149,8 @@ class LinearFp8OperatorTest(BaseOperatorTest):
         implementation: str = "default",
     ) -> torch.Tensor:
         """Execute only the caller-output CUTLASS scaled-mm kernel."""
-        impl = prepared_data.get("implementation", implementation)
-        if impl != self.CUDA_IMPLEMENTATION:
-            raise ValueError(f"unsupported FP8 Linear implementation: {impl}")
-        self._cutlass_scaled_mm()(
+        del implementation
+        prepared_data["op"](
             prepared_data["output"],
             prepared_data["A"],
             prepared_data["B"],
@@ -173,8 +173,17 @@ class LinearFp8OperatorTest(BaseOperatorTest):
     def get_available_implementations(self, device: str) -> List[str]:
         return self.get_formal_implementations(device)
 
+    @staticmethod
+    def _cuda_device_capability(device: str) -> Optional[tuple[int, int]]:
+        if not device.startswith("cuda"):
+            return None
+        try:
+            return tuple(torch.cuda.get_device_capability(device))
+        except (AssertionError, RuntimeError, TypeError, ValueError):
+            return None
+
     def get_formal_implementations(self, device: str) -> List[str]:
-        if device.startswith("cuda"):
+        if self._cuda_device_capability(device) == (9, 0):
             return [self.CUDA_IMPLEMENTATION]
         return []
 
@@ -182,12 +191,15 @@ class LinearFp8OperatorTest(BaseOperatorTest):
         formal = self.get_formal_implementations(device)
         if implementation == "default":
             if not formal:
-                raise ValueError(f"FP8 Linear does not support device {device}")
+                raise ValueError(
+                    "FP8 Linear requires an exact CUDA SM90/H20 device; "
+                    f"unsupported device {device}"
+                )
             return formal[0]
         if implementation not in formal:
             raise ValueError(
-                f"implementation {implementation!r} is not formal for {device}; "
-                f"formal={formal}"
+                f"implementation {implementation!r} requires exact CUDA "
+                f"SM90/H20; device={device}, formal={formal}"
             )
         return implementation
 

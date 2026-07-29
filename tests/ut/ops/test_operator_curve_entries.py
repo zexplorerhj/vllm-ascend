@@ -56,6 +56,9 @@ from linear.linear_fp8_npu_operator import (  # noqa: E402
 from linear.linear_mxfp8_npu_operator import (  # noqa: E402
     LinearMxFp8NpuOperatorTest,
 )
+from linear.linear_mxfp4_npu_operator import (  # noqa: E402
+    LinearMxFp4NpuOperatorTest,
+)
 
 try:
     from groupgemm.groupgemm_fp8 import GroupGemmFp8OperatorTest
@@ -304,6 +307,15 @@ def test_mxfp8_precision_token_is_not_an_fp8_enum_alias():
     assert PrecisionType.MXFP8.value == "mxfp8"
 
 
+def test_mxfp4_precision_token_is_independent_from_fp8_and_mxfp8():
+    assert "MXFP4" in PrecisionType.__members__
+    assert PrecisionType.MXFP4 not in {
+        PrecisionType.FP8,
+        PrecisionType.MXFP8,
+    }
+    assert PrecisionType.MXFP4.value == "mxfp4"
+
+
 def test_add_formal_point_uses_one_v2_call_and_provenance(
     monkeypatch, tmp_path
 ):
@@ -441,6 +453,16 @@ def test_linear_fp8_curve_selects_cutlass_provider_and_fp8_storage_plan(
             ),
             "BF16,no_bias",
         ),
+        (
+            "mxfp4",
+            "npu_quant_matmul_mxfp4_e2m1_e8m0_group32_bf16",
+            "MXFP4",
+            (
+                "E2M1 pair-packed activation/weight; group32 pair-packed "
+                "E8M0 activation/weight scales"
+            ),
+            "BF16,no_bias",
+        ),
     ],
 )
 def test_linear_950pr_curves_keep_precision_provider_and_artifacts_distinct(
@@ -506,6 +528,7 @@ def test_linear_950pr_curves_keep_precision_provider_and_artifacts_distinct(
     [
         ("fp8", LinearFp8NpuOperatorTest, PrecisionType.FP8),
         ("mxfp8", LinearMxFp8NpuOperatorTest, PrecisionType.MXFP8),
+        ("mxfp4", LinearMxFp4NpuOperatorTest, PrecisionType.MXFP4),
     ],
 )
 def test_linear_950pr_precision_selects_its_own_npu_provider(
@@ -538,6 +561,26 @@ def test_linear_950pr_precision_selects_its_own_npu_provider(
     assert framework.calls[0]["operator_test"] is suite.operator_test
     assert framework.calls[0]["precision"] is expected_precision
     assert result["rows"][0]["provider"] == provider_type.NPU_IMPLEMENTATION
+
+
+def test_linear_mxfp4_has_no_cuda_h20_provider(monkeypatch, tmp_path):
+    framework = _FakeFramework(tmp_path)
+    suite = LinearTestSuite(precision="mxfp4")
+    suite.framework = framework
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    assert type(suite.operator_test) is LinearMxFp4NpuOperatorTest
+    assert suite.operator_test.get_formal_implementations("cuda:0") == []
+    with pytest.raises(RuntimeError, match="MXFP4.*Ascend 950PR"):
+        suite.run_tflops_test(
+            sizes=[64],
+            device="cuda:0",
+            num_warmup=2,
+            num_iterations=1,
+            num_repeats=1,
+            plot_results=False,
+        )
+    assert framework.calls == []
 
 
 def test_linear_fp8_fresh_byte_estimate_uses_nonsquare_dimensions():
@@ -650,7 +693,7 @@ def test_linear_quantized_formal_grid_has_34_unique_ascending_points():
     )
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8"])
+@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
 def test_linear_quantized_default_selects_complete_34_point_formal_grid(
     monkeypatch,
     tmp_path,
@@ -767,7 +810,7 @@ def test_linear_quantized_shard_selects_from_34_point_formal_grid(
     )
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8"])
+@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
 def test_linear_quantized_large_points_share_mxfp8_bounded_invocation_plan(
     monkeypatch,
     tmp_path,
@@ -899,6 +942,7 @@ def test_linear_main_dispatches_fp8_precision_to_the_fp8_suite(
     [
         ("fp8", LinearFp8NpuOperatorTest),
         ("mxfp8", LinearMxFp8NpuOperatorTest),
+        ("mxfp4", LinearMxFp4NpuOperatorTest),
     ],
 )
 def test_linear_main_selects_950pr_provider_from_precision_and_npu_device(

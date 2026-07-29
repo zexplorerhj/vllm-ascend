@@ -29,6 +29,9 @@ from flashattention.base import FlashAttentionOperatorTest  # noqa: E402
 from groupgemm.groupgemm_bf16 import GroupGemmBF16OperatorTest  # noqa: E402
 from groupgemm.groupgemm_int8 import GroupGemmOperatorTest  # noqa: E402
 from linear.linear_operator import LinearOperatorTest  # noqa: E402
+from linear.linear_mxfp4_npu_operator import (  # noqa: E402
+    LinearMxFp4NpuOperatorTest,
+)
 from operator_test_framework import (  # noqa: E402
     OperatorTestFramework,
     PrecisionType,
@@ -84,6 +87,15 @@ except ModuleNotFoundError:
             LinearOperatorTest,
             {"implementation": LinearOperatorTest.NPU_IMPLEMENTATION},
             True,
+        ),
+        (
+            LinearMxFp4NpuOperatorTest,
+            {
+                "implementation": (
+                    LinearMxFp4NpuOperatorTest.NPU_IMPLEMENTATION
+                )
+            },
+            False,
         ),
         (
             RMSNormOperatorTest,

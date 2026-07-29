@@ -21,6 +21,7 @@ from operator_test_framework import (
 from linear.linear_fp8_operator import LinearFp8OperatorTest
 from linear.linear_fp8_npu_operator import LinearFp8NpuOperatorTest
 from linear.linear_mxfp8_npu_operator import LinearMxFp8NpuOperatorTest
+from linear.linear_mxfp4_npu_operator import LinearMxFp4NpuOperatorTest
 from linear.linear_operator import LinearOperatorTest
 
 LINEAR_BASE_ITERATIONS = 50
@@ -36,6 +37,7 @@ LINEAR_PRECISION_TYPES = {
     "bf16": PrecisionType.BF16,
     "fp8": PrecisionType.FP8,
     "mxfp8": PrecisionType.MXFP8,
+    "mxfp4": PrecisionType.MXFP4,
 }
 LINEAR_QUANTIZATION_SEMANTICS = {
     "fp16": "none; FP16 activation/weight",
@@ -48,12 +50,17 @@ LINEAR_QUANTIZATION_SEMANTICS = {
         "E4M3 activation/weight; group32 pair-packed E8M0 "
         "activation/weight scales"
     ),
+    "mxfp4": (
+        "E2M1 pair-packed activation/weight; group32 pair-packed "
+        "E8M0 activation/weight scales"
+    ),
 }
 LINEAR_OUTPUT_SEMANTICS = {
     "fp16": "FP16,no_bias",
     "bf16": "BF16,no_bias",
     "fp8": "BF16,no_bias",
     "mxfp8": "BF16,no_bias",
+    "mxfp4": "BF16,no_bias",
 }
 
 
@@ -114,6 +121,8 @@ class LinearTestSuite(BaseTestSuite):
             return LinearFp8OperatorTest
         if self.precision == "mxfp8":
             return LinearMxFp8NpuOperatorTest
+        if self.precision == "mxfp4":
+            return LinearMxFp4NpuOperatorTest
         return LinearOperatorTest
 
     def _select_operator_for_device(self, device: str) -> None:
@@ -122,6 +131,7 @@ class LinearTestSuite(BaseTestSuite):
             LinearFp8OperatorTest,
             LinearFp8NpuOperatorTest,
             LinearMxFp8NpuOperatorTest,
+            LinearMxFp4NpuOperatorTest,
         )
         if not isinstance(self.operator_test, managed_types):
             return
@@ -354,7 +364,7 @@ class LinearTestSuite(BaseTestSuite):
         default_formal_sizes = list(range(256, 4096 + 1, 128))
         formal_sizes = (
             list(LINEAR_QUANTIZED_FORMAL_SIZES)
-            if self.precision in {"fp8", "mxfp8"}
+            if self.precision in {"fp8", "mxfp8", "mxfp4"}
             else default_formal_sizes
         )
         if sizes is None:
@@ -400,7 +410,7 @@ class LinearTestSuite(BaseTestSuite):
                             device = "npu:0"
                     except (ImportError, AttributeError, RuntimeError):
                         pass
-            elif self.precision == "mxfp8":
+            elif self.precision in {"mxfp8", "mxfp4"}:
                 try:
                     import torch_npu
                     if torch_npu.npu.is_available():
@@ -426,14 +436,18 @@ class LinearTestSuite(BaseTestSuite):
                     "formal FP8 Linear curve requires CUDA SM90/H20 or "
                     "NPU Ascend 950PR"
                 )
-            if self.precision == "mxfp8":
+            if self.precision in {"mxfp8", "mxfp4"}:
                 raise RuntimeError(
-                    "formal MXFP8 Linear curve requires NPU Ascend 950PR"
+                    f"formal {self.precision.upper()} Linear curve requires "
+                    "NPU Ascend 950PR"
                 )
             raise RuntimeError("formal Linear curve requires CUDA or NPU")
-        if self.precision == "mxfp8" and not device.startswith("npu"):
+        if self.precision in {"mxfp8", "mxfp4"} and not device.startswith(
+            "npu"
+        ):
             raise RuntimeError(
-                "formal MXFP8 Linear curve requires NPU Ascend 950PR"
+                f"formal {self.precision.upper()} Linear curve requires "
+                "NPU Ascend 950PR"
             )
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA device requested but unavailable: {device}")
@@ -447,9 +461,10 @@ class LinearTestSuite(BaseTestSuite):
                     "NPU Ascend 950PR; "
                     f"device={device}, providers={implementations}"
                 )
-            if self.precision == "mxfp8":
+            if self.precision in {"mxfp8", "mxfp4"}:
                 raise RuntimeError(
-                    "formal MXFP8 Linear curve requires NPU Ascend 950PR; "
+                    f"formal {self.precision.upper()} Linear curve requires "
+                    "NPU Ascend 950PR; "
                     f"device={device}, providers={implementations}"
                 )
             raise RuntimeError(
@@ -486,7 +501,7 @@ class LinearTestSuite(BaseTestSuite):
         rows = []
         failures = []
         for point_index, size in indexed_sizes:
-            if self.precision in {"fp8", "mxfp8"}:
+            if self.precision in {"fp8", "mxfp8", "mxfp4"}:
                 iteration_plan = (
                     build_memory_bounded_fresh_invocation_plan(
                         requested_warmup=num_warmup,
@@ -640,7 +655,7 @@ def main():
     parser = argparse.ArgumentParser(description='Linear 算子 Profile 测试')
     parser.add_argument(
         '--precision',
-        choices=['fp16', 'bf16', 'fp8', 'mxfp8'],
+        choices=['fp16', 'bf16', 'fp8', 'mxfp8', 'mxfp4'],
         default='bf16',
         help='精度类型',
     )

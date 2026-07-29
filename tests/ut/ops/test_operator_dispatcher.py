@@ -191,9 +191,30 @@ def test_formal_mxfp8_opt_in_dispatches_950pr_linear_and_groupgemm(
     ] == ["mxfp8", "mxfp8"]
 
 
+def test_formal_mxfp4_opt_in_dispatches_only_950pr_linear(tmp_path):
+    commands = _dry_run(
+        "--operator",
+        "all",
+        "--precision",
+        "mxfp4",
+        "--device",
+        "npu:0",
+        "--output-dir",
+        str(tmp_path / "950pr-mxfp4"),
+    )
+
+    assert len(commands) == 1
+    assert Path(commands[0][1]).name == "test_linear.py"
+    assert commands[0][commands[0].index("--precision") + 1] == "mxfp4"
+
+
 @pytest.mark.parametrize(
     ("precision", "device"),
-    [("fp8", "cuda:0"), ("mxfp8", "npu:0")],
+    [
+        ("fp8", "cuda:0"),
+        ("mxfp8", "npu:0"),
+        ("mxfp4", "npu:0"),
+    ],
 )
 def test_formal_quantized_linear_keeps_entry_owned_sparse_grid(
     tmp_path,
@@ -224,9 +245,11 @@ def test_formal_quantized_linear_keeps_entry_owned_sparse_grid(
     assert "--tflops-iterations" not in command
 
 
+@pytest.mark.parametrize("precision", ["mxfp8", "mxfp4"])
 @pytest.mark.parametrize("device", ["auto", "cuda", "cuda:0"])
-def test_formal_mxfp8_rejects_non_npu_devices_without_dispatch(
+def test_formal_mx_precision_rejects_non_npu_devices_without_dispatch(
     tmp_path,
+    precision,
     device,
 ):
     completed = subprocess.run(
@@ -237,11 +260,11 @@ def test_formal_mxfp8_rejects_non_npu_devices_without_dispatch(
             "--operator",
             "all",
             "--precision",
-            "mxfp8",
+            precision,
             "--device",
             device,
             "--output-dir",
-            str(tmp_path / "invalid-mxfp8"),
+            str(tmp_path / f"invalid-{precision}"),
             "--dry-run",
         ],
         cwd=OPS_ROOT,
@@ -250,7 +273,7 @@ def test_formal_mxfp8_rejects_non_npu_devices_without_dispatch(
     )
 
     assert completed.returncode != 0
-    assert "mxfp8" in completed.stderr.lower()
+    assert precision in completed.stderr.lower()
     assert "npu" in completed.stderr.lower()
     assert "DRY-RUN:" not in completed.stdout
 
@@ -267,10 +290,38 @@ def test_formal_default_npu_matrix_does_not_include_opt_in_fp8(tmp_path):
 
     assert len(commands) == 10
     assert all(
-        command[command.index("--precision") + 1] not in {"fp8", "mxfp8"}
+        command[command.index("--precision") + 1]
+        not in {"fp8", "mxfp8", "mxfp4"}
         for command in commands
         if "--precision" in command
     )
+
+
+def test_formal_mxfp4_rejects_groupgemm_without_dispatch(tmp_path):
+    completed = subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "groupgemm",
+            "--precision",
+            "mxfp4",
+            "--device",
+            "npu:0",
+            "--output-dir",
+            str(tmp_path / "invalid-mxfp4-groupgemm"),
+            "--dry-run",
+        ],
+        cwd=OPS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "mxfp4" in completed.stderr.lower()
+    assert "linear" in completed.stderr.lower()
+    assert "DRY-RUN:" not in completed.stdout
 
 
 def test_formal_quick_forwards_explicit_protocol_and_shard(tmp_path):

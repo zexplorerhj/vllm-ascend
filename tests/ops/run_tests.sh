@@ -16,7 +16,7 @@ formal_usage() {
     cat >&2 <<'EOF'
 Usage:
   run_tests.sh --formal --operator OP --device DEVICE --output-dir DIR
-      [--precision fp8|mxfp8]
+      [--precision fp8|mxfp8|mxfp4]
       [--warmup W] [--iterations I] [--repeats R]
       [--stabilization-repeats S]
       [--task-queue unset|0|1|2]
@@ -250,8 +250,8 @@ if [ "$#" -gt 0 ]; then
         *) formal_error "不支持的 operator: $formal_operator" ;;
     esac
     case "$formal_precision" in
-        ''|fp8|mxfp8) ;;
-        *) formal_error "--precision 仅支持 fp8 或 mxfp8" ;;
+        ''|fp8|mxfp8|mxfp4) ;;
+        *) formal_error "--precision 仅支持 fp8、mxfp8 或 mxfp4" ;;
     esac
     [ -n "$formal_device" ] || formal_error "必须指定 --device"
     is_formal_device "$formal_device" || \
@@ -276,6 +276,15 @@ if [ "$#" -gt 0 ]; then
         case "$formal_device" in
             npu|npu:[0-9]*) ;;
             *) formal_error "MXFP8 formal 仅支持 NPU Ascend 950PR" ;;
+        esac
+    elif [ "$formal_precision" = "mxfp4" ]; then
+        case "$formal_operator" in
+            linear|all) ;;
+            *) formal_error "MXFP4 formal 仅支持 linear 或 all" ;;
+        esac
+        case "$formal_device" in
+            npu|npu:[0-9]*) ;;
+            *) formal_error "MXFP4 formal 仅支持 NPU Ascend 950PR" ;;
         esac
     fi
     [ -n "$formal_output_dir" ] || formal_error "必须指定 --output-dir"
@@ -341,7 +350,11 @@ if [ "$#" -gt 0 ]; then
     formal_status=0
     if [ "$formal_operator" = "all" ]; then
         if [ -n "$formal_precision" ]; then
-            formal_families=(linear groupgemm)
+            if [ "$formal_precision" = "mxfp4" ]; then
+                formal_families=(linear)
+            else
+                formal_families=(linear groupgemm)
+            fi
         else
             formal_families=(
                 add linear rmsnorm flashattention groupgemm

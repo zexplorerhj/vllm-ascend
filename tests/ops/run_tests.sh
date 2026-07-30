@@ -22,7 +22,7 @@ Usage:
       [--task-queue unset|0|1|2]
       [--shard-index N] [--num-shards M] [--quick] [--dry-run]
 
-OP: add | linear | rmsnorm | flashattention | groupgemm |
+OP: add | linear | rmsnorm | flashattention | groupgemm | norm_quant |
     paged_attention | recurrent | all
 EOF
 }
@@ -174,6 +174,15 @@ dispatch_formal_operator() {
                 done
             fi
             ;;
+        norm_quant)
+            [ -n "$formal_precision" ] || {
+                echo "错误: NormQuant formal 必须指定 --precision" >&2
+                return 2
+            }
+            run_formal_entry general tests/test_norm_quant.py \
+                --mode curve --precision "$formal_precision" \
+                --dispatch-mode both || command_status=$?
+            ;;
         paged_attention)
             run_formal_entry general tests/test_paged_attention.py \
                 --mode latency || command_status=$?
@@ -246,7 +255,7 @@ if [ "$#" -gt 0 ]; then
 
     [ -n "$formal_operator" ] || formal_error "必须指定 --operator"
     case "$formal_operator" in
-        add|linear|rmsnorm|flashattention|groupgemm|paged_attention|recurrent|all) ;;
+        add|linear|rmsnorm|flashattention|groupgemm|norm_quant|paged_attention|recurrent|all) ;;
         *) formal_error "不支持的 operator: $formal_operator" ;;
     esac
     case "$formal_precision" in
@@ -258,8 +267,8 @@ if [ "$#" -gt 0 ]; then
         formal_error "不支持的 device: $formal_device"
     if [ "$formal_precision" = "fp8" ]; then
         case "$formal_operator" in
-            linear|groupgemm|all) ;;
-            *) formal_error "FP8 formal 仅支持 linear、groupgemm 或 all" ;;
+            linear|groupgemm|norm_quant|all) ;;
+            *) formal_error "FP8 formal 仅支持 linear、groupgemm、norm_quant 或 all" ;;
         esac
         case "$formal_device" in
             cuda|cuda:[0-9]*|npu|npu:[0-9]*) ;;
@@ -270,8 +279,8 @@ if [ "$#" -gt 0 ]; then
         esac
     elif [ "$formal_precision" = "mxfp8" ]; then
         case "$formal_operator" in
-            linear|groupgemm|all) ;;
-            *) formal_error "MXFP8 formal 仅支持 linear、groupgemm 或 all" ;;
+            linear|groupgemm|norm_quant|all) ;;
+            *) formal_error "MXFP8 formal 仅支持 linear、groupgemm、norm_quant 或 all" ;;
         esac
         case "$formal_device" in
             npu|npu:[0-9]*) ;;
@@ -279,8 +288,8 @@ if [ "$#" -gt 0 ]; then
         esac
     elif [ "$formal_precision" = "mxfp4" ]; then
         case "$formal_operator" in
-            linear|groupgemm|all) ;;
-            *) formal_error "MXFP4 formal 仅支持 linear、groupgemm 或 all" ;;
+            linear|groupgemm|norm_quant|all) ;;
+            *) formal_error "MXFP4 formal 仅支持 linear、groupgemm、norm_quant 或 all" ;;
         esac
         case "$formal_device" in
             npu|npu:[0-9]*) ;;
@@ -306,6 +315,12 @@ if [ "$#" -gt 0 ]; then
     if [ -n "$formal_warmup" ]; then
         case "$formal_warmup" in
             ''|*[!0-9]*) formal_error "--warmup 必须是非负整数" ;;
+        esac
+        case "$formal_operator:$formal_precision" in
+            norm_quant:*|all:fp8|all:mxfp8|all:mxfp4)
+                [ "$formal_warmup" -ge 2 ] || \
+                    formal_error "NormQuant formal --warmup 必须 >= 2"
+                ;;
         esac
     fi
     for positive_count in "$formal_iterations" "$formal_repeats"; do
@@ -350,7 +365,7 @@ if [ "$#" -gt 0 ]; then
     formal_status=0
     if [ "$formal_operator" = "all" ]; then
         if [ -n "$formal_precision" ]; then
-            formal_families=(linear groupgemm)
+            formal_families=(linear groupgemm norm_quant)
         else
             formal_families=(
                 add linear rmsnorm flashattention groupgemm

@@ -120,7 +120,7 @@ def test_formal_all_quick_dispatches_every_precision_without_shapes(tmp_path):
             )
 
 
-def test_formal_fp8_opt_in_dispatches_only_h20_linear_and_groupgemm(
+def test_formal_fp8_opt_in_dispatches_h20_quantized_families(
     tmp_path,
 ):
     commands = _dry_run(
@@ -134,18 +134,20 @@ def test_formal_fp8_opt_in_dispatches_only_h20_linear_and_groupgemm(
         str(tmp_path / "h20-fp8"),
     )
 
-    assert len(commands) == 2
+    assert len(commands) == 3
     assert [Path(command[1]).name for command in commands] == [
         "test_linear.py",
         "test_groupgemm.py",
+        "test_norm_quant.py",
     ]
     assert [command[command.index("--precision") + 1] for command in commands] == [
         "fp8",
         "fp8",
+        "fp8",
     ]
 
 
-def test_formal_fp8_opt_in_dispatches_950pr_linear_and_groupgemm(
+def test_formal_fp8_opt_in_dispatches_950pr_quantized_families(
     tmp_path,
 ):
     commands = _dry_run(
@@ -162,13 +164,14 @@ def test_formal_fp8_opt_in_dispatches_950pr_linear_and_groupgemm(
     assert [Path(command[1]).name for command in commands] == [
         "test_linear.py",
         "test_groupgemm.py",
+        "test_norm_quant.py",
     ]
     assert [
         command[command.index("--precision") + 1] for command in commands
-    ] == ["fp8", "fp8"]
+    ] == ["fp8", "fp8", "fp8"]
 
 
-def test_formal_mxfp8_opt_in_dispatches_950pr_linear_and_groupgemm(
+def test_formal_mxfp8_opt_in_dispatches_950pr_quantized_families(
     tmp_path,
 ):
     commands = _dry_run(
@@ -185,13 +188,14 @@ def test_formal_mxfp8_opt_in_dispatches_950pr_linear_and_groupgemm(
     assert [Path(command[1]).name for command in commands] == [
         "test_linear.py",
         "test_groupgemm.py",
+        "test_norm_quant.py",
     ]
     assert [
         command[command.index("--precision") + 1] for command in commands
-    ] == ["mxfp8", "mxfp8"]
+    ] == ["mxfp8", "mxfp8", "mxfp8"]
 
 
-def test_formal_mxfp4_opt_in_dispatches_950pr_linear_and_groupgemm(tmp_path):
+def test_formal_mxfp4_opt_in_dispatches_950pr_quantized_families(tmp_path):
     commands = _dry_run(
         "--operator",
         "all",
@@ -206,10 +210,79 @@ def test_formal_mxfp4_opt_in_dispatches_950pr_linear_and_groupgemm(tmp_path):
     assert [Path(command[1]).name for command in commands] == [
         "test_linear.py",
         "test_groupgemm.py",
+        "test_norm_quant.py",
     ]
     assert [
         command[command.index("--precision") + 1] for command in commands
-    ] == ["mxfp4", "mxfp4"]
+    ] == ["mxfp4", "mxfp4", "mxfp4"]
+
+
+def test_formal_norm_quant_dispatches_exact_curve_cli(tmp_path):
+    commands = _dry_run(
+        "--operator",
+        "norm_quant",
+        "--precision",
+        "fp8",
+        "--device",
+        "cuda:0",
+        "--output-dir",
+        str(tmp_path / "norm-quant"),
+        "--warmup",
+        "2",
+        "--iterations",
+        "7",
+        "--repeats",
+        "5",
+        "--quick",
+        "--shard-index",
+        "1",
+        "--num-shards",
+        "3",
+    )
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert Path(command[1]).name == "test_norm_quant.py"
+    assert command[command.index("--mode") + 1] == "curve"
+    assert command[command.index("--precision") + 1] == "fp8"
+    assert command[command.index("--dispatch-mode") + 1] == "both"
+    assert command[command.index("--warmup") + 1] == "2"
+    assert command[command.index("--iterations") + 1] == "7"
+    assert command[command.index("--repeats") + 1] == "5"
+    assert command[command.index("--shard-index") + 1] == "1"
+    assert command[command.index("--num-shards") + 1] == "3"
+    assert "--quick" in command
+    assert "--no-plot" in command
+
+
+@pytest.mark.parametrize("warmup", ["0", "1"])
+def test_formal_norm_quant_rejects_warmup_below_two(tmp_path, warmup):
+    completed = subprocess.run(
+        [
+            "bash",
+            str(DISPATCHER),
+            "--formal",
+            "--operator",
+            "norm_quant",
+            "--precision",
+            "fp8",
+            "--device",
+            "cuda:0",
+            "--output-dir",
+            str(tmp_path),
+            "--warmup",
+            warmup,
+            "--dry-run",
+        ],
+        cwd=OPS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "warmup" in completed.stderr.lower()
+    assert "2" in completed.stderr
+    assert "DRY-RUN:" not in completed.stdout
 
 
 @pytest.mark.parametrize(

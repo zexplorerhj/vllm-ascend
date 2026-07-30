@@ -322,6 +322,675 @@ def test_mxfp4_precision_token_is_independent_from_fp8_and_mxfp8():
     assert PrecisionType.MXFP4.value == "mxfp4"
 
 
+def test_norm_quant_entry_exposes_formal_suite():
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    assert NormQuantTestSuite.__name__ == "NormQuantTestSuite"
+
+
+@pytest.mark.parametrize(
+    ("device", "variant", "precision", "tokens", "hidden", "expected"),
+    [
+        ("cuda:0", "rms_norm_quant", "fp8", 2, 64, 516),
+        ("cuda:0", "add_rms_norm_quant", "fp8", 2, 64, 1028),
+        ("npu:0", "rms_norm_quant", "fp8", 2, 64, 896),
+        ("npu:0", "add_rms_norm_quant", "fp8", 2, 64, 1536),
+        ("npu:0", "add_rms_norm_dynamic_quant", "fp8", 2, 64, 1288),
+        ("npu:0", "rms_norm_dynamic_mx_quant", "mxfp4", 2, 64, 452),
+        (
+            "npu:0",
+            "add_rms_norm_dynamic_mx_quant",
+            "mxfp8",
+            2,
+            64,
+            1284,
+        ),
+    ],
+)
+def test_norm_quant_peak_retained_estimator_counts_full_payload_contract(
+    device,
+    variant,
+    precision,
+    tokens,
+    hidden,
+    expected,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import estimate_norm_quant_peak_retained_bytes
+
+    assert estimate_norm_quant_peak_retained_bytes(
+        device=device,
+        variant=NormQuantVariant(variant),
+        precision={
+            "fp8": PrecisionType.FP8,
+            "mxfp8": PrecisionType.MXFP8,
+            "mxfp4": PrecisionType.MXFP4,
+        }[precision],
+        tokens=tokens,
+        hidden=hidden,
+    ) == expected
+
+
+def test_norm_quant_window_plan_targets_shared_20_to_50_ms_interval():
+    from tests.test_norm_quant import build_norm_quant_window_plan
+
+    plan = build_norm_quant_window_plan(
+        requested_warmup=4,
+        requested_iterations=None,
+        estimated_unique_bytes_per_invocation=100,
+        fresh_storage_hard_limit_bytes=100_000,
+        calibration_samples_ms={
+            "provider_a/eager_direct": 0.10,
+            "provider_a/captured_chain": 0.08,
+            "provider_b/eager_direct": 0.12,
+            "provider_b/captured_chain": 0.10,
+        },
+        calibration_iterations=20,
+    )
+
+    assert plan["effective_warmup"] == 4
+    assert plan["effective_iterations"] == 375
+    assert plan["window_target_capacity_limited"] is False
+    assert plan["window_target_feasible"] is True
+    assert plan["predicted_event_window_min_ms"] == pytest.approx(30.0)
+    assert plan["predicted_event_window_max_ms"] == pytest.approx(45.0)
+    assert plan["calibration_is_diagnostic"] is True
+
+
+def test_norm_quant_window_plan_clamps_shared_protocol_to_hard_capacity():
+    from tests.test_norm_quant import build_norm_quant_window_plan
+
+    plan = build_norm_quant_window_plan(
+        requested_warmup=4,
+        requested_iterations=None,
+        estimated_unique_bytes_per_invocation=100,
+        fresh_storage_hard_limit_bytes=10_000,
+        calibration_samples_ms={
+            "provider_a/eager_direct": 0.10,
+            "provider_a/captured_chain": 0.08,
+        },
+        calibration_iterations=20,
+    )
+
+    assert plan["effective_warmup"] == 4
+    assert plan["effective_iterations"] == 96
+    assert plan["estimated_fresh_storage_bytes_per_repeat"] == 10_000
+    assert plan["fresh_storage_hard_limit_overflow"] is False
+    assert plan["window_target_capacity_limited"] is True
+    assert plan["predicted_event_window_min_ms"] == pytest.approx(7.68)
+
+
+class _NormQuantFakeOperator:
+
+    def __init__(
+        self,
+        variant,
+        precision,
+        *,
+        providers=("provider_a",),
+        capability_error=None,
+        events=None,
+    ):
+        self.variant = variant
+        self.precision = precision
+        self.operator_name = f"fake_{variant.value}_{precision.name}"
+        self.providers = list(providers)
+        self.capability_error = capability_error
+        self.events = events if events is not None else []
+
+    def get_formal_implementations(self, device):
+        del device
+        return list(self.providers)
+
+    def get_declared_implementations(self):
+        return list(self.providers or ["npu_native_provider"])
+
+    def generate_test_data(self, *, tokens, hidden, seed=0):
+        return {
+            "metadata": {
+                "tokens": tokens,
+                "hidden": hidden,
+                "variant": self.variant.value,
+                "precision": self.precision.name,
+                "seed": seed,
+            },
+        }
+
+    def run_device_implementation(
+        self,
+        data,
+        device,
+        precision,
+        implementation,
+    ):
+        self.events.append(
+            (
+                "accuracy",
+                implementation,
+                data["metadata"]["tokens"],
+                data["metadata"]["hidden"],
+            )
+        )
+        assert device in {"cuda:0", "npu:0"}
+        assert precision is self.precision
+        return ("validated", implementation)
+
+    def logical_bytes(self, data):
+        return data["metadata"]["tokens"] * data["metadata"]["hidden"] * 3
+
+    def physical_bytes(self, data):
+        return self.logical_bytes(data) + data["metadata"]["tokens"] * 4
+
+    def calculate_bandwidth(self, data, avg_time_ms):
+        return self.logical_bytes(data) / (avg_time_ms * 1e6)
+
+
+class _NormQuantFakeFramework(_FakeFramework):
+
+    def __init__(self, result_dir, events, *, capture_error=None):
+        super().__init__(result_dir)
+        self.events = events
+        self.capture_error = capture_error
+
+    def run_core_operator_performance_test_v2(self, **kwargs):
+        metadata = kwargs["data"]["metadata"]
+        mode = kwargs["dispatch_mode"]
+        self.events.append(
+            (
+                mode,
+                kwargs["implementation"],
+                metadata["tokens"],
+                metadata["hidden"],
+            )
+        )
+        self.calls.append(kwargs)
+        if mode == "captured_chain" and self.capture_error is not None:
+            raise self.capture_error
+        latency = 1.0 if kwargs["implementation"] == "provider_b" else 2.0
+        return SimpleNamespace(
+            avg_time_ms=latency,
+            throughput=None,
+            bandwidth_gb_s=None,
+        )
+
+    def performance_provenance(self, metrics):
+        del metrics
+        call = self.calls[-1]
+        provenance = dict(PROVENANCE)
+        provenance.update(
+            warmup=call["num_warmup"],
+            iterations=call["num_iterations"],
+            repeats=call["num_repeats"],
+            stabilization_repeats=call["num_stabilization_repeats"],
+            dispatch_mode=call["dispatch_mode"],
+            graph_capture_width=(
+                call["num_iterations"]
+                if call["dispatch_mode"] == "captured_chain"
+                else 0
+            ),
+            graph_replays=(
+                1 if call["dispatch_mode"] == "captured_chain" else 0
+            ),
+            capture_timed=False,
+            mutable_inputs_restored=(
+                call["dispatch_mode"] == "captured_chain"
+            ),
+            profiler_is_diagnostic=False,
+        )
+        return provenance
+
+    def run_core_operator_profile_test_v2(self, **kwargs):
+        metadata = kwargs["data"]["metadata"]
+        self.events.append(
+            (
+                "profile",
+                kwargs["implementation"],
+                metadata["tokens"],
+                metadata["hidden"],
+            )
+        )
+        return {
+            "profile_path": kwargs["trace_file_path"],
+            "provider": kwargs["implementation"],
+            "device": kwargs["device"],
+            "precision": kwargs["precision"].name,
+            "profiled_invocations": kwargs["num_iterations"],
+            "preallocated_invocations": (
+                kwargs["num_warmup"] + kwargs["num_iterations"]
+            ),
+            "dispatch_mode": "eager_prepared_core",
+            "profiler_is_diagnostic": True,
+            "latency_ms": 0.01,
+        }
+
+
+def test_norm_quant_correctness_precedes_identical_eager_and_graph_protocol(
+    tmp_path,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    events = []
+    framework = _NormQuantFakeFramework(tmp_path, events)
+
+    def factory(device, variant, precision):
+        del device
+        return _NormQuantFakeOperator(
+            variant,
+            precision,
+            providers=("provider_a",),
+            events=events,
+        )
+
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=factory,
+    )
+    suite.framework = framework
+    result = suite.run_curve_test(
+        variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+        tokens=[2],
+        hidden_sizes=[],
+        num_warmup=4,
+        num_iterations=6,
+        num_repeats=3,
+        num_stabilization_repeats=2,
+        dispatch_mode="both",
+        plot_results=False,
+    )
+
+    assert [event[0] for event in events] == [
+        "accuracy",
+        "eager_direct",
+        "captured_chain",
+    ]
+    assert len(framework.calls) == 2
+    eager_call, graph_call = framework.calls
+    for key in (
+        "num_warmup",
+        "num_iterations",
+        "num_repeats",
+        "num_stabilization_repeats",
+    ):
+        assert eager_call[key] == graph_call[key]
+    assert eager_call["data"]["metadata"] == graph_call["data"]["metadata"]
+    assert (
+        eager_call["num_iterations"]
+        == graph_call["num_iterations"]
+        == 6
+    )
+    assert {row["status"] for row in result["rows"]} == {"ok"}
+
+
+def test_norm_quant_auto_window_calibrates_after_all_accuracy_and_shares_i(
+    tmp_path,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    events = []
+    framework = _NormQuantFakeFramework(tmp_path, events)
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                providers=("provider_a", "provider_b"),
+                events=events,
+            )
+        ),
+    )
+    suite.framework = framework
+
+    result = suite.run_curve_test(
+        variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+        tokens=[1],
+        hidden_sizes=[],
+        dispatch_mode="both",
+        num_warmup=2,
+        num_iterations=None,
+        num_repeats=5,
+        num_stabilization_repeats=2,
+        plot_results=False,
+    )
+
+    assert [event[0] for event in events[:2]] == ["accuracy", "accuracy"]
+    calibration_calls = [
+        call
+        for call in framework.calls
+        if call["num_repeats"] == 1
+        and call["num_stabilization_repeats"] == 0
+    ]
+    formal_calls = [
+        call
+        for call in framework.calls
+        if call["num_repeats"] == 5
+        and call["num_stabilization_repeats"] == 2
+    ]
+    assert len(calibration_calls) == 4
+    assert len(formal_calls) == 4
+    assert {call["num_iterations"] for call in formal_calls} == {25}
+    assert {
+        (
+            call["data"]["metadata"]["tokens"],
+            call["data"]["metadata"]["hidden"],
+        )
+        for call in formal_calls
+    } == {(1, 7168)}
+    assert {
+        row["calibrated_iterations"] for row in result["rows"]
+    } == {25}
+    assert all(row["calibration_is_diagnostic"] for row in result["rows"])
+
+
+def test_norm_quant_checkpoints_are_distinct_per_provider_and_dispatch(
+    tmp_path,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    events = []
+    framework = _NormQuantFakeFramework(tmp_path, events)
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                providers=("provider_a", "provider_b"),
+                events=events,
+            )
+        ),
+    )
+    suite.framework = framework
+
+    result = suite.run_curve_test(
+        variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+        tokens=[1],
+        hidden_sizes=[],
+        dispatch_mode="both",
+        num_warmup=2,
+        num_iterations=1,
+        num_repeats=1,
+        num_stabilization_repeats=0,
+        plot_results=False,
+    )
+
+    checkpoint_paths = list(result["checkpoint_files"].values())
+    assert len(checkpoint_paths) == 4
+    assert len(set(checkpoint_paths)) == 4
+    assert all(Path(path).is_file() for path in checkpoint_paths)
+    assert all("shard-0-of-1" in Path(path).name for path in checkpoint_paths)
+    assert any("provider-a" in Path(path).name for path in checkpoint_paths)
+    assert any("provider-b" in Path(path).name for path in checkpoint_paths)
+    assert any("eager-direct" in Path(path).name for path in checkpoint_paths)
+    assert any("captured-chain" in Path(path).name for path in checkpoint_paths)
+
+
+def test_norm_quant_capture_failure_is_terminal_and_preserves_error(tmp_path):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    events = []
+    framework = _NormQuantFakeFramework(
+        tmp_path,
+        events,
+        capture_error=RuntimeError("synthetic graph capture exploded"),
+    )
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    suite.framework = framework
+
+    with pytest.raises(RuntimeError, match="unsupported_graph_capture"):
+        suite.run_curve_test(
+            variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+            tokens=[1],
+            hidden_sizes=[],
+            dispatch_mode="both",
+            num_warmup=2,
+            num_iterations=1,
+            num_repeats=1,
+            num_stabilization_repeats=0,
+            plot_results=False,
+        )
+
+    graph_csv = next(tmp_path.glob("*captured-chain*.csv"))
+    with graph_csv.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["status"] == "unsupported_graph_capture"
+    assert "synthetic graph capture exploded" in row["error"]
+    assert row["latency_ms"] == ""
+
+
+def test_norm_quant_graph_provenance_error_is_not_capture_unsupported(
+    tmp_path,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    class ProvenanceFailureFramework(_NormQuantFakeFramework):
+
+        def performance_provenance(self, metrics):
+            if self.calls[-1]["dispatch_mode"] == "captured_chain":
+                raise RuntimeError("synthetic provenance validation error")
+            return super().performance_provenance(metrics)
+
+    events = []
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    suite.framework = ProvenanceFailureFramework(tmp_path, events)
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        suite.run_curve_test(
+            variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+            tokens=[1],
+            hidden_sizes=[],
+            dispatch_mode="both",
+            num_warmup=2,
+            num_iterations=1,
+            num_repeats=1,
+            num_stabilization_repeats=0,
+            plot_results=False,
+        )
+
+    graph_csv = next(tmp_path.glob("*captured-chain*.csv"))
+    with graph_csv.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["status"] == "error"
+    assert "synthetic provenance validation error" in row["error"]
+
+
+def test_norm_quant_capability_failure_is_terminal_with_original_error(
+    tmp_path,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    native_error = RuntimeError("native E4M3 probe returned error 507899")
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="npu:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                providers=(),
+                capability_error=native_error,
+            )
+        ),
+    )
+    suite.framework = _NormQuantFakeFramework(tmp_path, [])
+
+    with pytest.raises(RuntimeError, match="unsupported"):
+        suite.run_curve_test(
+            variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+            tokens=[1],
+            hidden_sizes=[],
+            dispatch_mode="eager",
+            num_warmup=2,
+            num_iterations=1,
+            num_repeats=1,
+            num_stabilization_repeats=0,
+            plot_results=False,
+        )
+
+    checkpoint = next(tmp_path.glob("*.csv"))
+    with checkpoint.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["status"] == "unsupported"
+    assert row["error"] == (
+        "RuntimeError: native E4M3 probe returned error 507899"
+    )
+    assert row["latency_ms"] == ""
+
+
+def test_norm_quant_h20_envelope_retains_winning_provider_per_point():
+    from tests.test_norm_quant import select_h20_best_envelope
+
+    rows = [
+        {
+            "variant": "rms_norm_quant",
+            "precision": "FP8",
+            "dispatch_mode": "eager_direct",
+            "tokens": 1,
+            "hidden": 7168,
+            "provider": "provider_a",
+            "latency_ms": 2.0,
+            "status": "ok",
+            "profiler_is_diagnostic": False,
+        },
+        {
+            "variant": "rms_norm_quant",
+            "precision": "FP8",
+            "dispatch_mode": "eager_direct",
+            "tokens": 1,
+            "hidden": 7168,
+            "provider": "provider_b",
+            "latency_ms": 1.0,
+            "status": "ok",
+            "profiler_is_diagnostic": False,
+        },
+    ]
+
+    envelope = select_h20_best_envelope(rows)
+
+    assert len(envelope) == 1
+    assert envelope[0]["provider"] == "provider_b"
+    assert envelope[0]["winning_provider"] == "provider_b"
+    assert envelope[0]["latency_ms"] == 1.0
+
+
+def test_norm_quant_rejects_profiler_latency_as_formal_latency():
+    from tests.test_norm_quant import validate_formal_latency_rows
+
+    with pytest.raises(ValueError, match="diagnostic"):
+        validate_formal_latency_rows([
+            {
+                "status": "ok",
+                "latency_ms": 0.25,
+                "profiler_is_diagnostic": True,
+            }
+        ])
+
+
+def test_norm_quant_profile_writes_diagnostic_manifest_without_latency(
+    tmp_path,
+):
+    import json
+
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    events = []
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    suite.framework = _NormQuantFakeFramework(tmp_path, events)
+
+    result = suite.run_profile_test(
+        variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+        tokens=[1],
+        hidden=7168,
+        num_warmup=2,
+        num_iterations=3,
+    )
+
+    assert [event[0] for event in events] == ["accuracy", "profile"]
+    assert len(result["manifest_files"]) == 1
+    manifest = json.loads(
+        Path(result["manifest_files"][0]).read_text(encoding="utf-8")
+    )
+    assert manifest["profiler_is_diagnostic"] is True
+    assert manifest["logical_invocation_count"] == 3
+    assert manifest["expected_fused_kernel_count"] == 3
+    assert "latency_ms" not in manifest
+    assert "avg_time_ms" not in manifest
+
+
+def test_norm_quant_artifact_identity_is_collision_safe_and_complete(tmp_path):
+    from tests.test_norm_quant import build_artifact_identity
+
+    kwargs = {
+        "result_dir": tmp_path,
+        "kind": "checkpoint",
+        "precision": "mxfp8",
+        "device": "npu:3",
+        "device_model": "Ascend950PR_0",
+        "variant": "add_rms_norm_dynamic_mx_quant",
+        "provider": "npu_add_dynamic_mx",
+        "dispatch_mode": "captured_chain",
+        "shard_index": 2,
+        "num_shards": 4,
+        "suffix": ".csv",
+    }
+
+    first = build_artifact_identity(**kwargs)
+    second = build_artifact_identity(**kwargs)
+
+    assert first != second
+    identity = first.name
+    for fragment in (
+        "mxfp8",
+        "npu-3",
+        "ascend950pr-0",
+        "add-rms-norm-dynamic-mx-quant",
+        "npu-add-dynamic-mx",
+        "captured-chain",
+        "shard-2-of-4",
+    ):
+        assert fragment in identity
+
+
 def test_add_formal_point_uses_one_v2_call_and_provenance(
     monkeypatch, tmp_path
 ):

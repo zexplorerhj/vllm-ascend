@@ -390,12 +390,18 @@ class NormQuantOperatorTestBase(BaseOperatorTest):
         expected: torch.Tensor,
         *,
         label: str,
+        comparison_mask: Optional[torch.Tensor] = None,
     ) -> None:
         """Require matching sign and at most one E4M3 representable code."""
         actual_bits = actual.contiguous().view(torch.uint8)
         expected_bits = expected.contiguous().view(torch.uint8)
         actual_float = actual.float()
         expected_float = expected.float()
+        if comparison_mask is not None:
+            actual_bits = actual_bits[comparison_mask]
+            expected_bits = expected_bits[comparison_mask]
+            actual_float = actual_float[comparison_mask]
+            expected_float = expected_float[comparison_mask]
         both_zero = (actual_float == 0) & (expected_float == 0)
         sign_mismatch = ((actual_bits ^ expected_bits) & 0x80) != 0
         if bool((sign_mismatch & ~both_zero).any()):
@@ -514,10 +520,40 @@ class NormQuantOperatorTestBase(BaseOperatorTest):
                 quant_values,
                 expected_scale,
             )
+            expected_saturation = expected_codes.float().abs() >= _FP8_MAX
+            observed_saturation = output_codes.abs() >= _FP8_MAX
+            if not torch.equal(expected_saturation, observed_saturation):
+                raise AssertionError(
+                    "dynamic FP8 saturation semantics mismatch"
+                )
+            output_bits = output.contiguous().view(torch.uint8)
+            expected_bits = expected_codes.contiguous().view(torch.uint8)
+            if not torch.equal(
+                output_bits[expected_saturation],
+                expected_bits[expected_saturation],
+            ):
+                raise AssertionError(
+                    "dynamic FP8 saturated codes must match exactly"
+                )
+            zero_rows = (
+                quant_values.abs().amax(dim=-1, keepdim=True) == 0
+            )
+            zero_code_mask = zero_rows.expand_as(output_codes)
+            if not torch.equal(
+                output_bits[zero_code_mask],
+                expected_bits[zero_code_mask],
+            ):
+                raise AssertionError(
+                    "dynamic FP8 zero-row codes must be exactly zero"
+                )
+            tolerant_code_mask = (
+                ~expected_saturation & ~zero_code_mask
+            )
             self._assert_fp8_codes_close(
                 output,
                 expected_codes,
                 label="dynamic FP8 codes",
+                comparison_mask=tolerant_code_mask,
             )
 
         dequantized = self._dequantize_fp8(output, scale)

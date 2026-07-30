@@ -113,6 +113,18 @@ def _dynamic_fake(mode):
         elif mode == "same_dequant_wrong_scale":
             output.copy_((codes.float() / 2.0).to(output.dtype))
             scales.copy_(expected_scales * 2.0)
+        elif mode == "saturated_to_416":
+            tampered = torch.where(
+                codes.float().abs() == 448.0,
+                codes.float().sign() * 416.0,
+                codes.float(),
+            ).to(output.dtype)
+            output.copy_(tampered)
+            scales.copy_(expected_scales)
+        elif mode == "zero_row_min_subnormal":
+            output.copy_(codes)
+            output[0, 0] = torch.tensor(2**-9, dtype=output.dtype)
+            scales.copy_(expected_scales)
         else:
             raise AssertionError(f"unknown fake mode {mode}")
         residual.copy_(residual_out)
@@ -641,3 +653,60 @@ def test_auxiliary_correctness_rejects_unexpected_static_saturation(
 
     with pytest.raises(AssertionError, match="static FP8 saturation"):
         operator.validate_prepared_correctness(data, prepared, result)
+
+
+def test_auxiliary_correctness_rejects_adjacent_dynamic_saturation_code(
+    monkeypatch,
+):
+    operator = _operator(NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8)
+    _patch_prepare(
+        monkeypatch,
+        operator,
+        VLLM_DYNAMIC_ADD,
+        _dynamic_fake("saturated_to_416"),
+    )
+    data = _data(operator)
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        VLLM_DYNAMIC_ADD,
+    )
+    outputs = operator._execute_core_operator(prepared, VLLM_DYNAMIC_ADD)
+    assert bool((outputs[0].float().abs() == 416.0).any())
+    assert not bool((outputs[0].float().abs() == 448.0).any())
+
+    with pytest.raises(AssertionError, match="dynamic FP8 saturation"):
+        operator.validate_prepared_correctness(data, prepared, outputs)
+
+
+def test_auxiliary_correctness_rejects_nonzero_code_on_zero_row(
+    monkeypatch,
+):
+    operator = _operator(NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8)
+    _patch_prepare(
+        monkeypatch,
+        operator,
+        VLLM_DYNAMIC_ADD,
+        _dynamic_fake("zero_row_min_subnormal"),
+    )
+    data = _data(operator)
+    data["x"].zero_()
+    data["residual"].zero_()
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        VLLM_DYNAMIC_ADD,
+    )
+    outputs = operator._execute_core_operator(prepared, VLLM_DYNAMIC_ADD)
+    assert outputs[0][0, 0].float() == 2**-9
+    torch.testing.assert_close(
+        outputs[1],
+        torch.full_like(outputs[1], 1.0 / (448.0 * 512.0)),
+        rtol=0,
+        atol=0,
+    )
+
+    with pytest.raises(AssertionError, match="dynamic FP8 zero-row"):
+        operator.validate_prepared_correctness(data, prepared, outputs)

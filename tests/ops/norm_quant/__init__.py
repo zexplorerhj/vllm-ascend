@@ -2,6 +2,7 @@
 
 from .base import NormQuantOperatorTestBase, NormQuantVariant
 from .cuda_impl import CudaNormQuantOperatorTest
+from .npu_impl import NpuNormQuantOperatorTest
 from operator_test_framework import BaseOperatorTest, PrecisionType
 
 
@@ -13,6 +14,8 @@ def create_norm_quant_operator(
     """Create only a native provider for the requested platform contract."""
     if device.startswith("cuda"):
         return CudaNormQuantOperatorTest(variant, precision)
+    if device.startswith("npu"):
+        return NpuNormQuantOperatorTest(variant, precision)
     raise ValueError(
         f"NormQuant does not support device {device!r} for "
         f"variant={variant.value}, precision={precision.name}"
@@ -23,5 +26,6 @@ __all__ = [
     "CudaNormQuantOperatorTest",
     "NormQuantOperatorTestBase",
     "NormQuantVariant",
+    "NpuNormQuantOperatorTest",
     "create_norm_quant_operator",
 ]

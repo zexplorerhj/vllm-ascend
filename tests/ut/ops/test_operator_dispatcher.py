@@ -316,6 +316,42 @@ def test_norm_quant_cli_rejects_empty_selected_quick_shard(tmp_path):
     assert not list(tmp_path.glob("*.csv"))
 
 
+def test_norm_quant_profile_cli_rejects_empty_selected_shard(tmp_path):
+    completed = subprocess.run(
+        [
+            "python3",
+            str(NORM_QUANT_ENTRY),
+            "--mode",
+            "profile",
+            "--precision",
+            "fp8",
+            "--device",
+            "cuda:0",
+            "--result-dir",
+            str(tmp_path),
+            "--tokens",
+            "1",
+            "--quick",
+            "--shard-index",
+            "3",
+            "--num-shards",
+            "4",
+            "--iterations",
+            "1",
+        ],
+        cwd=OPS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert (
+        "selected zero normquant profile points"
+        in completed.stderr.lower()
+    )
+    assert not list(tmp_path.glob("*profile-manifest*.json"))
+
+
 @pytest.mark.parametrize(
     ("precision", "device"),
     [

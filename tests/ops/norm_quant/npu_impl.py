@@ -612,6 +612,21 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             total += matrix_elements * data["x"].element_size()
         return total
 
+    def _native_input_bytes(self, data: Dict[str, Any]) -> int:
+        """Count tensor bytes passed to the native NPU operator ABI."""
+        x = data["x"]
+        weight = data["weight"]
+        x_bytes = x.numel() * x.element_size()
+        weight_bytes = weight.numel() * weight.element_size()
+        total = x_bytes + weight_bytes
+        if self.is_add_variant:
+            total += x_bytes
+        if self.is_static_variant:
+            total += 2 * weight_bytes
+        if self.variant is NormQuantVariant.RMS_NORM_STATIC_FP8:
+            total += weight_bytes
+        return total
+
     def physical_bytes(
         self,
         data: Dict[str, Any],
@@ -623,7 +638,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             if outputs is None
             else self.observable_output_bytes(outputs)
         )
-        return self._retained_prepared_input_bytes(data) + output_bytes
+        return self._native_input_bytes(data) + output_bytes
 
     @staticmethod
     def _result_tuple(result: Any, expected_arity: int) -> Tuple[Any, ...]:

@@ -29,6 +29,7 @@ from operator_test_framework import (  # noqa: E402
     GraphCaptureUnsupportedError,
     OperatorTestFramework,
     PrecisionType,
+    _is_out_of_memory_error,
     build_curve_selection_provenance,
     build_memory_bounded_fresh_invocation_plan,
     finalize_curve_coverage,
@@ -204,7 +205,7 @@ def _atomic_write_csv(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
-    except Exception:
+    except BaseException:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
@@ -227,7 +228,7 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
-    except Exception:
+    except BaseException:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
@@ -241,8 +242,11 @@ def validate_formal_latency_rows(rows: Iterable[Dict[str, Any]]) -> None:
         if row.get("status") not in SUCCESS_STATUSES:
             continue
         diagnostic = row.get("profiler_is_diagnostic")
-        if diagnostic is True or str(diagnostic).lower() == "true":
-            raise ValueError("diagnostic profiler latency is not formal latency")
+        if diagnostic is not False:
+            raise ValueError(
+                "profiler_is_diagnostic must be exactly False for formal "
+                "latency"
+            )
         latency = row.get("latency_ms")
         if (
             isinstance(latency, bool)
@@ -828,7 +832,15 @@ class NormQuantTestSuite:
         num_stabilization_repeats: int,
     ) -> None:
         def require_equal(field: str, actual: Any, expected: Any) -> None:
-            if actual != expected:
+            if isinstance(expected, bool):
+                exact_type = type(actual) is bool and type(expected) is bool
+            elif isinstance(expected, int):
+                exact_type = type(actual) is int and type(expected) is int
+            elif isinstance(expected, str):
+                exact_type = type(actual) is str and type(expected) is str
+            else:
+                exact_type = type(actual) is type(expected)
+            if not exact_type or actual != expected:
                 raise RuntimeError(
                     f"{field} mismatch: {actual!r} != {expected!r}"
                 )
@@ -866,8 +878,10 @@ class NormQuantTestSuite:
 
         def parse_samples(field: str, count: int) -> List[float]:
             raw = provenance[field]
+            if type(raw) is not str:
+                raise RuntimeError(f"{field} must be an exact JSON string")
             try:
-                values = json.loads(raw) if isinstance(raw, str) else raw
+                values = json.loads(raw)
             except (TypeError, ValueError) as error:
                 raise RuntimeError(f"{field} is not valid JSON") from error
             if not isinstance(values, list) or len(values) != count:
@@ -893,8 +907,8 @@ class NormQuantTestSuite:
             actual: Any,
             expected: Sequence[float],
         ) -> None:
-            if not isinstance(actual, (tuple, list)):
-                raise RuntimeError(f"{field} must be a sample sequence")
+            if type(actual) is not list:
+                raise RuntimeError(f"{field} must be an exact sample list")
             if len(actual) != len(expected):
                 raise RuntimeError(
                     f"{field} must contain exactly {len(expected)} samples"
@@ -1204,17 +1218,21 @@ class NormQuantTestSuite:
             "workspace_allocation_policy",
             "not_audited",
         )
+        if type(provenance["task_queue_enable"]) is not str:
+            raise RuntimeError(
+                "task_queue_enable must be an exact string"
+            )
         require_metric(
             "task_queue_enable",
             "task_queue_enable",
             provenance["task_queue_enable"],
         )
 
-        diagnostic = provenance["profiler_is_diagnostic"]
-        if diagnostic is True or str(diagnostic).lower() == "true":
-            raise RuntimeError(
-                "diagnostic profiler result cannot enter formal latency"
-            )
+        require_equal(
+            "profiler_is_diagnostic",
+            provenance["profiler_is_diagnostic"],
+            False,
+        )
         require_metric(
             "profiler_is_diagnostic",
             "profiler_is_diagnostic",
@@ -1713,9 +1731,14 @@ class NormQuantTestSuite:
                                 provider,
                                 mode,
                             )]
-                            if isinstance(
-                                calibration_error,
-                                GraphCaptureUnsupportedError,
+                            if (
+                                isinstance(
+                                    calibration_error,
+                                    GraphCaptureUnsupportedError,
+                                )
+                                and not _is_out_of_memory_error(
+                                    calibration_error
+                                )
                             ):
                                 row.update(
                                     status="unsupported_graph_capture",
@@ -1760,9 +1783,12 @@ class NormQuantTestSuite:
                                     )
                                 )
                             except Exception as error:
-                                if isinstance(
-                                    error,
-                                    GraphCaptureUnsupportedError,
+                                if (
+                                    isinstance(
+                                        error,
+                                        GraphCaptureUnsupportedError,
+                                    )
+                                    and not _is_out_of_memory_error(error)
                                 ):
                                     row.update(
                                         status="unsupported_graph_capture",
@@ -1984,6 +2010,30 @@ class NormQuantTestSuite:
         if num_iterations <= 0:
             raise ValueError("NormQuant profile iterations must be positive")
         token_values = _validate_positive_ints(tokens, "profile tokens")
+        if (
+            not isinstance(num_shards, int)
+            or isinstance(num_shards, bool)
+            or num_shards <= 0
+        ):
+            raise ValueError("num_shards must be a positive integer")
+        if (
+            not isinstance(shard_index, int)
+            or isinstance(shard_index, bool)
+            or not 0 <= shard_index < num_shards
+        ):
+            raise ValueError(
+                "shard_index must satisfy 0 <= index < num_shards"
+            )
+        selected_tokens = [
+            token_count
+            for point_index, token_count in enumerate(token_values)
+            if point_index % num_shards == shard_index
+        ]
+        if not selected_tokens:
+            raise ValueError(
+                "selected zero NormQuant profile points; choose a shard "
+                "containing at least one requested point"
+            )
         manifest_files: List[str] = []
         failures = []
         for variant in self._normalize_variants(variants):
@@ -2000,9 +2050,7 @@ class NormQuantTestSuite:
                     f"{type(error).__name__}: {error}"
                 )
             for provider in providers:
-                for point_index, token_count in enumerate(token_values):
-                    if point_index % num_shards != shard_index:
-                        continue
+                for token_count in selected_tokens:
                     data = operator.generate_test_data(
                         tokens=token_count,
                         hidden=hidden,

@@ -1132,23 +1132,32 @@ _NPU_PROVIDER_CASES = [
 
 
 @pytest.mark.parametrize(
-    ("variant", "precision", "expected_logical", "expected_physical"),
+    (
+        "variant",
+        "precision",
+        "expected_logical",
+        "expected_physical",
+        "expected_retained",
+    ),
     [
         (
             NormQuantVariant.RMS_NORM_STATIC_FP8,
             PrecisionType.FP8,
             35_844,
             78_848,
+            78_848,
         ),
         (
             NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
             PrecisionType.FP8,
             64_516,
+            93_184,
             107_520,
         ),
         (
             NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8,
             PrecisionType.FP8,
+            64_516,
             64_516,
             78_852,
         ),
@@ -1157,10 +1166,12 @@ _NPU_PROVIDER_CASES = [
             PrecisionType.MXFP8,
             36_064,
             36_064,
+            36_064,
         ),
         (
             NormQuantVariant.RMS_NORM_DYNAMIC_MX,
             PrecisionType.MXFP4,
+            32_480,
             32_480,
             32_480,
         ),
@@ -1168,22 +1179,25 @@ _NPU_PROVIDER_CASES = [
             NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
             PrecisionType.MXFP8,
             64_736,
+            64_736,
             79_072,
         ),
         (
             NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
             PrecisionType.MXFP4,
             61_152,
+            61_152,
             75_488,
         ),
     ],
 )
-def test_npu_950pr_physical_bytes_match_prepared_inputs_and_full_outputs(
+def test_npu_950pr_separates_native_traffic_from_retained_footprint(
     monkeypatch,
     variant,
     precision,
     expected_logical,
     expected_physical,
+    expected_retained,
 ):
     runtime = _FakeNpuRuntime()
     operator = _npu_operator(variant, precision)
@@ -1197,15 +1211,27 @@ def test_npu_950pr_physical_bytes_match_prepared_inputs_and_full_outputs(
         implementation,
     )
     outputs = operator._execute_core_operator(prepared, implementation)
-    prepared_input_bytes = sum(
+    retained_prepared_input_bytes = sum(
         value.numel() * value.element_size()
         for value in prepared.values()
         if isinstance(value, torch.Tensor)
     )
+    native_call = runtime.calls[-1]
+    native_input_bytes = operator.observable_output_bytes(
+        (native_call["args"], native_call["kwargs"])
+    )
     actual_output_bytes = operator.observable_output_bytes(outputs)
 
     assert operator.logical_bytes(data) == expected_logical
-    assert prepared_input_bytes + actual_output_bytes == expected_physical
+    assert (
+        operator._retained_prepared_input_bytes(data)
+        == retained_prepared_input_bytes
+    )
+    assert (
+        retained_prepared_input_bytes + actual_output_bytes
+        == expected_retained
+    )
+    assert native_input_bytes + actual_output_bytes == expected_physical
     assert operator.physical_bytes(data) == expected_physical
     assert operator.physical_bytes(data, outputs) == expected_physical
 

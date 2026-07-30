@@ -148,6 +148,14 @@ PROVENANCE = {
 }
 
 
+class _ExactStringAdversary(str):
+    """Compare equal to str while retaining a distinct runtime type."""
+
+
+class _ExactIntAdversary(int):
+    """Compare equal to int while retaining a distinct runtime type."""
+
+
 class _FakeFramework:
 
     def __init__(self, result_dir, fail=False):
@@ -496,11 +504,13 @@ class _NormQuantFakeFramework(_FakeFramework):
         events,
         *,
         capture_error=None,
+        metrics_mutator=None,
         provenance_mutator=None,
     ):
         super().__init__(result_dir)
         self.events = events
         self.capture_error = capture_error
+        self.metrics_mutator = metrics_mutator
         self.provenance_mutator = provenance_mutator
 
     def run_core_operator_performance_test_v2(self, **kwargs):
@@ -531,7 +541,7 @@ class _NormQuantFakeFramework(_FakeFramework):
             if mode == "captured_chain"
             else invocations
         )
-        return PerformanceMetrics(
+        metrics = PerformanceMetrics(
             avg_time_ms=latency,
             throughput=None,
             precision_type=kwargs["precision"].name,
@@ -631,6 +641,9 @@ class _NormQuantFakeFramework(_FakeFramework):
             mutable_inputs_restored=(mode == "captured_chain"),
             profiler_is_diagnostic=False,
         )
+        if self.metrics_mutator is not None:
+            self.metrics_mutator(metrics)
+        return metrics
 
     def performance_provenance(self, metrics):
         provenance = OperatorTestFramework.performance_provenance(metrics)
@@ -929,6 +942,55 @@ def test_norm_quant_graph_replay_failure_is_an_error_not_capture_unsupported(
     assert "synthetic graph replay/storage failure" in row["error"]
 
 
+def test_norm_quant_capture_wrapper_with_oom_cause_is_execution_error(
+    tmp_path,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    oom = RuntimeError("NPU out of memory")
+    wrapped = GraphCaptureUnsupportedError("graph capture failed")
+    wrapped.__cause__ = oom
+    events = []
+    framework = _NormQuantFakeFramework(
+        tmp_path,
+        events,
+        capture_error=wrapped,
+    )
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    suite.framework = framework
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        suite.run_curve_test(
+            variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+            tokens=[1],
+            hidden_sizes=[],
+            dispatch_mode="graph",
+            num_warmup=2,
+            num_iterations=1,
+            num_repeats=1,
+            num_stabilization_repeats=0,
+            plot_results=False,
+        )
+
+    graph_csv = next(tmp_path.glob("*captured-chain*.csv"))
+    with graph_csv.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["status"] == "error"
+    assert row["graph_status"] == "formal_execution_error"
+    assert "graph capture failed" in row["error"]
+
+
 def test_norm_quant_calibration_capture_failure_retains_capture_type(
     tmp_path,
 ):
@@ -1050,6 +1112,35 @@ def test_norm_quant_graph_provenance_error_is_not_capture_unsupported(
         ("timing_semantics", "capture included"),
         ("dispatch_loop_policy", "python loop"),
         ("total_operator_calls_per_repeat", 4),
+        ("warmup", 2.0),
+        ("iterations", 2.0),
+        ("repeats", 3.0),
+        ("stabilization_repeats", 1.0),
+        ("preallocated_invocations_per_repeat", 4.0),
+        ("input_storage_sets_verified", 2.0),
+        ("output_storage_sets_verified", 2.0),
+        ("graph_capture_width", 2.0),
+        ("graph_replays", True),
+        ("capture_timed", 0),
+        ("mutable_inputs_restored", 1),
+        ("input_reuse_within_repeat", 0),
+        ("input_output_storage_disjoint", 1),
+        ("device_stabilization_timed", 1),
+        ("profiler_is_diagnostic", 0),
+        ("profiler_is_diagnostic", "false"),
+        ("profiler_is_diagnostic", None),
+        (
+            "timing_method",
+            _ExactStringAdversary("device_event_graph_replay"),
+        ),
+        ("input_storage_ptr_count", _ExactIntAdversary(2)),
+        ("repeat_samples_ms", [2.0, 2.0, 2.0]),
+        (
+            "repeat_samples_ms",
+            _ExactStringAdversary("[2.0, 2.0, 2.0]"),
+        ),
+        ("repeat_samples_ms", "[true, 2.0, 2.0]"),
+        ("event_window_samples_ms", "[true, 4.0, 4.0]"),
     ],
 )
 def test_norm_quant_corrupt_graph_provenance_is_terminal_error(
@@ -1100,6 +1191,87 @@ def test_norm_quant_corrupt_graph_provenance_is_terminal_error(
     assert row["status"] == "error"
     assert row["graph_status"] == "formal_validation_error"
     assert field in row["error"]
+
+
+@pytest.mark.parametrize(
+    ("attribute", "bad_value", "provenance_field", "good_value"),
+    [
+        ("warmup_iterations", 2.0, "warmup", 2),
+        ("iterations", 2.0, "iterations", 2),
+        ("repeats", 3.0, "repeats", 3),
+        ("stabilization_repeats", True, "stabilization_repeats", 1),
+        ("preallocated_invocations_per_repeat", 4.0,
+         "preallocated_invocations_per_repeat", 4),
+        ("capture_timed", 0, "capture_timed", False),
+        ("mutable_inputs_restored", 1, "mutable_inputs_restored", True),
+        ("profiler_is_diagnostic", 0, "profiler_is_diagnostic", False),
+        (
+            "timing_method",
+            _ExactStringAdversary("device_event_graph_replay"),
+            "timing_method",
+            "device_event_graph_replay",
+        ),
+        ("task_queue_enable", None, None, None),
+        ("repeat_samples_ms", (2.0, 2.0, 2.0), None, None),
+        ("avg_time_ms", True, None, None),
+        ("repeat_samples_ms", [True, 2.0, 2.0], None, None),
+    ],
+)
+def test_norm_quant_metrics_require_exact_types(
+    tmp_path,
+    attribute,
+    bad_value,
+    provenance_field,
+    good_value,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    def corrupt_metrics(metrics):
+        setattr(metrics, attribute, bad_value)
+
+    def restore_provenance(provenance):
+        if provenance_field is not None:
+            provenance[provenance_field] = good_value
+
+    events = []
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    suite.framework = _NormQuantFakeFramework(
+        tmp_path,
+        events,
+        metrics_mutator=corrupt_metrics,
+        provenance_mutator=restore_provenance,
+    )
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        suite.run_curve_test(
+            variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+            tokens=[1],
+            hidden_sizes=[],
+            dispatch_mode="graph",
+            num_warmup=2,
+            num_iterations=2,
+            num_repeats=3,
+            num_stabilization_repeats=1,
+            plot_results=False,
+        )
+
+    graph_csv = next(tmp_path.glob("*captured-chain*.csv"))
+    with graph_csv.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["status"] == "error"
+    assert row["graph_status"] == "formal_validation_error"
+    assert attribute in row["error"]
 
 
 def test_norm_quant_metrics_counts_must_match_requested_protocol(tmp_path):
@@ -1314,6 +1486,22 @@ def test_norm_quant_rejects_profiler_latency_as_formal_latency():
         ])
 
 
+@pytest.mark.parametrize("diagnostic", [0, 1, "false", None])
+def test_norm_quant_formal_latency_requires_exact_false_diagnostic(
+    diagnostic,
+):
+    from tests.test_norm_quant import validate_formal_latency_rows
+
+    with pytest.raises(ValueError, match="exactly False"):
+        validate_formal_latency_rows([
+            {
+                "status": "ok",
+                "latency_ms": 0.25,
+                "profiler_is_diagnostic": diagnostic,
+            }
+        ])
+
+
 def test_norm_quant_profile_writes_diagnostic_manifest_without_latency(
     tmp_path,
 ):
@@ -1356,6 +1544,36 @@ def test_norm_quant_profile_writes_diagnostic_manifest_without_latency(
     assert "avg_time_ms" not in manifest
 
 
+def test_norm_quant_profile_rejects_empty_selected_shard_before_provider(
+    tmp_path,
+):
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda *args: pytest.fail(
+            "empty profile shard must fail before provider creation"
+        ),
+    )
+    suite.framework = _NormQuantFakeFramework(tmp_path, [])
+
+    with pytest.raises(
+        ValueError,
+        match="selected zero NormQuant profile points",
+    ):
+        suite.run_profile_test(
+            tokens=[1],
+            hidden=7168,
+            num_warmup=2,
+            num_iterations=1,
+            shard_index=3,
+            num_shards=4,
+        )
+
+    assert not list(tmp_path.glob("*profile-manifest*.json"))
+
+
 def test_norm_quant_artifact_identity_is_collision_safe_and_complete(tmp_path):
     from tests.test_norm_quant import build_artifact_identity
 
@@ -1388,6 +1606,38 @@ def test_norm_quant_artifact_identity_is_collision_safe_and_complete(tmp_path):
         "shard-2-of-4",
     ):
         assert fragment in identity
+
+
+@pytest.mark.parametrize("artifact_kind", ["csv", "json"])
+def test_norm_quant_atomic_writer_cleans_tmp_on_keyboard_interrupt(
+    monkeypatch,
+    tmp_path,
+    artifact_kind,
+):
+    import tests.test_norm_quant as norm_quant_entry
+
+    destination = tmp_path / f"checkpoint.{artifact_kind}"
+
+    def interrupt_replace(*args, **kwargs):
+        raise KeyboardInterrupt("synthetic interruption")
+
+    monkeypatch.setattr(norm_quant_entry.os, "replace", interrupt_replace)
+
+    with pytest.raises(KeyboardInterrupt, match="synthetic interruption"):
+        if artifact_kind == "csv":
+            norm_quant_entry._atomic_write_csv(
+                destination,
+                [{"value": 1}],
+                ("value",),
+            )
+        else:
+            norm_quant_entry._atomic_write_json(
+                destination,
+                {"value": 1},
+            )
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
 
 
 def test_add_formal_point_uses_one_v2_call_and_provenance(

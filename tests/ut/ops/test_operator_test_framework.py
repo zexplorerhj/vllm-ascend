@@ -704,6 +704,92 @@ def test_captured_chain_capture_oom_is_not_capture_unsupported(
     assert not isinstance(exc_info.value, GraphCaptureUnsupportedError)
 
 
+@pytest.mark.parametrize(
+    ("message", "chain_attribute", "nested_message"),
+    [
+        ("NPU out of memory", None, None),
+        ("graph capture failed", "__cause__", "NPU out of memory"),
+        (
+            "backend capture failed",
+            "__context__",
+            "CUDA out-of-memory",
+        ),
+    ],
+    ids=("direct", "explicit-cause", "implicit-context"),
+)
+def test_captured_chain_generic_backend_oom_is_re_raised(
+    monkeypatch,
+    tmp_path,
+    message,
+    chain_attribute,
+    nested_message,
+):
+    from operator_test_framework import GraphCaptureUnsupportedError
+
+    expected = RuntimeError(message)
+    if chain_attribute is not None:
+        setattr(
+            expected,
+            chain_attribute,
+            RuntimeError(nested_message),
+        )
+
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(monkeypatch)
+    operator.event_window_active = event_window_active
+
+    def oom_during_capture(*args, **kwargs):
+        raise expected
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        oom_during_capture,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _run_captured_chain(
+            framework,
+            operator,
+            num_iterations=2,
+        )
+
+    assert exc_info.value is expected
+    assert not isinstance(exc_info.value, GraphCaptureUnsupportedError)
+
+
+def test_captured_chain_near_oom_message_is_capture_unsupported(
+    monkeypatch,
+    tmp_path,
+):
+    from operator_test_framework import GraphCaptureUnsupportedError
+
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(monkeypatch)
+    operator.event_window_active = event_window_active
+    expected = RuntimeError("room allocation failure during capture")
+
+    def fail_capture(*args, **kwargs):
+        raise expected
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        fail_capture,
+    )
+
+    with pytest.raises(GraphCaptureUnsupportedError) as exc_info:
+        _run_captured_chain(
+            framework,
+            operator,
+            num_iterations=2,
+        )
+
+    assert exc_info.value.__cause__ is expected
+
+
 def test_mutable_graph_restore_runs_outside_event_window(
     monkeypatch,
     tmp_path,

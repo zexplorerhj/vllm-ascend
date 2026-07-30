@@ -12,6 +12,7 @@ import math
 import numpy as np
 import os
 import pandas as pd
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Union, Callable
@@ -22,6 +23,41 @@ import json
 
 class GraphCaptureUnsupportedError(RuntimeError):
     """The backend rejected graph creation or capture."""
+
+
+_OUT_OF_MEMORY_PATTERN = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:out(?:[ _-]+)of(?:[ _-]+)memory|oom)"
+    r"(?:$|[^a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _is_out_of_memory_error(error: BaseException) -> bool:
+    """Recognize standard and backend OOM errors through causal chains."""
+    pending = [error]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if isinstance(current, (MemoryError, torch.OutOfMemoryError)):
+            return True
+        normalized_name = re.sub(
+            r"[^a-z0-9]",
+            "",
+            type(current).__name__.lower(),
+        )
+        if "outofmemory" in normalized_name:
+            return True
+        if _OUT_OF_MEMORY_PATTERN.search(str(current)):
+            return True
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return False
 
 
 class ProfilerBackend(Enum):
@@ -2019,9 +2055,9 @@ class OperatorTestFramework:
                                 device,
                             )
                         )
-                    except (MemoryError, torch.OutOfMemoryError):
-                        raise
                     except Exception as error:
+                        if _is_out_of_memory_error(error):
+                            raise
                         raise GraphCaptureUnsupportedError(
                             f"graph capture is unsupported: {error}"
                         ) from error

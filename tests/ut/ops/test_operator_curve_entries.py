@@ -685,22 +685,27 @@ def test_memory_bounded_plan_rejects_unsatisfiable_hard_limit(
         )
 
 
-def test_linear_quantized_formal_grid_has_34_unique_ascending_points():
+def test_linear_quantized_formal_grid_has_39_unique_ascending_points():
     assert LINEAR_QUANTIZED_FORMAL_SIZES == [
         *range(256, 4096 + 1, 128),
+        5120,
+        6144,
+        7168,
         8192,
+        12288,
         16384,
+        24576,
         32768,
     ]
-    assert len(LINEAR_QUANTIZED_FORMAL_SIZES) == 34
-    assert len(set(LINEAR_QUANTIZED_FORMAL_SIZES)) == 34
+    assert len(LINEAR_QUANTIZED_FORMAL_SIZES) == 39
+    assert len(set(LINEAR_QUANTIZED_FORMAL_SIZES)) == 39
     assert LINEAR_QUANTIZED_FORMAL_SIZES == sorted(
         LINEAR_QUANTIZED_FORMAL_SIZES
     )
 
 
 @pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-def test_linear_quantized_default_selects_complete_34_point_formal_grid(
+def test_linear_quantized_default_selects_complete_39_point_formal_grid(
     monkeypatch,
     tmp_path,
     precision,
@@ -735,15 +740,15 @@ def test_linear_quantized_default_selects_complete_34_point_formal_grid(
         result["rows"],
         mode="full_formal_shape_matrix",
         source="default_formal",
-        total=34,
-        requested=34,
-        selected=34,
+        total=39,
+        requested=39,
+        selected=39,
         selection_complete=True,
         complete=True,
     )
 
 
-def test_linear_quantized_quick_selects_first_of_34_formal_points(
+def test_linear_quantized_quick_selects_first_of_39_formal_points(
     monkeypatch,
     tmp_path,
 ):
@@ -769,15 +774,15 @@ def test_linear_quantized_quick_selects_first_of_34_formal_points(
         result["rows"],
         mode="quick_shape_subset",
         source="default_formal",
-        total=34,
-        requested=34,
+        total=39,
+        requested=39,
         selected=1,
         selection_complete=False,
         complete=False,
     )
 
 
-def test_linear_quantized_shard_selects_from_34_point_formal_grid(
+def test_linear_quantized_shard_selects_from_39_point_formal_grid(
     monkeypatch,
     tmp_path,
 ):
@@ -802,22 +807,22 @@ def test_linear_quantized_shard_selects_from_34_point_formal_grid(
         call["data"]["batch_size"] for call in framework.calls
     ] == LINEAR_QUANTIZED_FORMAL_SIZES[1::4]
     assert [row["point_index"] for row in result["rows"]] == list(
-        range(1, 34, 4)
+        range(1, 39, 4)
     )
     _assert_coverage(
         result["rows"],
         mode="formal_shape_shard",
         source="default_formal",
-        total=34,
-        requested=34,
-        selected=9,
+        total=39,
+        requested=39,
+        selected=10,
         selection_complete=False,
         complete=False,
     )
 
 
 @pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-def test_linear_quantized_large_points_share_mxfp8_bounded_invocation_plan(
+def test_linear_quantized_large_shapes_share_mxfp8_bounded_invocation_plan(
     monkeypatch,
     tmp_path,
     precision,
@@ -834,7 +839,7 @@ def test_linear_quantized_large_points_share_mxfp8_bounded_invocation_plan(
     )
 
     result = suite.run_tflops_test(
-        sizes=[8192, 16384, 32768],
+        sizes=[5120, 6144, 7168, 8192, 12288, 16384, 24576, 32768],
         device="npu:0",
         num_warmup=10,
         num_iterations=None,
@@ -845,11 +850,29 @@ def test_linear_quantized_large_points_share_mxfp8_bounded_invocation_plan(
     assert [
         (call["num_warmup"], call["num_iterations"])
         for call in framework.calls
-    ] == [(10, 50), (7, 32), (2, 7)]
+    ] == [
+        (10, 50),
+        (10, 50),
+        (10, 50),
+        (10, 50),
+        (10, 50),
+        (7, 32),
+        (3, 14),
+        (2, 7),
+    ]
     assert [
         row["estimated_unique_bytes_per_invocation"]
         for row in result["rows"]
-    ] == [272_629_760, 1_090_519_040, 4_362_076_160]
+    ] == [
+        106_496_000,
+        153_354_240,
+        208_732_160,
+        272_629_760,
+        613_416_960,
+        1_090_519_040,
+        2_453_667_840,
+        4_362_076_160,
+    ]
     assert all(
         row["estimated_fresh_storage_bytes_per_repeat"]
         <= 40 * 1024**3

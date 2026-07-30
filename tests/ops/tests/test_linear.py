@@ -27,8 +27,13 @@ from linear.linear_operator import LinearOperatorTest
 LINEAR_BASE_ITERATIONS = 50
 LINEAR_QUANTIZED_FORMAL_SIZES = [
     *range(256, 4096 + 1, 128),
+    5120,
+    6144,
+    7168,
     8192,
+    12288,
     16384,
+    24576,
     32768,
 ]
 LINEAR_FRESH_STORAGE_HARD_LIMIT_BYTES = 40 * 1024**3

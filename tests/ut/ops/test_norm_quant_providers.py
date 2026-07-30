@@ -813,6 +813,10 @@ def _fake_rms_values(x, gamma, epsilon, residual=None):
     )
 
 
+def _fake_optional_beta(values, beta):
+    return values if beta is None else values + beta.float()
+
+
 def _fake_dynamic_fp8(values):
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     scale = (
@@ -864,15 +868,29 @@ def _fake_mx_quant(values, dst_type):
     return packed, scale_bytes
 
 
+class _FakeNpuApi:
+    def __init__(self, synchronize_failure=None):
+        self.synchronize_failure = synchronize_failure
+        self.synchronize_calls = []
+
+    @staticmethod
+    def get_device_name(index):
+        del index
+        return "Ascend950PR_957b"
+
+    def synchronize(self, device_index):
+        self.synchronize_calls.append(device_index)
+        if self.synchronize_failure is not None:
+            raise self.synchronize_failure
+
+
 class _FakeNpuRuntime:
     __version__ = "2.10.0.post1.dev20260528"
     float4_e2m1fn_x2 = 296
     float8_e8m0fnu = 293
 
-    def __init__(self, *, failure=None):
-        self.npu = SimpleNamespace(
-            get_device_name=lambda index: "Ascend950PR_957b"
-        )
+    def __init__(self, *, failure=None, synchronize_failure=None):
+        self.npu = _FakeNpuApi(synchronize_failure)
         self.calls = []
         self.failure = failure
 
@@ -918,7 +936,10 @@ class _FakeNpuRuntime:
             dst_dtype=dst_dtype,
         )
         assert dst_dtype is torch.float8_e4m3fn
-        values = _fake_rms_values(x, gamma, epsilon) + beta.float()
+        values = _fake_optional_beta(
+            _fake_rms_values(x, gamma, epsilon),
+            beta,
+        )
         return (values * scale.float() + offset.float()).to(dst_dtype)
 
     def npu_add_rms_norm_quant(
@@ -943,9 +964,10 @@ class _FakeNpuRuntime:
             epsilon=epsilon, div_mode=div_mode, dst_type=dst_type,
         )
         assert dst_type == 292
-        values = _fake_rms_values(
-            x1, gamma, epsilon, residual=x2
-        ) + beta.float()
+        values = _fake_optional_beta(
+            _fake_rms_values(x1, gamma, epsilon, residual=x2),
+            beta,
+        )
         y1 = (values * scales1.float() + zero_points1.float()).to(
             torch.float8_e4m3fn
         )
@@ -974,9 +996,10 @@ class _FakeNpuRuntime:
             beta=beta, epsilon=epsilon, output_mask=list(output_mask),
             y_dtype=y_dtype,
         )
-        values = _fake_rms_values(
-            x1, gamma, epsilon, residual=x2
-        ) + beta.float()
+        values = _fake_optional_beta(
+            _fake_rms_values(x1, gamma, epsilon, residual=x2),
+            beta,
+        )
         y1, scale1 = _fake_dynamic_fp8(
             values.to(torch.bfloat16).float()
         )
@@ -1004,7 +1027,10 @@ class _FakeNpuRuntime:
             epsilon=epsilon, scale_alg=scale_alg, round_mode=round_mode,
             dst_type=dst_type,
         )
-        values = _fake_rms_values(x, gamma, epsilon) + beta.float()
+        values = _fake_optional_beta(
+            _fake_rms_values(x, gamma, epsilon),
+            beta,
+        )
         quantized, scale = _fake_mx_quant(
             values.to(torch.bfloat16).float(),
             dst_type,
@@ -1028,9 +1054,10 @@ class _FakeNpuRuntime:
             beta=beta, epsilon=epsilon, scale_alg=scale_alg,
             round_mode=round_mode, dst_type=dst_type,
         )
-        values = _fake_rms_values(
-            x1, gamma, epsilon, residual=x2
-        ) + beta.float()
+        values = _fake_optional_beta(
+            _fake_rms_values(x1, gamma, epsilon, residual=x2),
+            beta,
+        )
         quantized, scale = _fake_mx_quant(
             values.to(torch.bfloat16).float(),
             dst_type,
@@ -1157,6 +1184,8 @@ def test_npu_950pr_gate_rejects_nonexact_prefix(
     )
 
     assert operator.get_formal_implementations("npu:0") == []
+    assert isinstance(operator.capability_error, RuntimeError)
+    assert "Ascend950PR" in str(operator.capability_error)
 
 
 @pytest.mark.parametrize(
@@ -1191,6 +1220,11 @@ def test_npu_formal_gate_rejects_missing_symbol_schema_or_return_arity(
     _patch_npu_runtime(monkeypatch, operator, runtime, **ops_kwargs)
 
     assert operator.get_formal_implementations("npu:0") == []
+    assert isinstance(operator.capability_error, RuntimeError)
+    expected_error = (
+        "runtime symbol" if mutation == "missing_symbol" else "schema"
+    )
+    assert expected_error in str(operator.capability_error)
 
 
 def test_npu_formal_gate_rejects_missing_e4m3_dtype(monkeypatch):
@@ -1208,6 +1242,60 @@ def test_npu_formal_gate_rejects_missing_e4m3_dtype(monkeypatch):
     )
 
     assert operator.get_formal_implementations("npu:0") == []
+    assert isinstance(operator.capability_error, RuntimeError)
+    assert "dtype" in str(operator.capability_error)
+
+
+def test_npu_non_npu_device_sets_current_capability_error(monkeypatch):
+    operator = _npu_operator(
+        NormQuantVariant.RMS_NORM_STATIC_FP8,
+        PrecisionType.FP8,
+    )
+    runtime = _FakeNpuRuntime()
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+
+    assert operator.get_formal_implementations("cuda:0") == []
+    assert isinstance(operator.capability_error, RuntimeError)
+    assert "NPU device" in str(operator.capability_error)
+
+
+def test_npu_runtime_import_failure_preserves_original_error(monkeypatch):
+    runtime_error = RuntimeError("torch_npu shared library failed to load")
+    operator = _npu_operator(
+        NormQuantVariant.RMS_NORM_STATIC_FP8,
+        PrecisionType.FP8,
+    )
+
+    def raise_runtime_error():
+        raise runtime_error
+
+    monkeypatch.setattr(operator, "_load_torch_npu", raise_runtime_error)
+
+    assert operator.get_formal_implementations("npu:0") == []
+    assert operator.capability_error is runtime_error
+
+
+def test_npu_gate_error_replaces_stale_probe_error(monkeypatch):
+    probe_error = RuntimeError("asynchronous probe failure")
+    runtime = _FakeNpuRuntime(synchronize_failure=probe_error)
+    operator = _npu_operator(
+        NormQuantVariant.RMS_NORM_STATIC_FP8,
+        PrecisionType.FP8,
+    )
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+
+    assert operator.get_formal_implementations("npu:0") == []
+    assert operator.capability_error is probe_error
+
+    monkeypatch.setattr(
+        operator,
+        "_npu_device_name",
+        lambda device: "Ascend910C",
+    )
+    assert operator.get_formal_implementations("npu:0") == []
+    assert operator.capability_error is not probe_error
+    assert isinstance(operator.capability_error, RuntimeError)
+    assert "Ascend950PR" in str(operator.capability_error)
 
 
 def test_npu_capability_probe_is_instance_cached_by_runtime_key(
@@ -1224,6 +1312,7 @@ def test_npu_capability_probe_is_instance_cached_by_runtime_key(
     calls_after_first = len(runtime.calls)
     assert operator.get_formal_implementations("npu:1")
     assert len(runtime.calls) == calls_after_first
+    assert runtime.npu.synchronize_calls == [1]
     assert list(operator._capability_cache) == [
         (
             "npu:1",
@@ -1232,6 +1321,36 @@ def test_npu_capability_probe_is_instance_cached_by_runtime_key(
             292,
         )
     ]
+
+
+def test_npu_probe_caches_original_asynchronous_failure(monkeypatch):
+    asynchronous_error = RuntimeError("asynchronous E4M3 launch failed")
+    runtime = _FakeNpuRuntime(
+        synchronize_failure=asynchronous_error,
+    )
+    operator = _npu_operator(
+        NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+        PrecisionType.FP8,
+    )
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+
+    assert operator.get_formal_implementations("npu:2") == []
+    assert operator.capability_error is asynchronous_error
+    assert runtime.npu.synchronize_calls == [2]
+    assert len(runtime.calls) == 1
+    cached = next(iter(operator._capability_cache.values()))
+    assert not cached.supported
+    assert cached.error is asynchronous_error
+
+    assert operator.get_formal_implementations("npu:2") == []
+    assert operator.capability_error is asynchronous_error
+    assert runtime.npu.synchronize_calls == [2]
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0]["kwargs"]["dst_type"] == 292
+    assert all(
+        call["kwargs"].get("dst_type") not in (torch.int8, torch.qint8)
+        for call in runtime.calls
+    )
 
 
 def test_npu_probe_failure_preserves_original_error_without_int8_fallback(
@@ -1383,21 +1502,44 @@ def test_npu_native_calls_follow_950pr_abi_snapshot(
     elif variant is NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8:
         expected_kwargs = {
             "smooth_scale1": None, "smooth_scale2": None,
-            "epsilon": 1e-6, "output_mask": [True, False],
+            "beta": None, "epsilon": 1e-6,
+            "output_mask": [True, False],
             "y_dtype": torch.float8_e4m3fn,
         }
     else:
         expected_kwargs = {
-            "epsilon": 1e-6, "scale_alg": 0, "round_mode": "rint",
+            "beta": None, "epsilon": 1e-6, "scale_alg": 0,
+            "round_mode": "rint",
             "dst_type": 296 if precision is PrecisionType.MXFP4 else 292,
         }
-    assert call["kwargs"] | expected_kwargs == call["kwargs"]
-    for name, value in expected_kwargs.items():
-        assert call["kwargs"][name] is value or call["kwargs"][name] == value
-    if "beta" in call["kwargs"]:
-        assert call["kwargs"]["beta"] is prepared["beta"]
-    elif variant is not NormQuantVariant.RMS_NORM_STATIC_FP8:
-        assert call["args"][5] is prepared["beta"]
+    assert call["kwargs"] == expected_kwargs
+
+    args = call["args"]
+    assert args[0] is prepared["x"]
+    if variant is NormQuantVariant.RMS_NORM_STATIC_FP8:
+        assert args[1] is prepared["weight"]
+        assert args[2] is prepared["beta"]
+        assert args[3] is prepared["scale"]
+        assert args[4] is prepared["offset"]
+        assert args[5] == prepared["eps"]
+    elif variant is NormQuantVariant.ADD_RMS_NORM_STATIC_FP8:
+        assert args[1] is prepared["residual"]
+        assert args[2] is prepared["weight"]
+        assert args[3] is prepared["scale"]
+        assert args[4] is prepared["offset"]
+        assert args[5:] == (None, None, None)
+        assert "beta" not in prepared
+    elif variant is NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8:
+        assert args[1] is prepared["residual"]
+        assert args[2] is prepared["weight"]
+        assert "beta" not in prepared
+    elif variant is NormQuantVariant.RMS_NORM_DYNAMIC_MX:
+        assert args[1] is prepared["weight"]
+        assert "beta" not in prepared
+    else:
+        assert args[1] is prepared["residual"]
+        assert args[2] is prepared["weight"]
+        assert "beta" not in prepared
 
 
 @pytest.mark.parametrize(

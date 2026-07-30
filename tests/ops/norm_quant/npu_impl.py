@@ -120,6 +120,16 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
     def capability_error(self) -> Optional[BaseException]:
         return self._capability_error
 
+    def _reject_formal(
+        self,
+        message: str,
+        error: Optional[BaseException] = None,
+    ) -> List[str]:
+        self._capability_error = (
+            error if error is not None else RuntimeError(message)
+        )
+        return []
+
     @staticmethod
     def _load_torch_npu():
         try:
@@ -282,11 +292,6 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             device=device,
             dtype=torch.bfloat16,
         )
-        beta = self._copy_to_device(
-            torch.zeros(64, dtype=torch.bfloat16),
-            device=device,
-            dtype=torch.bfloat16,
-        )
         prepared = {
             "implementation": self._PROVIDERS[
                 (self.variant, self.precision)
@@ -294,11 +299,16 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             "op": op,
             "x": x,
             "weight": gamma,
-            "beta": beta,
             "eps": 1e-6,
             "scale": torch.ones_like(gamma),
             "offset": torch.zeros_like(gamma),
         }
+        if self.variant is NormQuantVariant.RMS_NORM_STATIC_FP8:
+            prepared["beta"] = self._copy_to_device(
+                torch.zeros(64, dtype=torch.bfloat16),
+                device=device,
+                dtype=torch.bfloat16,
+            )
         if self.is_add_variant:
             prepared["residual"] = torch.zeros_like(x)
         return prepared
@@ -322,6 +332,12 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 self._probe_payload(device, op)
             )
             self._validate_probe_outputs(result)
+            synchronize = getattr(runtime.npu, "synchronize", None)
+            if not callable(synchronize):
+                raise RuntimeError(
+                    "torch_npu.npu.synchronize is unavailable"
+                )
+            synchronize(self._device_index(device))
             probe_result = CapabilityResult(True)
         except Exception as error:
             probe_result = CapabilityResult(False, error)
@@ -330,25 +346,38 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         return probe_result
 
     def get_formal_implementations(self, device: str) -> List[str]:
-        if (
-            not device.startswith("npu")
-            or not (self._npu_device_name(device) or "").startswith(
-                "Ascend950PR"
+        if not device.startswith("npu"):
+            return self._reject_formal(
+                f"{self.operator_name} requires an NPU device; got {device}"
             )
-        ):
-            return []
         try:
             runtime = self._load_torch_npu()
-        except RuntimeError:
-            return []
+        except RuntimeError as error:
+            return self._reject_formal(
+                "torch_npu runtime is unavailable",
+                error,
+            )
+        device_name = self._npu_device_name(device)
+        if not (device_name or "").startswith("Ascend950PR"):
+            return self._reject_formal(
+                f"{self.operator_name} requires a device name beginning "
+                f"'Ascend950PR'; got {device_name!r}"
+            )
         implementation = self._PROVIDERS[(self.variant, self.precision)]
         native_op = self._NATIVE_OPS[implementation]
-        if (
-            not callable(getattr(runtime, native_op, None))
-            or not self._schema_supported(native_op)
-            or not self._runtime_dtype_supported(runtime)
-        ):
-            return []
+        if not callable(getattr(runtime, native_op, None)):
+            return self._reject_formal(
+                f"torch_npu runtime symbol {native_op} is unavailable"
+            )
+        if not self._schema_supported(native_op):
+            return self._reject_formal(
+                f"torch.ops.npu.{native_op} schema does not satisfy "
+                "the captured 950PR ABI"
+            )
+        if not self._runtime_dtype_supported(runtime):
+            return self._reject_formal(
+                f"{implementation} required native dtype is unavailable"
+            )
         capability = self._probe_capability(
             device,
             runtime,
@@ -380,13 +409,12 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         op = prepared_data["op"]
         x = prepared_data["x"]
         gamma = prepared_data["weight"]
-        beta = prepared_data["beta"]
         eps = prepared_data["eps"]
         if implementation == self.RMS_STATIC_FP8:
             return op(
                 x,
                 gamma,
-                beta,
+                prepared_data["beta"],
                 prepared_data["scale"],
                 prepared_data["offset"],
                 eps,
@@ -399,7 +427,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 gamma,
                 prepared_data["scale"],
                 prepared_data["offset"],
-                beta,
+                None,
                 None,
                 None,
                 axis=-1,
@@ -414,13 +442,13 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 gamma,
                 smooth_scale1=None,
                 smooth_scale2=None,
-                beta=beta,
+                beta=None,
                 epsilon=eps,
                 output_mask=[True, False],
                 y_dtype=self._fp8_dtype(),
             )
         kwargs = {
-            "beta": beta,
+            "beta": None,
             "epsilon": eps,
             "scale_alg": 0,
             "round_mode": "rint",
@@ -484,11 +512,6 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             device=device,
             dtype=torch.bfloat16,
         )
-        beta = self._copy_to_device(
-            torch.zeros_like(weight_source),
-            device=device,
-            dtype=torch.bfloat16,
-        )
         prepared: Dict[str, Any] = {
             "implementation": resolved,
             "op": op,
@@ -496,9 +519,14 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             "device": device,
             "x": x,
             "weight": weight,
-            "beta": beta,
             "eps": float(data["eps"]),
         }
+        if resolved == self.RMS_STATIC_FP8:
+            prepared["beta"] = self._copy_to_device(
+                torch.zeros_like(weight_source),
+                device=device,
+                dtype=torch.bfloat16,
+            )
         if self.is_static_variant:
             prepared["scale"] = self._copy_to_device(
                 torch.ones_like(weight_source),

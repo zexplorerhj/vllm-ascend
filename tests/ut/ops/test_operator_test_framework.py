@@ -13,10 +13,12 @@
 #
 
 from contextlib import contextmanager, nullcontext
-from dataclasses import fields
+from dataclasses import asdict, fields
 import gc
+import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import weakref
 
 import pytest
@@ -242,6 +244,28 @@ class _PreparedProfileOperator(_FreshCpuOperator):
         return super()._execute_core_operator(prepared, implementation)
 
 
+class _MutableGraphOperator(_PreparedProfileOperator):
+
+    def __init__(self):
+        super().__init__()
+        self.restore_log = []
+        self.event_window_active = None
+
+    def _restore_mutable_graph_inputs(
+        self,
+        prepared_payloads,
+        implementation="default",
+    ):
+        del prepared_payloads, implementation
+        assert self.event_window_active is not None
+        assert self.event_window_active[0] is False
+        self.restore_log.append(
+            "after_capture"
+            if not self.restore_log
+            else "before_measured_replay"
+        )
+
+
 class _FakeProfiler:
 
     def __init__(self, operator):
@@ -351,6 +375,523 @@ class _DirectRepeatLifetimeOperator(_PreallocatedOutputOperator):
 
 def _framework(tmp_path):
     return OperatorTestFramework(result_dir=str(tmp_path / "results"))
+
+
+def _install_cpu_backed_cuda(monkeypatch, elapsed_ms=12.0):
+    event_window_active = [False]
+    original_storage_ptrs = OperatorTestFramework._device_storage_ptrs
+
+    def prepare_on_cpu(
+        self,
+        data,
+        device,
+        precision,
+        implementation="default",
+    ):
+        del device, implementation
+        self.prepare_calls += 1
+        return {
+            "x": data["x"].to(dtype=precision.value).clone(),
+        }
+
+    def cpu_backed_cuda_storage_ptrs(value, device_type):
+        if device_type == "cuda":
+            device_type = "cpu"
+        return original_storage_ptrs(value, device_type)
+
+    class FakeEvent:
+
+        created = 0
+
+        def __init__(self, enable_timing):
+            assert enable_timing is True
+            self.index = FakeEvent.created
+            FakeEvent.created += 1
+
+        def record(self):
+            event_window_active[0] = self.index % 2 == 0
+
+        def synchronize(self):
+            assert self.index % 2 == 1
+            event_window_active[0] = False
+
+        def elapsed_time(self, end_event):
+            assert self.index % 2 == 0
+            assert end_event.index == self.index + 1
+            return elapsed_ms
+
+    monkeypatch.setattr(
+        OperatorTestFramework,
+        "_device_storage_ptrs",
+        staticmethod(cpu_backed_cuda_storage_ptrs),
+    )
+    monkeypatch.setattr(
+        _FreshCpuOperator,
+        "_prepare_data_for_core_operator",
+        prepare_on_cpu,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    return event_window_active
+
+
+def _run_captured_chain(
+    framework,
+    operator,
+    *,
+    num_warmup=0,
+    num_iterations=2,
+    num_repeats=1,
+    retain_outputs=True,
+    verify_independent_storage=False,
+):
+    return framework.run_core_operator_performance_test_v2(
+        operator_test=operator,
+        data=operator.generate_test_data(),
+        device="cuda:0",
+        precision=PrecisionType.FP32,
+        num_warmup=num_warmup,
+        num_iterations=num_iterations,
+        num_repeats=num_repeats,
+        dispatch_mode="captured_chain",
+        retain_outputs=retain_outputs,
+        verify_independent_storage=verify_independent_storage,
+    )
+
+
+def test_captured_chain_times_one_replay_of_independent_payloads(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(
+        monkeypatch,
+        elapsed_ms=12.0,
+    )
+    operator.event_window_active = event_window_active
+    captured_payload_ids = []
+    captured_storage_ptrs = []
+    replay_calls = 0
+
+    def capture(
+        prepared_payloads,
+        execute_core_operator,
+        implementation,
+        device,
+    ):
+        del device
+        captured_payload_ids.extend(
+            payload["payload_id"] for payload in prepared_payloads
+        )
+        captured_storage_ptrs.extend(
+            payload["x"].untyped_storage().data_ptr()
+            for payload in prepared_payloads
+        )
+        retained_outputs = [
+            execute_core_operator(payload, implementation)
+            for payload in prepared_payloads
+        ]
+
+        def replay():
+            nonlocal replay_calls
+            assert event_window_active[0] is True
+            assert all(output is not None for output in retained_outputs)
+            replay_calls += 1
+
+        return SimpleNamespace(
+            replay=replay,
+            retained_outputs=retained_outputs,
+            logical_invocations=len(prepared_payloads),
+        )
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        capture,
+    )
+
+    num_iterations = 3
+    metrics = _run_captured_chain(
+        framework,
+        operator,
+        num_iterations=num_iterations,
+        retain_outputs=True,
+        verify_independent_storage=True,
+    )
+
+    assert captured_payload_ids == list(range(num_iterations))
+    assert len(set(captured_storage_ptrs)) == num_iterations
+    assert replay_calls == 1
+    assert operator.restore_log == [
+        "after_capture",
+        "before_measured_replay",
+    ]
+    assert metrics.avg_time_ms == 12.0 / num_iterations
+    assert metrics.dispatch_mode == "captured_chain"
+    assert metrics.graph_capture_width == num_iterations
+    assert metrics.capture_timed is False
+    assert metrics.mutable_inputs_restored is True
+    assert metrics.graph_replays == 1
+    assert metrics.profiler_is_diagnostic is False
+    provenance = framework.performance_provenance(metrics)
+    assert provenance["timing_method"] == "device_event_graph_replay"
+    assert provenance["timing_semantics"] == (
+        "device elapsed time; capture and mutable restore excluded"
+    )
+    assert provenance["dispatch_loop_policy"] == (
+        "captured_prepared_payload_chain_single_replay"
+    )
+    assert provenance["timed_region"] == (
+        "one graph replay containing I independent core invocations"
+    )
+    assert provenance["timed_output_capture_policy"] == (
+        "capture_returns_retained_outside_timed_replay"
+    )
+    assert provenance["output_storage_policy"] == (
+        "capture_outputs_retained_until_repeat_end"
+    )
+
+
+def test_graph_dispatch_rejects_invalid_mode_before_preparation(tmp_path):
+    framework = _framework(tmp_path)
+    operator = _FreshCpuOperator()
+
+    with pytest.raises(ValueError, match="dispatch_mode"):
+        framework.run_core_operator_performance_test_v2(
+            operator_test=operator,
+            data=operator.generate_test_data(),
+            device="cpu",
+            precision=PrecisionType.FP32,
+            num_warmup=0,
+            num_iterations=1,
+            dispatch_mode="eager",
+        )
+
+    assert operator.prepare_calls == 0
+
+
+def test_captured_chain_propagates_capture_failure_without_eager_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(monkeypatch)
+    operator.event_window_active = event_window_active
+
+    class CaptureFailure(RuntimeError):
+        pass
+
+    expected = CaptureFailure("capture refused")
+
+    def fail_capture(*args, **kwargs):
+        raise expected
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        fail_capture,
+    )
+    monkeypatch.setattr(
+        framework,
+        "_measure_execution_time_v2",
+        lambda *args, **kwargs: pytest.fail("must not fall back to eager"),
+    )
+
+    with pytest.raises(CaptureFailure, match="capture refused") as exc_info:
+        _run_captured_chain(
+            framework,
+            operator,
+            num_warmup=1,
+            num_iterations=2,
+        )
+
+    assert exc_info.value is expected
+
+
+def test_mutable_graph_restore_runs_outside_event_window(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(monkeypatch)
+    operator.event_window_active = event_window_active
+    timeline = []
+
+    def capture(
+        prepared_payloads,
+        execute_core_operator,
+        implementation,
+        device,
+    ):
+        del device
+        outputs = [
+            execute_core_operator(payload, implementation)
+            for payload in prepared_payloads
+        ]
+
+        def replay():
+            assert event_window_active[0] is True
+            timeline.append("replay")
+
+        return SimpleNamespace(
+            replay=replay,
+            retained_outputs=outputs,
+            logical_invocations=len(prepared_payloads),
+        )
+
+    original_restore = operator._restore_mutable_graph_inputs
+
+    def restore(prepared_payloads, implementation="default"):
+        original_restore(prepared_payloads, implementation)
+        timeline.append("restore")
+
+    monkeypatch.setattr(
+        operator,
+        "_restore_mutable_graph_inputs",
+        restore,
+    )
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        capture,
+    )
+
+    _run_captured_chain(
+        framework,
+        operator,
+        num_iterations=2,
+    )
+
+    assert timeline == ["restore", "restore", "replay"]
+
+
+def test_captured_chain_retains_capture_outputs_through_replay(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(monkeypatch)
+    operator.event_window_active = event_window_active
+    capture_output_refs = []
+
+    def capture(
+        prepared_payloads,
+        execute_core_operator,
+        implementation,
+        device,
+    ):
+        del device
+        outputs = [
+            execute_core_operator(payload, implementation)
+            for payload in prepared_payloads
+        ]
+        capture_output_refs.extend(weakref.ref(output) for output in outputs)
+
+        def replay():
+            gc.collect()
+            assert all(ref() is not None for ref in capture_output_refs)
+
+        return SimpleNamespace(
+            replay=replay,
+            retained_outputs=outputs,
+            logical_invocations=len(prepared_payloads),
+        )
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        capture,
+    )
+
+    _run_captured_chain(
+        framework,
+        operator,
+        num_iterations=2,
+        retain_outputs=False,
+    )
+
+    assert len(capture_output_refs) == 2
+
+
+def test_captured_chain_builds_fresh_payloads_and_graph_each_repeat(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(
+        monkeypatch,
+        elapsed_ms=6.0,
+    )
+    operator.event_window_active = event_window_active
+    captured_id_groups = []
+    captured_pointer_groups = []
+    captured_chains = []
+    payload_refs = []
+    prior_payloads_alive_at_capture = []
+
+    def capture(
+        prepared_payloads,
+        execute_core_operator,
+        implementation,
+        device,
+    ):
+        del device
+        gc.collect()
+        prior_payloads_alive_at_capture.append(
+            sum(ref() is not None for ref in payload_refs)
+        )
+        captured_id_groups.append([
+            payload["payload_id"] for payload in prepared_payloads
+        ])
+        captured_pointer_groups.append([
+            payload["x"].untyped_storage().data_ptr()
+            for payload in prepared_payloads
+        ])
+        payload_refs.extend(
+            weakref.ref(payload["x"]) for payload in prepared_payloads
+        )
+        outputs = [
+            execute_core_operator(payload, implementation)
+            for payload in prepared_payloads
+        ]
+        chain = SimpleNamespace(
+            replay=lambda: None,
+            retained_outputs=outputs,
+            logical_invocations=len(prepared_payloads),
+        )
+        captured_chains.append(chain)
+        return chain
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        capture,
+    )
+
+    metrics = _run_captured_chain(
+        framework,
+        operator,
+        num_warmup=1,
+        num_iterations=2,
+        num_repeats=2,
+        verify_independent_storage=True,
+    )
+
+    assert captured_id_groups == [[1, 2], [4, 5]]
+    assert len({id(chain) for chain in captured_chains}) == 2
+    assert all(
+        len(set(pointer_group)) == 2
+        for pointer_group in captured_pointer_groups
+    )
+    assert prior_payloads_alive_at_capture == [0, 0]
+    assert metrics.repeat_samples_ms == [3.0, 3.0]
+
+
+def test_graph_dispatch_default_eager_provenance_is_byte_identical(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+
+    def measure(
+        payloads,
+        execute_core_operator,
+        implementation,
+        device,
+        retained_outputs=None,
+    ):
+        _execute_measurement_payloads(
+            payloads,
+            execute_core_operator,
+            implementation,
+            device,
+            retained_outputs,
+        )
+        return 0.5
+
+    monkeypatch.setattr(
+        framework,
+        "_measure_execution_time_v2",
+        measure,
+    )
+
+    def run(dispatch_mode=None):
+        kwargs = {}
+        if dispatch_mode is not None:
+            kwargs["dispatch_mode"] = dispatch_mode
+        operator = _FreshCpuOperator()
+        metrics = framework.run_core_operator_performance_test_v2(
+            operator_test=operator,
+            data=operator.generate_test_data(),
+            device="cpu",
+            precision=PrecisionType.FP32,
+            num_warmup=1,
+            num_iterations=2,
+            **kwargs,
+        )
+        return json.dumps(
+            {
+                "metrics": asdict(metrics),
+                "provenance": framework.performance_provenance(metrics),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    default_bytes = run()
+    explicit_eager_bytes = run("eager_direct")
+
+    assert default_bytes == explicit_eager_bytes
+    eager = json.loads(default_bytes)
+    assert eager["metrics"]["dispatch_mode"] == "eager_direct"
+    assert eager["metrics"]["graph_capture_width"] == 0
+    assert eager["metrics"]["graph_replays"] == 0
+    assert eager["metrics"]["capture_timed"] is False
+    assert eager["metrics"]["mutable_inputs_restored"] is False
+    assert eager["metrics"]["profiler_is_diagnostic"] is False
+
+
+def test_cuda_graph_dispatch_helper_retains_every_capture_output(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    replay_calls = []
+    graph_entries = []
+
+    class FakeCudaGraph:
+
+        def replay(self):
+            replay_calls.append("replay")
+
+    @contextmanager
+    def fake_graph_context(graph):
+        graph_entries.append(graph)
+        yield
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeCudaGraph)
+    monkeypatch.setattr(torch.cuda, "graph", fake_graph_context)
+
+    payloads = [{"x": torch.tensor([index])} for index in range(3)]
+    chain = framework._capture_prepared_payload_chain_v2(
+        payloads,
+        lambda payload, implementation: payload["x"] + 1,
+        "default",
+        "cuda:0",
+    )
+
+    assert len(graph_entries) == 1
+    assert chain.logical_invocations == 3
+    assert [output.item() for output in chain.retained_outputs] == [1, 2, 3]
+    chain.replay()
+    assert replay_calls == ["replay"]
 
 
 def test_prepared_core_profile_dispatches_only_prepared_core_payloads(
@@ -498,6 +1039,12 @@ def test_performance_metrics_keeps_v4_positional_field_order():
         "stabilization_repeat_samples_ms",
         "input_output_storage_disjoint",
         "stabilization_operator_calls",
+        "dispatch_mode",
+        "graph_capture_width",
+        "graph_replays",
+        "capture_timed",
+        "mutable_inputs_restored",
+        "profiler_is_diagnostic",
     )
 
 
@@ -944,6 +1491,12 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
             "_execute_core_operator plus return slot assignment; "
             "prepare excluded"
         ),
+        "dispatch_mode": "eager_direct",
+        "graph_capture_width": 0,
+        "graph_replays": 0,
+        "capture_timed": False,
+        "mutable_inputs_restored": False,
+        "profiler_is_diagnostic": False,
     }
 
 

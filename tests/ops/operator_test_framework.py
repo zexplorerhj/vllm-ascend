@@ -233,6 +233,12 @@ class PerformanceMetrics:
     )
     input_output_storage_disjoint: bool = False
     stabilization_operator_calls: int = 0
+    dispatch_mode: str = "eager_direct"
+    graph_capture_width: int = 0
+    graph_replays: int = 0
+    capture_timed: bool = False
+    mutable_inputs_restored: bool = False
+    profiler_is_diagnostic: bool = False
     
     def __post_init__(self):
         """初始化后处理，确保throughput_ops_per_sec有值"""
@@ -253,6 +259,13 @@ class PerformanceMetrics:
             result += f"  吞吐量: {self.throughput:.2f} ops/s\n"
         
         return result
+
+
+@dataclass
+class _CapturedPreparedChain:
+    replay: Callable[[], None]
+    retained_outputs: List[Any]
+    logical_invocations: int
 
 
 PERFORMANCE_PROVENANCE_FIELDS = (
@@ -306,6 +319,12 @@ PERFORMANCE_PROVENANCE_FIELDS = (
     "stabilization_operator_calls",
     "task_queue_enable",
     "timed_region",
+    "dispatch_mode",
+    "graph_capture_width",
+    "graph_replays",
+    "capture_timed",
+    "mutable_inputs_restored",
+    "profiler_is_diagnostic",
 )
 
 FRESH_ITERATION_PLAN_FIELDS = (
@@ -671,6 +690,14 @@ class BaseOperatorTest(ABC):
         """
         del prepared_data, implementation
         return False
+
+    def _restore_mutable_graph_inputs(
+        self,
+        prepared_payloads: List[Any],
+        implementation: str = "default",
+    ) -> None:
+        """Restore mutable captured inputs before graph replay, if needed."""
+        del prepared_payloads, implementation
 
     
     def calculate_throughput(self, data: Dict[str, Any], time_ms: float) -> Optional[float]:
@@ -1067,6 +1094,12 @@ class OperatorTestFramework:
             ),
             "task_queue_enable": metrics.task_queue_enable,
             "timed_region": metrics.timed_region,
+            "dispatch_mode": metrics.dispatch_mode,
+            "graph_capture_width": metrics.graph_capture_width,
+            "graph_replays": metrics.graph_replays,
+            "capture_timed": metrics.capture_timed,
+            "mutable_inputs_restored": metrics.mutable_inputs_restored,
+            "profiler_is_diagnostic": metrics.profiler_is_diagnostic,
         }
     
     def _measure_execution_time(self, func, device: str, num_iterations: int = 1) -> float:
@@ -1242,6 +1275,76 @@ class OperatorTestFramework:
         except Exception as e:
             print(f"    ❌ V2计时过程中发生错误: {str(e)}")
             raise
+
+    def _capture_prepared_payload_chain_v2(
+        self,
+        prepared_payloads: List[Any],
+        execute_core_operator: Callable[[Any, str], Any],
+        implementation: str,
+        device: str,
+    ) -> _CapturedPreparedChain:
+        """Capture one independent-address chain without eager fallback."""
+        if not prepared_payloads:
+            raise ValueError("prepared_payloads must not be empty")
+
+        retained_outputs: List[Any] = [None] * len(prepared_payloads)
+        if "npu" in device:
+            graph = torch_npu.npu.NPUGraph()
+            with torch_npu.npu.graph(graph):
+                self._dispatch_prepared_payloads(
+                    prepared_payloads,
+                    execute_core_operator,
+                    implementation,
+                    retained_outputs,
+                )
+        elif "cuda" in device:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._dispatch_prepared_payloads(
+                    prepared_payloads,
+                    execute_core_operator,
+                    implementation,
+                    retained_outputs,
+                )
+        else:
+            raise ValueError(
+                "captured_chain requires a CUDA or NPU device"
+            )
+
+        return _CapturedPreparedChain(
+            replay=graph.replay,
+            retained_outputs=retained_outputs,
+            logical_invocations=len(prepared_payloads),
+        )
+
+    @staticmethod
+    def _measure_captured_chain_replay_v2(
+        captured_chain: _CapturedPreparedChain,
+        device: str,
+    ) -> float:
+        """Time one graph replay and return latency per logical invocation."""
+        if captured_chain.logical_invocations <= 0:
+            raise ValueError("captured chain must contain an invocation")
+
+        if "npu" in device:
+            start_event = torch_npu.npu.Event(enable_timing=True)
+            end_event = torch_npu.npu.Event(enable_timing=True)
+        elif "cuda" in device:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+        else:
+            raise ValueError(
+                "captured_chain requires a CUDA or NPU device"
+            )
+
+        start_event.record()
+        captured_chain.replay()
+        end_event.record()
+        end_event.synchronize()
+        return (
+            start_event.elapsed_time(end_event)
+            / captured_chain.logical_invocations
+        )
     
     def run_unified_profile_test(
         self,
@@ -1707,6 +1810,7 @@ class OperatorTestFramework:
         num_iterations: int,
         retain_outputs: bool,
         verify_independent_storage: bool,
+        dispatch_mode: str,
     ) -> Tuple[
         float, int, int, int, int, int, int, str, str, str
     ]:
@@ -1730,6 +1834,8 @@ class OperatorTestFramework:
         execute_core_operator = None
         provider_context = None
         device_context = None
+        captured_chain = None
+        measured_payloads = None
         timed_output_capture_policy = "not_retained"
         preallocated_output_contract = "not_declared"
         output_alias_verification_scope = "not_retained"
@@ -1851,12 +1957,20 @@ class OperatorTestFramework:
                 )
                 output_alias_verification_scope = "warmup_returns_only"
             elif retain_outputs:
-                timed_output_capture_policy = (
-                    "retained_return_inside_timed_region"
-                )
-                output_alias_verification_scope = (
-                    "warmup_and_measured_returns"
-                )
+                if dispatch_mode == "captured_chain":
+                    timed_output_capture_policy = (
+                        "capture_returns_retained_outside_timed_replay"
+                    )
+                    output_alias_verification_scope = (
+                        "warmup_and_capture_returns"
+                    )
+                else:
+                    timed_output_capture_policy = (
+                        "retained_return_inside_timed_region"
+                    )
+                    output_alias_verification_scope = (
+                        "warmup_and_measured_returns"
+                    )
 
             execute_core_operator = operator_test._execute_core_operator
             with device_context, provider_context, torch.inference_mode():
@@ -1873,16 +1987,61 @@ class OperatorTestFramework:
                 elif "cuda" in device:
                     torch.cuda.synchronize(torch.device(device))
 
-                if not direct_preallocated_timing and retain_outputs:
-                    retained_outputs.extend([None] * num_iterations)
-                    timed_retained_outputs = retained_outputs
-                repeat_time_ms = self._measure_execution_time_v2(
-                    prepared_data_list[num_warmup:],
-                    execute_core_operator,
-                    implementation,
-                    device,
-                    timed_retained_outputs,
-                )
+                measured_payloads = prepared_data_list[num_warmup:]
+                if dispatch_mode == "captured_chain":
+                    captured_chain = (
+                        self._capture_prepared_payload_chain_v2(
+                            measured_payloads,
+                            execute_core_operator,
+                            implementation,
+                            device,
+                        )
+                    )
+                    if (
+                        captured_chain.logical_invocations
+                        != num_iterations
+                    ):
+                        raise RuntimeError(
+                            "captured chain invocation count mismatch: "
+                            f"{captured_chain.logical_invocations} != "
+                            f"{num_iterations}"
+                        )
+                    if (
+                        not direct_preallocated_timing
+                        and retain_outputs
+                    ):
+                        retained_outputs.extend(
+                            captured_chain.retained_outputs
+                        )
+                    operator_test._restore_mutable_graph_inputs(
+                        measured_payloads,
+                        implementation,
+                    )
+                    if "npu" in device:
+                        torch_npu.npu.synchronize()
+                    else:
+                        torch.cuda.synchronize(torch.device(device))
+                    operator_test._restore_mutable_graph_inputs(
+                        measured_payloads,
+                        implementation,
+                    )
+                    repeat_time_ms = (
+                        self._measure_captured_chain_replay_v2(
+                            captured_chain,
+                            device,
+                        )
+                    )
+                else:
+                    if not direct_preallocated_timing and retain_outputs:
+                        retained_outputs.extend([None] * num_iterations)
+                        timed_retained_outputs = retained_outputs
+                    repeat_time_ms = self._measure_execution_time_v2(
+                        measured_payloads,
+                        execute_core_operator,
+                        implementation,
+                        device,
+                        timed_retained_outputs,
+                    )
                 if (
                     not math.isfinite(repeat_time_ms)
                     or repeat_time_ms <= 0
@@ -2002,6 +2161,8 @@ class OperatorTestFramework:
             )
         finally:
             retained_outputs.clear()
+            if captured_chain is not None:
+                captured_chain.retained_outputs.clear()
             prepared_data_list.clear()
             output = None
             prepared_data = None
@@ -2014,6 +2175,8 @@ class OperatorTestFramework:
             execute_core_operator = None
             provider_context = None
             device_context = None
+            captured_chain = None
+            measured_payloads = None
             gc.collect()
             try:
                 if "npu" in device:
@@ -2042,6 +2205,7 @@ class OperatorTestFramework:
         retain_outputs: bool = True,
         verify_independent_storage: bool = False,
         num_stabilization_repeats: Optional[int] = None,
+        dispatch_mode: str = "eager_direct",
     ) -> PerformanceMetrics:
         """Measure the core operator with preallocated fresh storage.
 
@@ -2049,6 +2213,17 @@ class OperatorTestFramework:
         payloads. Optional full-window stabilization repeats use the same
         fresh-storage contract but are excluded from the reported median.
         """
+        if dispatch_mode not in {"eager_direct", "captured_chain"}:
+            raise ValueError(
+                "dispatch_mode must be exactly 'eager_direct' or "
+                "'captured_chain'"
+            )
+        if dispatch_mode == "captured_chain" and not (
+            "npu" in device or "cuda" in device
+        ):
+            raise ValueError(
+                "captured_chain requires a CUDA or NPU device"
+            )
         if num_stabilization_repeats is None:
             raw_stabilization_repeats = os.environ.get(
                 "OPERATOR_TEST_STABILIZATION_REPEATS",
@@ -2100,7 +2275,8 @@ class OperatorTestFramework:
         has_execute = hasattr(operator_test, "_execute_core_operator")
         if not has_prepare or not has_execute:
             if (
-                num_repeats != 1
+                dispatch_mode == "captured_chain"
+                or num_repeats != 1
                 or num_stabilization_repeats
                 or verify_independent_storage
             ):
@@ -2178,6 +2354,7 @@ class OperatorTestFramework:
                 num_iterations,
                 retain_outputs,
                 verify_independent_storage,
+                dispatch_mode,
             )
             if is_stabilization:
                 stabilization_repeat_samples_ms.append(repeat_time_ms)
@@ -2296,8 +2473,17 @@ class OperatorTestFramework:
             ),
             output_allocation_mode=output_allocation_mode,
             output_storage_policy=(
-                "retained_until_repeat_end"
-                if retain_outputs else "not_retained"
+                (
+                    "capture_outputs_retained_until_repeat_end"
+                    if retain_outputs
+                    else "capture_outputs_retained_through_replay_only"
+                )
+                if dispatch_mode == "captured_chain"
+                else (
+                    "retained_until_repeat_end"
+                    if retain_outputs
+                    else "not_retained"
+                )
             ),
             protocol_version="operator-test-framework-v2-fresh-v6",
             repeats=num_repeats,
@@ -2326,12 +2512,16 @@ class OperatorTestFramework:
             output_tensor_count=output_tensor_count,
             input_reuse_within_repeat=False,
             timing_method=(
-                "device_event"
+                "device_event_graph_replay"
+                if dispatch_mode == "captured_chain"
+                else "device_event"
                 if "npu" in device or "cuda" in device
                 else "host_perf_counter"
             ),
             timing_semantics=(
-                "device elapsed time; includes stream-idle gaps between "
+                "device elapsed time; capture and mutable restore excluded"
+                if dispatch_mode == "captured_chain"
+                else "device elapsed time; includes stream-idle gaps between "
                 "start/end events caused by host dispatch"
                 if "npu" in device or "cuda" in device
                 else "host wall-clock elapsed time"
@@ -2352,10 +2542,16 @@ class OperatorTestFramework:
                 0
             ),
             total_operator_calls_per_repeat=(
-                invocations_per_repeat
+                num_warmup + 2 * num_iterations
+                if dispatch_mode == "captured_chain"
+                else invocations_per_repeat
             ),
             workspace_allocation_policy="not_audited",
-            dispatch_loop_policy="python_direct_prepared_payload_loop",
+            dispatch_loop_policy=(
+                "captured_prepared_payload_chain_single_replay"
+                if dispatch_mode == "captured_chain"
+                else "python_direct_prepared_payload_loop"
+            ),
             device_stabilization_policy=(
                 "fresh_storage_full_window_priming_repeats"
                 if num_stabilization_repeats
@@ -2365,7 +2561,12 @@ class OperatorTestFramework:
                 num_stabilization_repeats
             ),
             stabilization_operator_calls=(
-                num_stabilization_repeats * invocations_per_repeat
+                num_stabilization_repeats
+                * (
+                    num_warmup + 2 * num_iterations
+                    if dispatch_mode == "captured_chain"
+                    else invocations_per_repeat
+                )
             ),
             task_queue_enable=(
                 os.environ.get("TASK_QUEUE_ENABLE", "unset")
@@ -2374,6 +2575,11 @@ class OperatorTestFramework:
             ),
             timed_region=(
                 (
+                    "one graph replay containing I independent core "
+                    "invocations"
+                )
+                if dispatch_mode == "captured_chain"
+                else (
                     "Python direct prepared-payload loop of "
                     "_execute_core_operator; prepare excluded; timed Python "
                     "returns discarded under declared out contract"
@@ -2394,6 +2600,20 @@ class OperatorTestFramework:
                     "_execute_core_operator; prepare excluded"
                 )
             ),
+            dispatch_mode=dispatch_mode,
+            graph_capture_width=(
+                num_iterations
+                if dispatch_mode == "captured_chain"
+                else 0
+            ),
+            graph_replays=(
+                1 if dispatch_mode == "captured_chain" else 0
+            ),
+            capture_timed=False,
+            mutable_inputs_restored=(
+                dispatch_mode == "captured_chain"
+            ),
+            profiler_is_diagnostic=False,
         )
     
     

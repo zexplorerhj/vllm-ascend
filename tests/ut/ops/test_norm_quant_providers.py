@@ -1,6 +1,8 @@
+import gc
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -83,6 +85,33 @@ def _patch_prepare(monkeypatch, operator, implementation, raw_op):
             "_resolve_flashinfer_callable",
             lambda symbol: raw_op,
         )
+
+
+def _track_static_scale_computation(monkeypatch, operator):
+    observed = {"quant_value_calls": 0, "scale_sources": []}
+    original_quant_values = operator._vllm_static_quant_values
+    original_scale = operator._static_scale_for_reference
+
+    def track_quant_values(*args, **kwargs):
+        observed["quant_value_calls"] += 1
+        return original_quant_values(*args, **kwargs)
+
+    def track_scale_source(reference):
+        scale_source = original_scale(reference)
+        observed["scale_sources"].append(scale_source)
+        return scale_source
+
+    monkeypatch.setattr(
+        operator,
+        "_vllm_static_quant_values",
+        track_quant_values,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_static_scale_for_reference",
+        track_scale_source,
+    )
+    return observed
 
 
 def _dynamic_vllm_oracle(x, residual, weight, eps):
@@ -266,32 +295,218 @@ def test_cuda_support_matrix_rejects_mx_variants(variant):
         create_norm_quant_operator("cuda:0", variant, PrecisionType.MXFP8)
 
 
-def test_prepared_payloads_have_fresh_input_and_output_storage(monkeypatch):
-    operator = _operator(NormQuantVariant.RMS_NORM_STATIC_FP8)
+@pytest.mark.parametrize(
+    ("variant", "implementation"),
+    [
+        (
+            NormQuantVariant.RMS_NORM_STATIC_FP8,
+            VLLM_STATIC_RMS,
+        ),
+        (
+            NormQuantVariant.RMS_NORM_STATIC_FP8,
+            FLASHINFER_STATIC_RMS,
+        ),
+        (
+            NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+            VLLM_STATIC_ADD,
+        ),
+        (
+            NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+            FLASHINFER_STATIC_ADD,
+        ),
+    ],
+)
+def test_static_scale_source_is_cached_with_fresh_payload_storage(
+    monkeypatch,
+    variant,
+    implementation,
+):
+    operator = _operator(variant)
     _patch_prepare(
         monkeypatch,
         operator,
-        VLLM_STATIC_RMS,
-        lambda *args: None,
+        implementation,
+        lambda *args, **kwargs: None,
     )
+    observed = _track_static_scale_computation(monkeypatch, operator)
     data = _data(operator)
 
     first = operator._prepare_data_for_core_operator(
-        data, "cpu", PrecisionType.FP8, VLLM_STATIC_RMS
+        data, "cpu", PrecisionType.FP8, implementation
     )
     second = operator._prepare_data_for_core_operator(
-        data, "cpu", PrecisionType.FP8, VLLM_STATIC_RMS
+        data, "cpu", PrecisionType.FP8, implementation
     )
 
+    assert observed["quant_value_calls"] == 1
+    assert len(observed["scale_sources"]) == 1
+    scale_source = observed["scale_sources"][0]
+    assert scale_source.device.type == "cpu"
+    torch.testing.assert_close(
+        first["static_scale"],
+        second["static_scale"],
+        rtol=0,
+        atol=0,
+    )
     for key in ("x", "weight", "static_scale", "output"):
         assert first[key] is not second[key]
         assert (
             first[key].untyped_storage().data_ptr()
             != second[key].untyped_storage().data_ptr()
         )
+    for prepared in (first, second):
+        assert prepared["static_scale"] is not scale_source
+        assert (
+            prepared["static_scale"].untyped_storage().data_ptr()
+            != scale_source.untyped_storage().data_ptr()
+        )
     assert first["static_scale"].shape == (1,)
     assert first["static_scale"].dtype is torch.float32
     assert first["static_scale"].is_contiguous()
+
+
+def test_static_scale_source_cache_is_single_entry_and_provider_scoped(
+    monkeypatch,
+):
+    operator = _operator(NormQuantVariant.RMS_NORM_STATIC_FP8)
+    monkeypatch.setattr(
+        operator,
+        "_resolve_implementation",
+        lambda device, requested: requested,
+    )
+    monkeypatch.setattr(operator, "_copy_to_device", _cpu_copy)
+    monkeypatch.setattr(
+        operator,
+        "_resolve_vllm_callable",
+        lambda symbol: (lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(
+        operator,
+        "_resolve_flashinfer_callable",
+        lambda symbol: (lambda *args, **kwargs: None),
+    )
+    observed = _track_static_scale_computation(monkeypatch, operator)
+    data = _data(operator)
+
+    for implementation in (
+        VLLM_STATIC_RMS,
+        VLLM_STATIC_RMS,
+        FLASHINFER_STATIC_RMS,
+        FLASHINFER_STATIC_RMS,
+        VLLM_STATIC_RMS,
+    ):
+        operator._prepare_data_for_core_operator(
+            data,
+            "cpu",
+            PrecisionType.FP8,
+            implementation,
+        )
+
+    assert observed["quant_value_calls"] == 3
+    assert len(observed["scale_sources"]) == 3
+
+
+def test_static_scale_source_cache_releases_previous_data(monkeypatch):
+    operator = _operator(NormQuantVariant.RMS_NORM_STATIC_FP8)
+    _patch_prepare(
+        monkeypatch,
+        operator,
+        VLLM_STATIC_RMS,
+        lambda *args, **kwargs: None,
+    )
+    observed = _track_static_scale_computation(monkeypatch, operator)
+    first_data = _data(operator, tokens=2)
+    first_x_ref = weakref.ref(first_data["x"])
+    for _ in range(2):
+        prepared = operator._prepare_data_for_core_operator(
+            first_data,
+            "cpu",
+            PrecisionType.FP8,
+            VLLM_STATIC_RMS,
+        )
+    del prepared
+
+    second_data = _data(operator, tokens=3)
+    for _ in range(2):
+        prepared = operator._prepare_data_for_core_operator(
+            second_data,
+            "cpu",
+            PrecisionType.FP8,
+            VLLM_STATIC_RMS,
+        )
+    del prepared
+    del first_data
+    gc.collect()
+
+    assert observed["quant_value_calls"] == 2
+    assert len(observed["scale_sources"]) == 2
+    assert first_x_ref() is None
+
+
+@pytest.mark.parametrize(
+    ("variant", "source_change"),
+    [
+        (
+            NormQuantVariant.RMS_NORM_STATIC_FP8,
+            "x_in_place",
+        ),
+        (
+            NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+            "residual_in_place",
+        ),
+        (
+            NormQuantVariant.RMS_NORM_STATIC_FP8,
+            "weight_replaced",
+        ),
+        (
+            NormQuantVariant.RMS_NORM_STATIC_FP8,
+            "eps_changed",
+        ),
+    ],
+)
+def test_static_scale_source_cache_invalidates_when_source_changes(
+    monkeypatch,
+    variant,
+    source_change,
+):
+    operator = _operator(variant)
+    implementation = (
+        VLLM_STATIC_ADD
+        if variant is NormQuantVariant.ADD_RMS_NORM_STATIC_FP8
+        else VLLM_STATIC_RMS
+    )
+    _patch_prepare(
+        monkeypatch,
+        operator,
+        implementation,
+        lambda *args, **kwargs: None,
+    )
+    observed = _track_static_scale_computation(monkeypatch, operator)
+    data = _data(operator)
+    operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        implementation,
+    )
+
+    if source_change == "x_in_place":
+        data["x"][0, 0].add_(1)
+    elif source_change == "residual_in_place":
+        data["residual"][0, 0].add_(1)
+    elif source_change == "weight_replaced":
+        data["weight"] = data["weight"].clone()
+    else:
+        data["eps"] = 1e-4
+    operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        implementation,
+    )
+
+    assert observed["quant_value_calls"] == 2
+    assert len(observed["scale_sources"]) == 2
 
 
 def test_vllm_static_rmsnorm_execute_uses_raw_out_first(monkeypatch):

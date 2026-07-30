@@ -1,5 +1,6 @@
 """Raw preallocated-output fused Norm/Quant providers for NVIDIA H20-3e."""
 
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -7,6 +8,14 @@ import torch
 from operator_test_framework import DeviceType, PrecisionType
 
 from .base import NormQuantOperatorTestBase, NormQuantVariant
+
+
+@dataclass(frozen=True)
+class _StaticScaleSourceCache:
+    data: dict[str, Any]
+    signature: tuple[Any, ...]
+    source_tensors: tuple[Optional[torch.Tensor], ...]
+    scale_source: torch.Tensor
 
 
 class CudaNormQuantOperatorTest(NormQuantOperatorTestBase):
@@ -71,6 +80,9 @@ class CudaNormQuantOperatorTest(NormQuantOperatorTestBase):
             )
         super().__init__(variant, precision)
         self.supported_devices = [DeviceType.GPU]
+        self._static_scale_source_cache: Optional[
+            _StaticScaleSourceCache
+        ] = None
 
     @staticmethod
     def _copy_to_device(
@@ -153,6 +165,64 @@ class CudaNormQuantOperatorTest(NormQuantOperatorTestBase):
             )
         return operator
 
+    def _get_static_scale_source(
+        self,
+        data: dict[str, Any],
+        implementation: str,
+    ) -> torch.Tensor:
+        """Return the cached CPU scale source for the current data/provider."""
+        source_tensors = (
+            data["x"],
+            data.get("residual"),
+            data["weight"],
+        )
+        signature = (
+            implementation,
+            float(data["eps"]),
+            *(
+                None
+                if tensor is None
+                else (
+                    id(tensor),
+                    int(tensor._version),
+                    tuple(tensor.shape),
+                    tensor.dtype,
+                    tensor.device,
+                )
+                for tensor in source_tensors
+            ),
+        )
+        cached = self._static_scale_source_cache
+        if (
+            cached is not None
+            and cached.data is data
+            and cached.signature == signature
+            and all(
+                previous is current
+                for previous, current in zip(
+                    cached.source_tensors,
+                    source_tensors,
+                )
+            )
+        ):
+            return cached.scale_source
+        static_quant_values = self._vllm_static_quant_values(
+            data["x"],
+            data.get("residual"),
+            data["weight"],
+            float(data["eps"]),
+        )
+        scale_source = self._static_scale_for_reference(
+            static_quant_values
+        )
+        self._static_scale_source_cache = _StaticScaleSourceCache(
+            data=data,
+            signature=signature,
+            source_tensors=source_tensors,
+            scale_source=scale_source,
+        )
+        return scale_source
+
     def _prepare_data_for_core_operator(
         self,
         data: Dict[str, Any],
@@ -220,14 +290,9 @@ class CudaNormQuantOperatorTest(NormQuantOperatorTestBase):
             device=device,
         )
         if self.is_static_variant:
-            static_quant_values = self._vllm_static_quant_values(
-                data["x"],
-                data.get("residual"),
-                data["weight"],
-                float(data["eps"]),
-            )
-            scale_source = self._static_scale_for_reference(
-                static_quant_values
+            scale_source = self._get_static_scale_source(
+                data,
+                resolved,
             )
             prepared["static_scale"] = self._copy_to_device(
                 scale_source,

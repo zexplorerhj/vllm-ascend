@@ -1879,7 +1879,7 @@ class OperatorTestFramework:
         measured_payloads = None
         input_audit_payloads = None
         timed_output_capture_policy = "not_retained"
-        preallocated_output_contract = "not_declared"
+        preallocated_output_contract = "none"
         output_alias_verification_scope = "not_retained"
 
         try:

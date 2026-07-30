@@ -249,12 +249,11 @@ def validate_formal_latency_rows(rows: Iterable[Dict[str, Any]]) -> None:
             )
         latency = row.get("latency_ms")
         if (
-            isinstance(latency, bool)
-            or not isinstance(latency, (int, float))
+            type(latency) is not float
             or not math.isfinite(float(latency))
             or float(latency) <= 0
         ):
-            raise ValueError(f"invalid formal latency: {latency!r}")
+            raise ValueError(f"invalid formal latency_ms: {latency!r}")
 
 
 def select_h20_best_envelope(
@@ -815,7 +814,11 @@ class NormQuantTestSuite:
             torch_npu_version=_torch_npu_version(),
             vllm_version=_package_version("vllm"),
             flashinfer_version=_package_version("flashinfer-python"),
-            task_queue_enable=os.environ.get("TASK_QUEUE_ENABLE", "unset"),
+            task_queue_enable=(
+                os.environ.get("TASK_QUEUE_ENABLE", "unset")
+                if self.device.startswith("npu")
+                else "not_applicable"
+            ),
             **iteration_plan,
         )
         return row
@@ -830,6 +833,9 @@ class NormQuantTestSuite:
         num_iterations: int,
         num_repeats: int,
         num_stabilization_repeats: int,
+        expected_device: str,
+        expected_precision: str,
+        expected_operator_name: str,
     ) -> None:
         def require_equal(field: str, actual: Any, expected: Any) -> None:
             if isinstance(expected, bool):
@@ -862,12 +868,11 @@ class NormQuantTestSuite:
 
         def require_close(field: str, actual: Any, expected: float) -> None:
             if (
-                isinstance(actual, bool)
-                or not isinstance(actual, (int, float))
-                or not math.isfinite(float(actual))
+                type(actual) is not float
+                or not math.isfinite(actual)
                 or not math.isclose(
-                    float(actual),
-                    float(expected),
+                    actual,
+                    expected,
                     rel_tol=1e-12,
                     abs_tol=1e-12,
                 )
@@ -891,15 +896,14 @@ class NormQuantTestSuite:
             samples: List[float] = []
             for value in values:
                 if (
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value))
-                    or float(value) <= 0
+                    type(value) is not float
+                    or not math.isfinite(value)
+                    or value <= 0
                 ):
                     raise RuntimeError(
                         f"{field} contains invalid sample {value!r}"
                     )
-                samples.append(float(value))
+                samples.append(value)
             return samples
 
         def require_sample_match(
@@ -930,6 +934,16 @@ class NormQuantTestSuite:
         if missing:
             raise RuntimeError(
                 f"Framework V2 provenance missing fields: {missing}"
+            )
+        for attribute, expected in (
+            ("device_type", expected_device),
+            ("precision_type", expected_precision),
+            ("operator_name", expected_operator_name),
+        ):
+            require_equal(
+                f"metrics.{attribute}",
+                getattr(metrics, attribute, None),
+                expected,
             )
         require_equal(
             "framework_api",
@@ -1126,8 +1140,25 @@ class NormQuantTestSuite:
             provenance["output_allocation_policy"],
             provenance["output_allocation_mode"],
         )
+        preallocated_output_contract = provenance[
+            "preallocated_output_contract"
+        ]
+        if (
+            type(preallocated_output_contract) is not str
+            or preallocated_output_contract
+            not in {"declared_phase_invariant_out", "none"}
+        ):
+            raise RuntimeError(
+                "preallocated_output_contract must be exactly "
+                "'declared_phase_invariant_out' or 'none'"
+            )
+        require_metric(
+            "preallocated_output_contract",
+            "preallocated_output_contract",
+            preallocated_output_contract,
+        )
         has_preallocated_contract = (
-            provenance["preallocated_output_contract"]
+            preallocated_output_contract
             == "declared_phase_invariant_out"
         )
         expected_output_aliases = num_warmup if has_preallocated_contract else 0
@@ -1172,11 +1203,6 @@ class NormQuantTestSuite:
             provenance["timed_output_capture_policy"],
         )
         require_metric(
-            "preallocated_output_contract",
-            "preallocated_output_contract",
-            provenance["preallocated_output_contract"],
-        )
-        require_metric(
             "output_alias_verification_scope",
             "output_alias_verification_scope",
             provenance["output_alias_verification_scope"],
@@ -1218,14 +1244,20 @@ class NormQuantTestSuite:
             "workspace_allocation_policy",
             "not_audited",
         )
-        if type(provenance["task_queue_enable"]) is not str:
-            raise RuntimeError(
-                "task_queue_enable must be an exact string"
-            )
+        expected_task_queue_enable = (
+            os.environ.get("TASK_QUEUE_ENABLE", "unset")
+            if expected_device.startswith("npu")
+            else "not_applicable"
+        )
+        require_equal(
+            "task_queue_enable",
+            provenance["task_queue_enable"],
+            expected_task_queue_enable,
+        )
         require_metric(
             "task_queue_enable",
             "task_queue_enable",
-            provenance["task_queue_enable"],
+            expected_task_queue_enable,
         )
 
         require_equal(
@@ -1822,8 +1854,15 @@ class NormQuantTestSuite:
                                         num_stabilization_repeats=(
                                             num_stabilization_repeats
                                         ),
+                                        expected_device=self.device,
+                                        expected_precision=(
+                                            self.precision.name
+                                        ),
+                                        expected_operator_name=(
+                                            f"{operator.operator_name}_core_v2"
+                                        ),
                                     )
-                                    latency = float(metrics.avg_time_ms)
+                                    latency = metrics.avg_time_ms
                                     if (
                                         not math.isfinite(latency)
                                         or latency <= 0

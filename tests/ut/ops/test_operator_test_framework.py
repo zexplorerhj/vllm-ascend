@@ -1838,7 +1838,7 @@ def test_v2_emits_flat_protocol_provenance(monkeypatch, tmp_path):
         "timed_output_capture_policy": (
             "retained_return_inside_timed_region"
         ),
-        "preallocated_output_contract": "not_declared",
+        "preallocated_output_contract": "none",
         "output_alias_verification_scope": (
             "warmup_and_measured_returns"
         ),

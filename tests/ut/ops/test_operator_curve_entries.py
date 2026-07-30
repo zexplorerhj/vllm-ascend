@@ -13,6 +13,7 @@
 #
 
 import csv
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -154,6 +155,10 @@ class _ExactStringAdversary(str):
 
 class _ExactIntAdversary(int):
     """Compare equal to int while retaining a distinct runtime type."""
+
+
+class _ExactFloatAdversary(float):
+    """Compare equal to float while retaining a distinct runtime type."""
 
 
 class _FakeFramework:
@@ -541,12 +546,13 @@ class _NormQuantFakeFramework(_FakeFramework):
             if mode == "captured_chain"
             else invocations
         )
+        has_preallocated_output_contract = "npu" not in kwargs["device"]
         metrics = PerformanceMetrics(
             avg_time_ms=latency,
             throughput=None,
             precision_type=kwargs["precision"].name,
             device_type=kwargs["device"],
-            operator_name="fake_norm_quant",
+            operator_name=f"{kwargs['operator_test'].operator_name}_core_v2",
             iterations=iterations,
             framework_api=(
                 "OperatorTestFramework."
@@ -577,9 +583,13 @@ class _NormQuantFakeFramework(_FakeFramework):
             output_storage_ptr_count=audited_storage_sets,
             output_tensor_count=audited_storage_sets,
             input_reuse_within_repeat=False,
-            preallocated_output_aliases_verified=warmup,
+            preallocated_output_aliases_verified=(
+                warmup if has_preallocated_output_contract else 0
+            ),
             output_allocation_mode=(
                 "preallocated_output_contract_with_warmup_alias_probe"
+                if has_preallocated_output_contract
+                else "no_preallocated_output_buffer_verified"
             ),
             output_storage_policy=(
                 "capture_outputs_retained_until_repeat_end"
@@ -599,13 +609,25 @@ class _NormQuantFakeFramework(_FakeFramework):
             ),
             timed_output_capture_policy=(
                 "preallocated_output_contract_no_timed_return_capture"
+                if has_preallocated_output_contract
+                else "capture_returns_retained_outside_timed_replay"
+                if mode == "captured_chain"
+                else "retained_return_inside_timed_region"
             ),
             preallocated_output_contract=(
                 "declared_phase_invariant_out"
+                if has_preallocated_output_contract
+                else "none"
             ),
-            output_alias_verification_scope="warmup_returns_only",
+            output_alias_verification_scope=(
+                "warmup_returns_only"
+                if has_preallocated_output_contract
+                else "warmup_and_capture_returns"
+                if mode == "captured_chain"
+                else "warmup_and_measured_returns"
+            ),
             preallocated_output_contract_invocations_per_repeat=(
-                invocations
+                invocations if has_preallocated_output_contract else 0
             ),
             output_verification_replay_invocations_per_repeat=0,
             total_operator_calls_per_repeat=total_calls,
@@ -624,13 +646,21 @@ class _NormQuantFakeFramework(_FakeFramework):
             stabilization_operator_calls=(
                 stabilization_repeats * total_calls
             ),
-            task_queue_enable="not_applicable",
+            task_queue_enable=(
+                os.environ.get("TASK_QUEUE_ENABLE", "unset")
+                if "npu" in kwargs["device"]
+                else "not_applicable"
+            ),
             timed_region=(
                 "one graph replay containing I independent core invocations"
                 if mode == "captured_chain"
                 else "Python direct prepared-payload loop of "
                 "_execute_core_operator; prepare excluded; timed Python "
                 "returns discarded under declared out contract"
+                if has_preallocated_output_contract
+                else "Python direct prepared-payload loop of "
+                "_execute_core_operator plus return slot assignment; "
+                "prepare excluded"
             ),
             dispatch_mode=mode,
             graph_capture_width=(
@@ -1141,6 +1171,13 @@ def test_norm_quant_graph_provenance_error_is_not_capture_unsupported(
         ),
         ("repeat_samples_ms", "[true, 2.0, 2.0]"),
         ("event_window_samples_ms", "[true, 4.0, 4.0]"),
+        ("repeat_min_ms", 2),
+        ("repeat_median_ms", _ExactFloatAdversary(2.0)),
+        ("event_window_min_ms", 4),
+        ("repeat_iqr_pct", 0),
+        ("repeat_samples_ms", "[2, 2, 2]"),
+        ("event_window_samples_ms", "[4, 4, 4]"),
+        ("stabilization_repeat_samples_ms", "[2]"),
     ],
 )
 def test_norm_quant_corrupt_graph_provenance_is_terminal_error(
@@ -1214,7 +1251,17 @@ def test_norm_quant_corrupt_graph_provenance_is_terminal_error(
         ("task_queue_enable", None, None, None),
         ("repeat_samples_ms", (2.0, 2.0, 2.0), None, None),
         ("avg_time_ms", True, None, None),
+        ("avg_time_ms", 2, None, None),
+        ("avg_time_ms", _ExactFloatAdversary(2.0), None, None),
         ("repeat_samples_ms", [True, 2.0, 2.0], None, None),
+        ("repeat_samples_ms", [2, 2, 2], None, None),
+        (
+            "repeat_samples_ms",
+            [_ExactFloatAdversary(2.0)] * 3,
+            None,
+            None,
+        ),
+        ("stabilization_repeat_samples_ms", [2], None, None),
     ],
 )
 def test_norm_quant_metrics_require_exact_types(
@@ -1272,6 +1319,260 @@ def test_norm_quant_metrics_require_exact_types(
     assert row["status"] == "error"
     assert row["graph_status"] == "formal_validation_error"
     assert attribute in row["error"]
+
+
+@pytest.mark.parametrize(
+    ("attribute", "bad_value"),
+    [
+        ("device_type", "cpu"),
+        ("precision_type", "FP32"),
+        ("operator_name", "wrong_operator"),
+    ],
+)
+def test_norm_quant_metrics_identity_is_bound_to_requested_operator(
+    tmp_path,
+    attribute,
+    bad_value,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    def forge_identity(metrics):
+        setattr(metrics, attribute, bad_value)
+
+    events = []
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    suite.framework = _NormQuantFakeFramework(
+        tmp_path,
+        events,
+        metrics_mutator=forge_identity,
+    )
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        suite.run_curve_test(
+            variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+            tokens=[1],
+            hidden_sizes=[],
+            dispatch_mode="graph",
+            num_warmup=2,
+            num_iterations=2,
+            num_repeats=3,
+            num_stabilization_repeats=1,
+            plot_results=False,
+        )
+
+    graph_csv = next(tmp_path.glob("*captured-chain*.csv"))
+    with graph_csv.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["status"] == "error"
+    assert row["graph_status"] == "formal_validation_error"
+    assert attribute in row["error"]
+
+
+def test_norm_quant_main_forged_metrics_identity_is_nonzero_and_terminal(
+    monkeypatch,
+    tmp_path,
+):
+    import tests.test_norm_quant as norm_quant_entry
+    from norm_quant import NormQuantVariant
+
+    def forge_identity(metrics):
+        metrics.device_type = "cpu"
+
+    events = []
+    framework = _NormQuantFakeFramework(
+        tmp_path,
+        events,
+        metrics_mutator=forge_identity,
+    )
+    suite = norm_quant_entry.NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        norm_quant_entry,
+        "OperatorTestFramework",
+        lambda result_dir: framework,
+    )
+    monkeypatch.setattr(
+        norm_quant_entry,
+        "NormQuantTestSuite",
+        lambda precision, device: suite,
+    )
+    monkeypatch.setenv("OPERATOR_TEST_STABILIZATION_REPEATS", "0")
+
+    exit_code = norm_quant_entry.main([
+        "--mode",
+        "curve",
+        "--precision",
+        "fp8",
+        "--device",
+        "cuda:0",
+        "--result-dir",
+        str(tmp_path),
+        "--variants",
+        NormQuantVariant.RMS_NORM_STATIC_FP8.value,
+        "--tokens",
+        "1",
+        "--hidden-sizes",
+        "7168",
+        "--dispatch-mode",
+        "graph",
+        "--warmup",
+        "2",
+        "--iterations",
+        "2",
+        "--repeats",
+        "1",
+        "--quick",
+        "--shard-index",
+        "0",
+        "--num-shards",
+        "2",
+        "--no-plot",
+    ])
+
+    assert exit_code != 0
+    checkpoint = next(tmp_path.glob("*captured-chain*.csv"))
+    with checkpoint.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows
+    assert all(row["status"] == "error" for row in rows)
+    assert all("metrics.device_type" in row["error"] for row in rows)
+
+
+@pytest.mark.parametrize(
+    ("device", "task_queue_value"),
+    [
+        ("cuda:0", "ignored-on-cuda"),
+        ("npu:0", "1"),
+    ],
+)
+def test_norm_quant_task_queue_is_bound_to_device_environment(
+    monkeypatch,
+    tmp_path,
+    device,
+    task_queue_value,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue_value)
+
+    def forge_task_queue(metrics):
+        metrics.task_queue_enable = "forged"
+
+    events = []
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device=device,
+        operator_factory=lambda requested_device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    suite.framework = _NormQuantFakeFramework(
+        tmp_path,
+        events,
+        metrics_mutator=forge_task_queue,
+    )
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        suite.run_curve_test(
+            variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+            tokens=[1],
+            hidden_sizes=[],
+            dispatch_mode="graph",
+            num_warmup=2,
+            num_iterations=2,
+            num_repeats=1,
+            num_stabilization_repeats=0,
+            plot_results=False,
+        )
+
+    graph_csv = next(tmp_path.glob("*captured-chain*.csv"))
+    with graph_csv.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["status"] == "error"
+    assert "task_queue_enable" in row["error"]
+
+
+def test_norm_quant_rejects_self_consistent_unknown_output_contract(
+    tmp_path,
+):
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    def forge_contract(metrics):
+        metrics.preallocated_output_contract = "bogus_contract_label"
+        metrics.preallocated_output_aliases_verified = 0
+        metrics.preallocated_output_contract_invocations_per_repeat = 0
+        metrics.output_allocation_mode = (
+            "no_preallocated_output_buffer_verified"
+        )
+        metrics.timed_output_capture_policy = (
+            "capture_returns_retained_outside_timed_replay"
+        )
+        metrics.output_alias_verification_scope = (
+            "warmup_and_capture_returns"
+        )
+
+    events = []
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                events=events,
+            )
+        ),
+    )
+    suite.framework = _NormQuantFakeFramework(
+        tmp_path,
+        events,
+        metrics_mutator=forge_contract,
+    )
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        suite.run_curve_test(
+            variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+            tokens=[1],
+            hidden_sizes=[],
+            dispatch_mode="graph",
+            num_warmup=2,
+            num_iterations=2,
+            num_repeats=1,
+            num_stabilization_repeats=0,
+            plot_results=False,
+        )
+
+    graph_csv = next(tmp_path.glob("*captured-chain*.csv"))
+    with graph_csv.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["status"] == "error"
+    assert "preallocated_output_contract" in row["error"]
 
 
 def test_norm_quant_metrics_counts_must_match_requested_protocol(tmp_path):
@@ -1498,6 +1799,23 @@ def test_norm_quant_formal_latency_requires_exact_false_diagnostic(
                 "status": "ok",
                 "latency_ms": 0.25,
                 "profiler_is_diagnostic": diagnostic,
+            }
+        ])
+
+
+@pytest.mark.parametrize(
+    "latency",
+    [1, _ExactFloatAdversary(1.0)],
+)
+def test_norm_quant_formal_latency_requires_exact_float(latency):
+    from tests.test_norm_quant import validate_formal_latency_rows
+
+    with pytest.raises(ValueError, match="latency_ms"):
+        validate_formal_latency_rows([
+            {
+                "status": "ok",
+                "latency_ms": latency,
+                "profiler_is_diagnostic": False,
             }
         ])
 

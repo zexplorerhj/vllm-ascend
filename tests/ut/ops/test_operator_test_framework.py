@@ -12,7 +12,7 @@
 # limitations under the License.
 #
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields
 import gc
 from pathlib import Path
@@ -30,6 +30,8 @@ from operator_test_framework import (  # noqa: E402
     BaseOperatorTest,
     OperatorTestFramework,
     PerformanceMetrics,
+    ProfilerBackend,
+    ProfilerFactory,
     PrecisionType,
     build_curve_selection_provenance,
     build_fresh_iteration_plan,
@@ -39,8 +41,8 @@ from operator_test_framework import (  # noqa: E402
 
 class _FreshCpuOperator(BaseOperatorTest):
 
-    def __init__(self):
-        super().__init__("fresh_cpu")
+    def __init__(self, operator_name="fresh_cpu"):
+        super().__init__(operator_name)
         self.prepare_calls = 0
         self.execute_calls = 0
 
@@ -215,6 +217,53 @@ class _ContextOperator(_FreshCpuOperator):
         return super()._execute_core_operator(prepared_data, implementation)
 
 
+class _PreparedProfileOperator(_FreshCpuOperator):
+
+    def __init__(self):
+        super().__init__("PreparedProfile")
+        self.prepared_ids = []
+        self.executed_ids = []
+
+    def run_device_implementation(self, *args, **kwargs):
+        raise AssertionError("full device API must not enter core profile")
+
+    def _prepare_data_for_core_operator(
+        self, data, device, precision, implementation="default"
+    ):
+        payload = super()._prepare_data_for_core_operator(
+            data, device, precision, implementation
+        )
+        payload["payload_id"] = len(self.prepared_ids)
+        self.prepared_ids.append(payload["payload_id"])
+        return payload
+
+    def _execute_core_operator(self, prepared, implementation="default"):
+        self.executed_ids.append(prepared["payload_id"])
+        return super()._execute_core_operator(prepared, implementation)
+
+
+class _FakeProfiler:
+
+    def __init__(self, operator):
+        self.operator = operator
+        self.events = []
+        self.executed_at_start = []
+        self.executed_after_steps = []
+        self.executed_at_stop = []
+
+    def start(self):
+        self.events.append("start")
+        self.executed_at_start = list(self.operator.executed_ids)
+
+    def step(self):
+        self.events.append("step")
+        self.executed_after_steps.append(list(self.operator.executed_ids))
+
+    def stop(self):
+        self.events.append("stop")
+        self.executed_at_stop = list(self.operator.executed_ids)
+
+
 class _RepeatLifetimeOperator(_FreshCpuOperator):
 
     def __init__(self, invocations_per_repeat):
@@ -296,6 +345,88 @@ class _DirectRepeatLifetimeOperator(_PreallocatedOutputOperator):
 
 def _framework(tmp_path):
     return OperatorTestFramework(result_dir=str(tmp_path / "results"))
+
+
+def test_prepared_core_profile_dispatches_only_prepared_core_payloads(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _PreparedProfileOperator()
+    profiler = _FakeProfiler(operator)
+    profiler_configs = []
+
+    def prepare_on_cpu(
+        self,
+        data,
+        device,
+        precision,
+        implementation="default",
+    ):
+        del device, precision, implementation
+        self.prepare_calls += 1
+        return {"x": data["x"].clone()}
+
+    original_storage_ptrs = OperatorTestFramework._device_storage_ptrs
+
+    def cpu_backed_cuda_storage_ptrs(value, device_type):
+        if device_type == "cuda":
+            device_type = "cpu"
+        return original_storage_ptrs(value, device_type)
+
+    def create_profiler(config):
+        profiler_configs.append(config)
+        return profiler
+
+    monkeypatch.setattr(
+        _FreshCpuOperator,
+        "_prepare_data_for_core_operator",
+        prepare_on_cpu,
+    )
+    monkeypatch.setattr(
+        OperatorTestFramework,
+        "_device_storage_ptrs",
+        staticmethod(cpu_backed_cuda_storage_ptrs),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    monkeypatch.setattr(
+        ProfilerFactory,
+        "create_profiler",
+        staticmethod(create_profiler),
+    )
+
+    result = framework.run_core_operator_profile_test_v2(
+        operator_test=operator,
+        data=operator.generate_test_data(),
+        device="cuda:0",
+        precision=PrecisionType.FP32,
+        num_warmup=2,
+        num_iterations=3,
+        trace_file_path=str(tmp_path / "prepared-core-profile"),
+    )
+
+    assert operator.prepared_ids == [0, 1, 2, 3, 4]
+    assert profiler.executed_at_start == [0, 1]
+    assert profiler.executed_after_steps == [[0, 1, 2], [0, 1, 2, 3], [0, 1, 2, 3, 4]]
+    assert profiler.executed_at_stop == [0, 1, 2, 3, 4]
+    assert profiler.events == ["start", "step", "step", "step", "stop"]
+    assert len(profiler_configs) == 1
+    assert profiler_configs[0].backend is ProfilerBackend.CUDA
+    assert profiler_configs[0].schedule_active == 3
+    assert result == {
+        "profile_path": str(tmp_path / "prepared-core-profile"),
+        "provider": "default",
+        "device": "cuda:0",
+        "precision": "FP32",
+        "warmup_iterations": 2,
+        "profiled_invocations": 3,
+        "preallocated_invocations": 5,
+        "input_storage_sets_verified": 5,
+        "output_storage_sets_verified": 5,
+        "dispatch_mode": "eager_prepared_core",
+        "profiler_is_diagnostic": True,
+    }
 
 
 def test_performance_metrics_keeps_v4_positional_field_order():

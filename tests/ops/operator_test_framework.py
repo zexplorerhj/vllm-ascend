@@ -1415,6 +1415,164 @@ class OperatorTestFramework:
         
         return results
 
+    def run_core_operator_profile_test_v2(
+        self,
+        operator_test: BaseOperatorTest,
+        data: Dict[str, Any],
+        device: str,
+        precision: PrecisionType,
+        implementation: str = "default",
+        *,
+        num_warmup: int = 10,
+        num_iterations: int = 20,
+        trace_file_path: str,
+        profile_level: str = "Level1",
+        aic_metrics: str = "PipeUtilization",
+        verify_independent_storage: bool = True,
+    ) -> Dict[str, Any]:
+        """Profile prepared core-operator dispatch without full API calls."""
+        for count_name, count_value, minimum in (
+            ("num_warmup", num_warmup, 0),
+            ("num_iterations", num_iterations, 1),
+        ):
+            if not isinstance(count_value, int) or isinstance(
+                count_value,
+                bool,
+            ):
+                raise ValueError(f"{count_name} must be a non-bool int")
+            if count_value < minimum:
+                if minimum == 0:
+                    raise ValueError(f"{count_name} must be >= 0")
+                raise ValueError(f"{count_name} must be > {minimum - 1}")
+        if "npu" not in device and "cuda" not in device:
+            raise ValueError(
+                "prepared core profiling requires a CUDA or NPU device"
+            )
+
+        invocations = num_warmup + num_iterations
+        prepared_payloads: List[Any] = []
+        retained_outputs: List[Any] = []
+        prepared_input_values: Optional[List[Any]] = None
+        profiler = None
+        try:
+            with torch.inference_mode():
+                for _ in range(invocations):
+                    prepared_payloads.append(
+                        operator_test._prepare_data_for_core_operator(
+                            data,
+                            device,
+                            precision,
+                            implementation,
+                        )
+                    )
+
+            input_storage_sets_verified = 0
+            if verify_independent_storage:
+                prepared_input_values = [
+                    self._prepared_input_values(payload)
+                    for payload in prepared_payloads
+                ]
+                (
+                    input_storage_sets_verified,
+                    _,
+                ) = self._verify_independent_storage_sets(
+                    prepared_input_values,
+                    device,
+                    "prepared core profile input/workspace sets",
+                )
+
+            if "npu" in device:
+                device_context = torch_npu.npu.device(device)
+                backend = ProfilerBackend.NPU
+            else:
+                device_context = torch.cuda.device(torch.device(device))
+                backend = ProfilerBackend.CUDA
+            context_factory = getattr(
+                operator_test,
+                "_core_operator_benchmark_context",
+                None,
+            )
+            provider_context = (
+                context_factory(device, precision, implementation)
+                if context_factory is not None
+                else nullcontext()
+            )
+            profiler = ProfilerFactory.create_profiler(
+                ProfilerConfig(
+                    backend=backend,
+                    trace_file_path=trace_file_path,
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                    experimental_config={
+                        "profile_level": profile_level,
+                        "aic_metrics": aic_metrics,
+                    },
+                    schedule_wait=0,
+                    schedule_warmup=0,
+                    schedule_active=num_iterations,
+                    schedule_repeat=1,
+                    schedule_skip_first=0,
+                )
+            )
+            execute = operator_test._execute_core_operator
+
+            with device_context, provider_context, torch.inference_mode():
+                for payload in prepared_payloads[:num_warmup]:
+                    retained_outputs.append(execute(payload, implementation))
+                if "npu" in device:
+                    torch_npu.npu.synchronize()
+                else:
+                    torch.cuda.synchronize(torch.device(device))
+
+                profiler.start()
+                try:
+                    for payload in prepared_payloads[num_warmup:]:
+                        retained_outputs.append(execute(payload, implementation))
+                        profiler.step()
+                    if "npu" in device:
+                        torch_npu.npu.synchronize()
+                    else:
+                        torch.cuda.synchronize(torch.device(device))
+                finally:
+                    profiler.stop()
+
+            output_storage_sets_verified = 0
+            if verify_independent_storage:
+                (
+                    output_storage_sets_verified,
+                    _,
+                ) = self._verify_independent_storage_sets(
+                    retained_outputs,
+                    device,
+                    "prepared core profile output sets",
+                )
+                self._verify_disjoint_storage_domains(
+                    prepared_input_values,
+                    retained_outputs,
+                    device,
+                    "prepared core profile input/workspace and output domains",
+                )
+
+            return {
+                "profile_path": trace_file_path,
+                "provider": implementation,
+                "device": device,
+                "precision": precision.name,
+                "warmup_iterations": num_warmup,
+                "profiled_invocations": num_iterations,
+                "preallocated_invocations": invocations,
+                "input_storage_sets_verified": input_storage_sets_verified,
+                "output_storage_sets_verified": output_storage_sets_verified,
+                "dispatch_mode": "eager_prepared_core",
+                "profiler_is_diagnostic": True,
+            }
+        finally:
+            retained_outputs.clear()
+            prepared_payloads.clear()
+            prepared_input_values = None
+            gc.collect()
+
     def register_operator(self, operator_test: BaseOperatorTest):
         """注册算子测试"""
         self.operators[operator_test.operator_name] = operator_test

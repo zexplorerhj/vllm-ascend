@@ -1132,6 +1132,85 @@ _NPU_PROVIDER_CASES = [
 
 
 @pytest.mark.parametrize(
+    ("variant", "precision", "expected_logical", "expected_physical"),
+    [
+        (
+            NormQuantVariant.RMS_NORM_STATIC_FP8,
+            PrecisionType.FP8,
+            35_844,
+            78_848,
+        ),
+        (
+            NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+            PrecisionType.FP8,
+            64_516,
+            107_520,
+        ),
+        (
+            NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8,
+            PrecisionType.FP8,
+            64_516,
+            78_852,
+        ),
+        (
+            NormQuantVariant.RMS_NORM_DYNAMIC_MX,
+            PrecisionType.MXFP8,
+            36_064,
+            36_064,
+        ),
+        (
+            NormQuantVariant.RMS_NORM_DYNAMIC_MX,
+            PrecisionType.MXFP4,
+            32_480,
+            32_480,
+        ),
+        (
+            NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
+            PrecisionType.MXFP8,
+            64_736,
+            79_072,
+        ),
+        (
+            NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
+            PrecisionType.MXFP4,
+            61_152,
+            75_488,
+        ),
+    ],
+)
+def test_npu_950pr_physical_bytes_match_prepared_inputs_and_full_outputs(
+    monkeypatch,
+    variant,
+    precision,
+    expected_logical,
+    expected_physical,
+):
+    runtime = _FakeNpuRuntime()
+    operator = _npu_operator(variant, precision)
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+    implementation = operator.get_formal_implementations("npu:0")[0]
+    data = operator.generate_test_data(tokens=1, hidden=7168, seed=7)
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "npu:0",
+        precision,
+        implementation,
+    )
+    outputs = operator._execute_core_operator(prepared, implementation)
+    prepared_input_bytes = sum(
+        value.numel() * value.element_size()
+        for value in prepared.values()
+        if isinstance(value, torch.Tensor)
+    )
+    actual_output_bytes = operator.observable_output_bytes(outputs)
+
+    assert operator.logical_bytes(data) == expected_logical
+    assert prepared_input_bytes + actual_output_bytes == expected_physical
+    assert operator.physical_bytes(data) == expected_physical
+    assert operator.physical_bytes(data, outputs) == expected_physical
+
+
+@pytest.mark.parametrize(
     ("variant", "precision", "implementation"),
     _NPU_PROVIDER_CASES,
 )

@@ -580,6 +580,8 @@ def test_captured_chain_propagates_capture_failure_without_eager_fallback(
     monkeypatch,
     tmp_path,
 ):
+    from operator_test_framework import GraphCaptureUnsupportedError
+
     framework = _framework(tmp_path)
     operator = _MutableGraphOperator()
     event_window_active = _install_cpu_backed_cuda(monkeypatch)
@@ -604,7 +606,10 @@ def test_captured_chain_propagates_capture_failure_without_eager_fallback(
         lambda *args, **kwargs: pytest.fail("must not fall back to eager"),
     )
 
-    with pytest.raises(CaptureFailure, match="capture refused") as exc_info:
+    with pytest.raises(
+        GraphCaptureUnsupportedError,
+        match="capture refused",
+    ) as exc_info:
         _run_captured_chain(
             framework,
             operator,
@@ -612,7 +617,91 @@ def test_captured_chain_propagates_capture_failure_without_eager_fallback(
             num_iterations=2,
         )
 
-    assert exc_info.value is expected
+    assert exc_info.value.__cause__ is expected
+
+
+def test_captured_chain_replay_failure_is_not_capture_unsupported(
+    monkeypatch,
+    tmp_path,
+):
+    from operator_test_framework import GraphCaptureUnsupportedError
+
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(monkeypatch)
+    operator.event_window_active = event_window_active
+
+    def capture(
+        prepared_payloads,
+        execute_core_operator,
+        implementation,
+        device,
+    ):
+        del device
+        outputs = [
+            execute_core_operator(payload, implementation)
+            for payload in prepared_payloads
+        ]
+
+        def replay():
+            raise RuntimeError("graph replay failed after capture")
+
+        return SimpleNamespace(
+            replay=replay,
+            retained_outputs=outputs,
+            logical_invocations=len(prepared_payloads),
+        )
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        capture,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="graph replay failed after capture",
+    ) as exc_info:
+        _run_captured_chain(
+            framework,
+            operator,
+            num_iterations=2,
+        )
+
+    assert not isinstance(exc_info.value, GraphCaptureUnsupportedError)
+
+
+def test_captured_chain_capture_oom_is_not_capture_unsupported(
+    monkeypatch,
+    tmp_path,
+):
+    from operator_test_framework import GraphCaptureUnsupportedError
+
+    framework = _framework(tmp_path)
+    operator = _MutableGraphOperator()
+    event_window_active = _install_cpu_backed_cuda(monkeypatch)
+    operator.event_window_active = event_window_active
+
+    def oom_during_capture(*args, **kwargs):
+        raise torch.OutOfMemoryError("capture allocation exhausted")
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        oom_during_capture,
+    )
+
+    with pytest.raises(
+        torch.OutOfMemoryError,
+        match="capture allocation exhausted",
+    ) as exc_info:
+        _run_captured_chain(
+            framework,
+            operator,
+            num_iterations=2,
+        )
+
+    assert not isinstance(exc_info.value, GraphCaptureUnsupportedError)
 
 
 def test_mutable_graph_restore_runs_outside_event_window(
@@ -754,6 +843,8 @@ def test_captured_chain_rejects_reused_capture_outputs_before_replay(
     monkeypatch,
     tmp_path,
 ):
+    from operator_test_framework import GraphCaptureUnsupportedError
+
     framework = _framework(tmp_path)
     operator = _ReusedOutputOperator()
     _install_cpu_backed_cuda(monkeypatch)
@@ -800,7 +891,7 @@ def test_captured_chain_rejects_reused_capture_outputs_before_replay(
     with pytest.raises(
         RuntimeError,
         match="reuse device storage",
-    ):
+    ) as exc_info:
         _run_captured_chain(
             framework,
             operator,
@@ -809,6 +900,7 @@ def test_captured_chain_rejects_reused_capture_outputs_before_replay(
             verify_independent_storage=False,
         )
 
+    assert not isinstance(exc_info.value, GraphCaptureUnsupportedError)
     assert restore_calls == 0
     assert replay_calls == 0
 

@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+import statistics
 import sys
 import tempfile
 import time
@@ -25,6 +26,7 @@ from norm_quant import (  # noqa: E402
 from operator_test_framework import (  # noqa: E402
     FRESH_ITERATION_PLAN_FIELDS,
     PERFORMANCE_PROVENANCE_FIELDS,
+    GraphCaptureUnsupportedError,
     OperatorTestFramework,
     PrecisionType,
     build_curve_selection_provenance,
@@ -44,6 +46,7 @@ NORM_QUANT_FRESH_STORAGE_HARD_LIMIT_BYTES = 40 * 1024**3
 EVENT_WINDOW_TARGET_MIN_MS = 20.0
 EVENT_WINDOW_TARGET_MS = 30.0
 EVENT_WINDOW_TARGET_MAX_MS = 50.0
+H20_DEVICE_MODEL = "NVIDIA H20-3e"
 TERMINAL_STATUSES = frozenset({
     "ok",
     "unsupported",
@@ -115,6 +118,8 @@ NORM_QUANT_FIELDS = (
     "residual_semantics",
     "latency_ms",
     "effective_bandwidth_gb_s",
+    "effective_bandwidth_semantics",
+    "physical_bandwidth_gb_s",
     "status",
     "error",
     "capability_status",
@@ -199,7 +204,7 @@ def _atomic_write_csv(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
-    except BaseException:
+    except Exception:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
@@ -222,7 +227,7 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
-    except BaseException:
+    except Exception:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
@@ -254,6 +259,16 @@ def select_h20_best_envelope(
     """Select the lowest successful provider latency for each H20 point."""
     candidates = [dict(row) for row in rows if row.get("status") == "ok"]
     validate_formal_latency_rows(candidates)
+    non_h20_models = sorted({
+        str(row.get("device_model", ""))
+        for row in candidates
+        if row.get("device_model") != H20_DEVICE_MODEL
+    })
+    if non_h20_models:
+        raise ValueError(
+            f"H20 envelope requires device_model={H20_DEVICE_MODEL!r}; "
+            f"got {non_h20_models}"
+        )
     best: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     for row in candidates:
         key = (
@@ -584,6 +599,11 @@ def build_norm_quant_shape_points(
         for point in selected
         if point["point_index"] % num_shards == shard_index
     ]
+    if not selected:
+        raise ValueError(
+            "selected zero NormQuant points; choose a shard containing at "
+            "least one requested point"
+        )
     formal_requested = (
         token_values == FORMAL_TOKENS
         and hidden_values == FORMAL_HIDDEN_SIZES
@@ -799,8 +819,95 @@ class NormQuantTestSuite:
     @staticmethod
     def _verify_performance_provenance(
         provenance: Dict[str, Any],
+        metrics: Any,
+        *,
         dispatch_mode: str,
+        num_warmup: int,
+        num_iterations: int,
+        num_repeats: int,
+        num_stabilization_repeats: int,
     ) -> None:
+        def require_equal(field: str, actual: Any, expected: Any) -> None:
+            if actual != expected:
+                raise RuntimeError(
+                    f"{field} mismatch: {actual!r} != {expected!r}"
+                )
+
+        def require_metric(
+            field: str,
+            attribute: str,
+            expected: Any,
+        ) -> None:
+            if not hasattr(metrics, attribute):
+                raise RuntimeError(
+                    f"metrics.{attribute} is missing for {field}"
+                )
+            require_equal(
+                f"metrics.{attribute}",
+                getattr(metrics, attribute),
+                expected,
+            )
+
+        def require_close(field: str, actual: Any, expected: float) -> None:
+            if (
+                isinstance(actual, bool)
+                or not isinstance(actual, (int, float))
+                or not math.isfinite(float(actual))
+                or not math.isclose(
+                    float(actual),
+                    float(expected),
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise RuntimeError(
+                    f"{field} mismatch: {actual!r} != {expected!r}"
+                )
+
+        def parse_samples(field: str, count: int) -> List[float]:
+            raw = provenance[field]
+            try:
+                values = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(f"{field} is not valid JSON") from error
+            if not isinstance(values, list) or len(values) != count:
+                raise RuntimeError(
+                    f"{field} must contain exactly {count} samples"
+                )
+            samples: List[float] = []
+            for value in values:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) <= 0
+                ):
+                    raise RuntimeError(
+                        f"{field} contains invalid sample {value!r}"
+                    )
+                samples.append(float(value))
+            return samples
+
+        def require_sample_match(
+            field: str,
+            actual: Any,
+            expected: Sequence[float],
+        ) -> None:
+            if not isinstance(actual, (tuple, list)):
+                raise RuntimeError(f"{field} must be a sample sequence")
+            if len(actual) != len(expected):
+                raise RuntimeError(
+                    f"{field} must contain exactly {len(expected)} samples"
+                )
+            for index, (actual_value, expected_value) in enumerate(
+                zip(actual, expected)
+            ):
+                require_close(
+                    f"{field}[{index}]",
+                    actual_value,
+                    expected_value,
+                )
+
         missing = [
             field
             for field in PERFORMANCE_PROVENANCE_FIELDS
@@ -810,15 +917,425 @@ class NormQuantTestSuite:
             raise RuntimeError(
                 f"Framework V2 provenance missing fields: {missing}"
             )
+        require_equal(
+            "framework_api",
+            provenance["framework_api"],
+            "OperatorTestFramework.run_core_operator_performance_test_v2",
+        )
+        require_metric(
+            "framework_api",
+            "framework_api",
+            provenance["framework_api"],
+        )
+        require_equal(
+            "protocol_version",
+            provenance["protocol_version"],
+            "operator-test-framework-v2-fresh-v6",
+        )
+        require_metric(
+            "protocol_version",
+            "protocol_version",
+            provenance["protocol_version"],
+        )
+        requested_counts = {
+            "warmup": (num_warmup, "warmup_iterations"),
+            "iterations": (num_iterations, "iterations"),
+            "repeats": (num_repeats, "repeats"),
+            "stabilization_repeats": (
+                num_stabilization_repeats,
+                "stabilization_repeats",
+            ),
+        }
+        for field, (expected, attribute) in requested_counts.items():
+            require_equal(field, provenance[field], expected)
+            require_metric(field, attribute, expected)
+
+        repeat_samples = parse_samples("repeat_samples_ms", num_repeats)
+        stabilization_samples = parse_samples(
+            "stabilization_repeat_samples_ms",
+            num_stabilization_repeats,
+        )
+        require_sample_match(
+            "metrics.repeat_samples_ms",
+            getattr(metrics, "repeat_samples_ms", None),
+            repeat_samples,
+        )
+        require_sample_match(
+            "metrics.stabilization_repeat_samples_ms",
+            getattr(metrics, "stabilization_repeat_samples_ms", None),
+            stabilization_samples,
+        )
+        repeat_median = float(statistics.median(repeat_samples))
+        require_close(
+            "metrics.avg_time_ms",
+            getattr(metrics, "avg_time_ms", None),
+            repeat_median,
+        )
+        repeat_p25, _, repeat_p75 = (
+            statistics.quantiles(
+                repeat_samples,
+                n=4,
+                method="inclusive",
+            )
+            if len(repeat_samples) >= 2
+            else (repeat_samples[0], repeat_samples[0], repeat_samples[0])
+        )
+        repeat_iqr_pct = (
+            (repeat_p75 - repeat_p25) / repeat_median * 100.0
+        )
+        repeat_spread_pct = (
+            (max(repeat_samples) / min(repeat_samples) - 1.0) * 100.0
+        )
+        for field, expected in {
+            "repeat_min_ms": min(repeat_samples),
+            "repeat_median_ms": repeat_median,
+            "repeat_max_ms": max(repeat_samples),
+            "repeat_p25_ms": repeat_p25,
+            "repeat_p75_ms": repeat_p75,
+            "repeat_iqr_pct": repeat_iqr_pct,
+            "repeat_spread_pct": repeat_spread_pct,
+        }.items():
+            require_close(field, provenance[field], expected)
+
+        event_samples = parse_samples(
+            "event_window_samples_ms",
+            num_repeats,
+        )
+        expected_event_samples = [
+            sample * num_iterations for sample in repeat_samples
+        ]
+        require_sample_match(
+            "event_window_samples_ms",
+            event_samples,
+            expected_event_samples,
+        )
+        for field, expected in {
+            "event_window_min_ms": min(expected_event_samples),
+            "event_window_median_ms": statistics.median(
+                expected_event_samples
+            ),
+            "event_window_max_ms": max(expected_event_samples),
+        }.items():
+            require_close(field, provenance[field], expected)
+
+        expected_aggregation = (
+            "median_of_post_stabilization_repeat_means"
+            if num_repeats > 1 and num_stabilization_repeats
+            else "median_of_repeat_means"
+            if num_repeats > 1
+            else "single_post_stabilization_repeat_mean"
+            if num_stabilization_repeats
+            else "single_repeat_mean"
+        )
+        require_equal(
+            "aggregation",
+            provenance["aggregation"],
+            expected_aggregation,
+        )
+        require_metric(
+            "aggregation",
+            "aggregation",
+            expected_aggregation,
+        )
+
+        invocations = num_warmup + num_iterations
+        require_equal(
+            "preallocated_invocations_per_repeat",
+            provenance["preallocated_invocations_per_repeat"],
+            invocations,
+        )
+        require_metric(
+            "preallocated_invocations_per_repeat",
+            "preallocated_invocations_per_repeat",
+            invocations,
+        )
+        audited_storage_sets = (
+            num_iterations
+            if dispatch_mode == "captured_chain"
+            else invocations
+        )
+        for field, attribute in (
+            ("input_storage_sets_verified", "input_storage_sets_verified"),
+            ("output_storage_sets_verified", "output_storage_sets_verified"),
+        ):
+            require_equal(field, provenance[field], audited_storage_sets)
+            require_metric(field, attribute, audited_storage_sets)
+        for field, attribute in (
+            ("input_storage_ptr_count", "input_storage_ptr_count"),
+            ("output_storage_ptr_count", "output_storage_ptr_count"),
+            ("output_tensor_count", "output_tensor_count"),
+        ):
+            actual = provenance[field]
+            if (
+                not isinstance(actual, int)
+                or isinstance(actual, bool)
+                or actual < audited_storage_sets
+                or actual % audited_storage_sets != 0
+            ):
+                raise RuntimeError(
+                    f"{field} is inconsistent with audited storage sets"
+                )
+            require_metric(field, attribute, actual)
+        require_equal(
+            "input_reuse_within_repeat",
+            provenance["input_reuse_within_repeat"],
+            False,
+        )
+        require_metric(
+            "input_reuse_within_repeat",
+            "input_reuse_within_repeat",
+            False,
+        )
+        require_equal(
+            "input_output_storage_disjoint",
+            provenance["input_output_storage_disjoint"],
+            True,
+        )
+        require_metric(
+            "input_output_storage_disjoint",
+            "input_output_storage_disjoint",
+            True,
+        )
+
+        require_equal(
+            "output_unique_storages_per_set",
+            provenance["output_unique_storages_per_set"],
+            provenance["output_storage_ptr_count"] // audited_storage_sets,
+        )
+        require_equal(
+            "output_tensors_per_set",
+            provenance["output_tensors_per_set"],
+            provenance["output_tensor_count"] // audited_storage_sets,
+        )
+        require_equal(
+            "output_allocation_policy",
+            provenance["output_allocation_policy"],
+            provenance["output_allocation_mode"],
+        )
+        has_preallocated_contract = (
+            provenance["preallocated_output_contract"]
+            == "declared_phase_invariant_out"
+        )
+        expected_output_aliases = num_warmup if has_preallocated_contract else 0
+        require_equal(
+            "preallocated_output_aliases_verified",
+            provenance["preallocated_output_aliases_verified"],
+            expected_output_aliases,
+        )
+        require_equal(
+            "preallocated_output_sets_verified",
+            provenance["preallocated_output_sets_verified"],
+            expected_output_aliases,
+        )
+        require_metric(
+            "preallocated_output_aliases_verified",
+            "preallocated_output_aliases_verified",
+            expected_output_aliases,
+        )
+        expected_output_allocation_mode = (
+            "preallocated_output_contract_with_warmup_alias_probe"
+            if has_preallocated_contract
+            else "no_preallocated_output_buffer_verified"
+        )
+        require_equal(
+            "output_allocation_mode",
+            provenance["output_allocation_mode"],
+            expected_output_allocation_mode,
+        )
+        require_metric(
+            "output_allocation_mode",
+            "output_allocation_mode",
+            expected_output_allocation_mode,
+        )
+        require_metric(
+            "output_storage_policy",
+            "output_storage_policy",
+            provenance["output_storage_policy"],
+        )
+        require_metric(
+            "timed_output_capture_policy",
+            "timed_output_capture_policy",
+            provenance["timed_output_capture_policy"],
+        )
+        require_metric(
+            "preallocated_output_contract",
+            "preallocated_output_contract",
+            provenance["preallocated_output_contract"],
+        )
+        require_metric(
+            "output_alias_verification_scope",
+            "output_alias_verification_scope",
+            provenance["output_alias_verification_scope"],
+        )
+        expected_contract_invocations = (
+            invocations if has_preallocated_contract else 0
+        )
+        require_equal(
+            "preallocated_output_contract_invocations_per_repeat",
+            provenance[
+                "preallocated_output_contract_invocations_per_repeat"
+            ],
+            expected_contract_invocations,
+        )
+        require_metric(
+            "preallocated_output_contract_invocations_per_repeat",
+            "preallocated_output_contract_invocations_per_repeat",
+            expected_contract_invocations,
+        )
+        require_equal(
+            "output_verification_replay_invocations_per_repeat",
+            provenance[
+                "output_verification_replay_invocations_per_repeat"
+            ],
+            0,
+        )
+        require_metric(
+            "output_verification_replay_invocations_per_repeat",
+            "output_verification_replay_invocations_per_repeat",
+            0,
+        )
+        require_equal(
+            "workspace_allocation_policy",
+            provenance["workspace_allocation_policy"],
+            "not_audited",
+        )
+        require_metric(
+            "workspace_allocation_policy",
+            "workspace_allocation_policy",
+            "not_audited",
+        )
+        require_metric(
+            "task_queue_enable",
+            "task_queue_enable",
+            provenance["task_queue_enable"],
+        )
+
         diagnostic = provenance["profiler_is_diagnostic"]
         if diagnostic is True or str(diagnostic).lower() == "true":
             raise RuntimeError(
                 "diagnostic profiler result cannot enter formal latency"
             )
-        if provenance["dispatch_mode"] != dispatch_mode:
-            raise RuntimeError(
-                "Framework dispatch provenance does not match request"
-            )
+        require_metric(
+            "profiler_is_diagnostic",
+            "profiler_is_diagnostic",
+            False,
+        )
+        require_equal("dispatch_mode", provenance["dispatch_mode"], dispatch_mode)
+        require_metric("dispatch_mode", "dispatch_mode", dispatch_mode)
+
+        is_graph = dispatch_mode == "captured_chain"
+        dispatch_expectations = {
+            "graph_capture_width": num_iterations if is_graph else 0,
+            "graph_replays": 1 if is_graph else 0,
+            "capture_timed": False,
+            "mutable_inputs_restored": is_graph,
+            "timing_method": (
+                "device_event_graph_replay" if is_graph else "device_event"
+            ),
+            "timing_semantics": (
+                "device elapsed time; capture and mutable restore excluded"
+                if is_graph
+                else "device elapsed time; includes stream-idle gaps "
+                "between start/end events caused by host dispatch"
+            ),
+            "dispatch_loop_policy": (
+                "captured_prepared_payload_chain_single_replay"
+                if is_graph
+                else "python_direct_prepared_payload_loop"
+            ),
+            "output_storage_policy": (
+                "capture_outputs_retained_until_repeat_end"
+                if is_graph
+                else "retained_until_repeat_end"
+            ),
+            "timed_output_capture_policy": (
+                "preallocated_output_contract_no_timed_return_capture"
+                if has_preallocated_contract
+                else "capture_returns_retained_outside_timed_replay"
+                if is_graph
+                else "retained_return_inside_timed_region"
+            ),
+            "output_alias_verification_scope": (
+                "warmup_returns_only"
+                if has_preallocated_contract
+                else "warmup_and_capture_returns"
+                if is_graph
+                else "warmup_and_measured_returns"
+            ),
+        }
+        for field, expected in dispatch_expectations.items():
+            require_equal(field, provenance[field], expected)
+            require_metric(field, field, expected)
+        expected_calls = (
+            num_warmup + 2 * num_iterations if is_graph else invocations
+        )
+        require_equal(
+            "total_operator_calls_per_repeat",
+            provenance["total_operator_calls_per_repeat"],
+            expected_calls,
+        )
+        require_metric(
+            "total_operator_calls_per_repeat",
+            "total_operator_calls_per_repeat",
+            expected_calls,
+        )
+        expected_timed_region = (
+            "one graph replay containing I independent core invocations"
+            if is_graph
+            else "Python direct prepared-payload loop of "
+            "_execute_core_operator; prepare excluded; timed Python returns "
+            "discarded under declared out contract"
+            if provenance["timed_output_capture_policy"]
+            == "preallocated_output_contract_no_timed_return_capture"
+            else "Python direct prepared-payload loop of "
+            "_execute_core_operator plus return slot assignment; "
+            "prepare excluded"
+            if provenance["timed_output_capture_policy"]
+            == "retained_return_inside_timed_region"
+            else "Python direct prepared-payload loop of "
+            "_execute_core_operator; prepare excluded"
+        )
+        require_equal(
+            "timed_region",
+            provenance["timed_region"],
+            expected_timed_region,
+        )
+        require_metric("timed_region", "timed_region", expected_timed_region)
+        expected_stabilization_policy = (
+            "fresh_storage_full_window_priming_repeats"
+            if num_stabilization_repeats
+            else "none"
+        )
+        require_equal(
+            "device_stabilization_policy",
+            provenance["device_stabilization_policy"],
+            expected_stabilization_policy,
+        )
+        require_equal(
+            "device_stabilization_timed",
+            provenance["device_stabilization_timed"],
+            bool(num_stabilization_repeats),
+        )
+        require_metric(
+            "device_stabilization_policy",
+            "device_stabilization_policy",
+            expected_stabilization_policy,
+        )
+        require_metric(
+            "device_stabilization_timed",
+            "device_stabilization_timed",
+            bool(num_stabilization_repeats),
+        )
+        require_equal(
+            "stabilization_operator_calls",
+            provenance["stabilization_operator_calls"],
+            num_stabilization_repeats * expected_calls,
+        )
+        require_metric(
+            "stabilization_operator_calls",
+            "stabilization_operator_calls",
+            num_stabilization_repeats * expected_calls,
+        )
 
     def _write_terminal_row(
         self,
@@ -993,7 +1510,7 @@ class NormQuantTestSuite:
                 continue
 
             data_by_point_provider: Dict[Tuple[int, str], Dict[str, Any]] = {}
-            correctness_errors: Dict[Tuple[int, str], BaseException] = {}
+            correctness_errors: Dict[Tuple[int, str], Exception] = {}
             for point in points:
                 point_index = int(point["point_index"])
                 for provider in providers:
@@ -1010,12 +1527,12 @@ class NormQuantTestSuite:
                             self.precision,
                             provider,
                         )
-                    except BaseException as error:
+                    except Exception as error:
                         correctness_errors[(point_index, provider)] = error
 
             plans_by_point: Dict[int, Dict[str, Any]] = {}
             calibration_errors: Dict[
-                Tuple[int, str, str], BaseException
+                Tuple[int, str, str], Exception
             ] = {}
             for point in points:
                 point_index = int(point["point_index"])
@@ -1079,7 +1596,7 @@ class NormQuantTestSuite:
                                 calibration_samples[
                                     f"{provider}/{mode}"
                                 ] = latency
-                            except BaseException as error:
+                            except Exception as error:
                                 calibration_errors[(
                                     point_index,
                                     provider,
@@ -1196,7 +1713,10 @@ class NormQuantTestSuite:
                                 provider,
                                 mode,
                             )]
-                            if mode == "captured_chain":
+                            if isinstance(
+                                calibration_error,
+                                GraphCaptureUnsupportedError,
+                            ):
                                 row.update(
                                     status="unsupported_graph_capture",
                                     error=(
@@ -1211,6 +1731,11 @@ class NormQuantTestSuite:
                                     error=(
                                         f"{type(calibration_error).__name__}: "
                                         f"{calibration_error}"
+                                    ),
+                                    graph_status=(
+                                        "calibration_error"
+                                        if mode == "captured_chain"
+                                        else "not_applicable"
                                     ),
                                 )
                         else:
@@ -1234,8 +1759,11 @@ class NormQuantTestSuite:
                                         dispatch_mode=mode,
                                     )
                                 )
-                            except BaseException as error:
-                                if mode == "captured_chain":
+                            except Exception as error:
+                                if isinstance(
+                                    error,
+                                    GraphCaptureUnsupportedError,
+                                ):
                                     row.update(
                                         status="unsupported_graph_capture",
                                         error=f"{type(error).__name__}: {error}",
@@ -1245,6 +1773,11 @@ class NormQuantTestSuite:
                                     row.update(
                                         status="error",
                                         error=f"{type(error).__name__}: {error}",
+                                        graph_status=(
+                                            "formal_execution_error"
+                                            if mode == "captured_chain"
+                                            else "not_applicable"
+                                        ),
                                     )
                             else:
                                 try:
@@ -1255,7 +1788,14 @@ class NormQuantTestSuite:
                                     )
                                     self._verify_performance_provenance(
                                         provenance,
-                                        mode,
+                                        metrics,
+                                        dispatch_mode=mode,
+                                        num_warmup=effective_warmup,
+                                        num_iterations=effective_iterations,
+                                        num_repeats=num_repeats,
+                                        num_stabilization_repeats=(
+                                            num_stabilization_repeats
+                                        ),
                                     )
                                     latency = float(metrics.avg_time_ms)
                                     if (
@@ -1265,7 +1805,7 @@ class NormQuantTestSuite:
                                         raise RuntimeError(
                                             f"invalid Event latency: {latency}"
                                         )
-                                except BaseException as error:
+                                except Exception as error:
                                     row.update(
                                         status="error",
                                         error=f"{type(error).__name__}: {error}",
@@ -1284,6 +1824,13 @@ class NormQuantTestSuite:
                                                 data,
                                                 latency,
                                             )
+                                        ),
+                                        effective_bandwidth_semantics=(
+                                            "logical_bytes / Event latency"
+                                        ),
+                                        physical_bandwidth_gb_s=(
+                                            operator.physical_bytes(data)
+                                            / (latency * 1e6)
                                         ),
                                         status="ok",
                                         graph_status=(
@@ -1308,7 +1855,7 @@ class NormQuantTestSuite:
         validate_formal_latency_rows(all_rows)
         envelope_rows: List[Dict[str, Any]] = []
         envelope_files: List[str] = []
-        if self.device.startswith("cuda"):
+        if _device_model(self.device) == H20_DEVICE_MODEL:
             envelope_rows = select_h20_best_envelope(all_rows)
             for variant in selected_variants:
                 for mode in dispatches:
@@ -1512,7 +2059,7 @@ class NormQuantTestSuite:
                             profiler_is_diagnostic=True,
                             status="ok",
                         )
-                    except BaseException as error:
+                    except Exception as error:
                         failures.append(error)
                         manifest = {
                             "variant": variant.value,
@@ -1570,6 +2117,7 @@ class NormQuantTestSuite:
             for metric, ylabel in (
                 ("latency_ms", "Latency (ms)"),
                 ("effective_bandwidth_gb_s", "Effective bandwidth (GB/s)"),
+                ("physical_bandwidth_gb_s", "Physical bandwidth (GB/s)"),
             ):
                 figure, axes = plt.subplots(1, 2, figsize=(14, 6))
                 for axis, sweep in zip(axes, ("tokens", "hidden")):
@@ -1778,7 +2326,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 num_shards=args.num_shards,
             )
         return 0
-    except BaseException as error:
+    except Exception as error:
         print(
             f"NormQuant formal command failed: {type(error).__name__}: {error}",
             file=sys.stderr,

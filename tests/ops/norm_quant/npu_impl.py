@@ -565,6 +565,66 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             )
         return self._invoke_native(prepared_data)
 
+    def _retained_prepared_input_bytes(
+        self,
+        data: Dict[str, Any],
+    ) -> int:
+        """Count every tensor retained in one native prepared payload."""
+        x = data["x"]
+        weight = data["weight"]
+        x_bytes = x.numel() * x.element_size()
+        weight_bytes = weight.numel() * weight.element_size()
+        total = x_bytes + weight_bytes
+        if self.is_add_variant:
+            # The native residual and immutable restore seed are both retained.
+            total += 2 * x_bytes
+        if self.is_static_variant:
+            # Ascend's static ABI requires vector scale and offset tensors.
+            total += 2 * weight_bytes
+        if self.variant is NormQuantVariant.RMS_NORM_STATIC_FP8:
+            # This native ABI also requires a materialized beta vector.
+            total += weight_bytes
+        return total
+
+    def _native_output_contract_bytes(
+        self,
+        data: Dict[str, Any],
+    ) -> int:
+        """Count the complete allocating NPU tuple, including x_out."""
+        tokens, hidden = data["x"].shape
+        matrix_elements = tokens * hidden
+        if self.is_static_variant:
+            total = matrix_elements
+        elif self.is_dynamic_fp8_variant:
+            total = matrix_elements + tokens * 4
+        elif self.is_mx_variant:
+            quantized = (
+                matrix_elements
+                if self.precision is PrecisionType.MXFP8
+                else matrix_elements // 2
+            )
+            total = quantized + tokens * ((hidden + 63) // 64) * 2
+        else:
+            raise ValueError(
+                f"unsupported NPU NormQuant variant {self.variant}"
+            )
+        if self.is_add_variant:
+            total += matrix_elements * data["x"].element_size()
+        return total
+
+    def physical_bytes(
+        self,
+        data: Dict[str, Any],
+        outputs: Optional[Any] = None,
+    ) -> int:
+        """Return the retained native NPU input plus full tuple output bytes."""
+        output_bytes = (
+            self._native_output_contract_bytes(data)
+            if outputs is None
+            else self.observable_output_bytes(outputs)
+        )
+        return self._retained_prepared_input_bytes(data) + output_bytes
+
     @staticmethod
     def _result_tuple(result: Any, expected_arity: int) -> Tuple[Any, ...]:
         outputs = result if isinstance(result, tuple) else (result,)

@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 import json
 
+
+class GraphCaptureUnsupportedError(RuntimeError):
+    """The backend rejected graph creation or capture."""
+
+
 class ProfilerBackend(Enum):
     """Profiler后端类型"""
     NPU = "npu"
@@ -2005,14 +2010,21 @@ class OperatorTestFramework:
                     torch.cuda.synchronize(torch.device(device))
 
                 if dispatch_mode == "captured_chain":
-                    captured_chain = (
-                        self._capture_prepared_payload_chain_v2(
-                            measured_payloads,
-                            execute_core_operator,
-                            implementation,
-                            device,
+                    try:
+                        captured_chain = (
+                            self._capture_prepared_payload_chain_v2(
+                                measured_payloads,
+                                execute_core_operator,
+                                implementation,
+                                device,
+                            )
                         )
-                    )
+                    except (MemoryError, torch.OutOfMemoryError):
+                        raise
+                    except Exception as error:
+                        raise GraphCaptureUnsupportedError(
+                            f"graph capture is unsupported: {error}"
+                        ) from error
                     if (
                         captured_chain.logical_invocations
                         != num_iterations

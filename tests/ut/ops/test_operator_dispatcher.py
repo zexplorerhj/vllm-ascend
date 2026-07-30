@@ -22,6 +22,7 @@ import pytest
 
 OPS_ROOT = Path(__file__).resolve().parents[2] / "ops"
 DISPATCHER = OPS_ROOT / "run_tests.sh"
+NORM_QUANT_ENTRY = OPS_ROOT / "tests" / "test_norm_quant.py"
 
 
 def _dry_run(*args: str) -> list[list[str]]:
@@ -283,6 +284,36 @@ def test_formal_norm_quant_rejects_warmup_below_two(tmp_path, warmup):
     assert "warmup" in completed.stderr.lower()
     assert "2" in completed.stderr
     assert "DRY-RUN:" not in completed.stdout
+
+
+def test_norm_quant_cli_rejects_empty_selected_quick_shard(tmp_path):
+    completed = subprocess.run(
+        [
+            "python3",
+            str(NORM_QUANT_ENTRY),
+            "--mode",
+            "curve",
+            "--precision",
+            "fp8",
+            "--device",
+            "cuda:0",
+            "--result-dir",
+            str(tmp_path),
+            "--quick",
+            "--shard-index",
+            "2",
+            "--num-shards",
+            "4",
+            "--no-plot",
+        ],
+        cwd=OPS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "selected zero normquant points" in completed.stderr.lower()
+    assert not list(tmp_path.glob("*.csv"))
 
 
 @pytest.mark.parametrize(

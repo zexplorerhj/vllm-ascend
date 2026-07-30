@@ -1836,6 +1836,7 @@ class OperatorTestFramework:
         device_context = None
         captured_chain = None
         measured_payloads = None
+        input_audit_payloads = None
         timed_output_capture_policy = "not_retained"
         preallocated_output_contract = "not_declared"
         output_alias_verification_scope = "not_retained"
@@ -1863,10 +1864,19 @@ class OperatorTestFramework:
 
             verified_input_sets = 0
             verified_input_ptrs = 0
-            if verify_independent_storage:
+            measured_payloads = prepared_data_list[num_warmup:]
+            if (
+                verify_independent_storage
+                or dispatch_mode == "captured_chain"
+            ):
+                input_audit_payloads = (
+                    measured_payloads
+                    if dispatch_mode == "captured_chain"
+                    else prepared_data_list
+                )
                 prepared_input_values = [
                     self._prepared_input_values(prepared_value)
-                    for prepared_value in prepared_data_list
+                    for prepared_value in input_audit_payloads
                 ]
                 (
                     verified_input_sets,
@@ -1874,7 +1884,11 @@ class OperatorTestFramework:
                 ) = self._verify_independent_storage_sets(
                     prepared_input_values,
                     device,
-                    "V2 prepared input/workspace sets",
+                    (
+                        "V2 captured measured input/workspace sets"
+                        if dispatch_mode == "captured_chain"
+                        else "V2 prepared input/workspace sets"
+                    ),
                 )
 
             if "npu" in device:
@@ -1973,6 +1987,9 @@ class OperatorTestFramework:
                     )
 
             execute_core_operator = operator_test._execute_core_operator
+            verified_output_sets = 0
+            verified_output_ptrs = 0
+            verified_output_tensors = 0
             with device_context, provider_context, torch.inference_mode():
                 for warmup_index in range(num_warmup):
                     output = execute_core_operator(
@@ -1987,7 +2004,6 @@ class OperatorTestFramework:
                 elif "cuda" in device:
                     torch.cuda.synchronize(torch.device(device))
 
-                measured_payloads = prepared_data_list[num_warmup:]
                 if dispatch_mode == "captured_chain":
                     captured_chain = (
                         self._capture_prepared_payload_chain_v2(
@@ -2006,6 +2022,36 @@ class OperatorTestFramework:
                             f"{captured_chain.logical_invocations} != "
                             f"{num_iterations}"
                         )
+                    if (
+                        len(captured_chain.retained_outputs)
+                        != num_iterations
+                    ):
+                        raise RuntimeError(
+                            "captured chain output count mismatch: "
+                            f"{len(captured_chain.retained_outputs)} != "
+                            f"{num_iterations}"
+                        )
+                    (
+                        verified_output_sets,
+                        verified_output_ptrs,
+                    ) = self._verify_independent_storage_sets(
+                        captured_chain.retained_outputs,
+                        device,
+                        "V2 captured functional output sets",
+                    )
+                    verified_output_tensors = sum(
+                        self._device_tensor_count(value, device_type)
+                        for value in captured_chain.retained_outputs
+                    )
+                    self._verify_disjoint_storage_domains(
+                        prepared_input_values,
+                        captured_chain.retained_outputs,
+                        device,
+                        (
+                            "V2 captured measured input/workspace and "
+                            "output storage domains"
+                        ),
+                    )
                     if (
                         not direct_preallocated_timing
                         and retain_outputs
@@ -2050,9 +2096,6 @@ class OperatorTestFramework:
                         f"invalid repeat latency: {repeat_time_ms} ms"
                     )
 
-            verified_output_sets = 0
-            verified_output_ptrs = 0
-            verified_output_tensors = 0
             alias_prepared_data = prepared_data_list
             alias_outputs = retained_outputs
             if direct_preallocated_timing:
@@ -2060,11 +2103,15 @@ class OperatorTestFramework:
                     tuple(self._prepared_output_values(prepared_value))
                     for prepared_value in prepared_data_list
                 ]
-                verified_output_tensors = sum(
-                    self._device_tensor_count(value, device_type)
-                    for value in prepared_output_values
-                )
-                if verify_independent_storage:
+                if dispatch_mode != "captured_chain":
+                    verified_output_tensors = sum(
+                        self._device_tensor_count(value, device_type)
+                        for value in prepared_output_values
+                    )
+                if (
+                    verify_independent_storage
+                    and dispatch_mode != "captured_chain"
+                ):
                     (
                         verified_output_sets,
                         verified_output_ptrs,
@@ -2075,7 +2122,10 @@ class OperatorTestFramework:
                     )
                 alias_prepared_data = prepared_data_list[:num_warmup]
                 alias_outputs = retained_outputs
-            elif retain_outputs:
+            elif (
+                retain_outputs
+                and dispatch_mode != "captured_chain"
+            ):
                 verified_output_tensors = sum(
                     self._device_tensor_count(value, device_type)
                     for value in retained_outputs
@@ -2084,6 +2134,7 @@ class OperatorTestFramework:
                 verify_independent_storage
                 and retain_outputs
                 and not direct_preallocated_timing
+                and dispatch_mode != "captured_chain"
             ):
                 (
                     verified_output_sets,
@@ -2134,7 +2185,11 @@ class OperatorTestFramework:
                         f"{verified_output_aliases}"
                     )
 
-            if verify_independent_storage and retain_outputs:
+            if (
+                verify_independent_storage
+                and retain_outputs
+                and dispatch_mode != "captured_chain"
+            ):
                 output_domain_values = (
                     prepared_output_values
                     if direct_preallocated_timing
@@ -2177,6 +2232,7 @@ class OperatorTestFramework:
             device_context = None
             captured_chain = None
             measured_payloads = None
+            input_audit_payloads = None
             gc.collect()
             try:
                 if "npu" in device:
@@ -2427,7 +2483,11 @@ class OperatorTestFramework:
                 f"{output_alias_scopes}"
             )
         output_alias_verification_scope = output_alias_scopes[0]
-        if not retain_outputs:
+        if dispatch_mode == "captured_chain" and not retain_outputs:
+            output_allocation_mode = (
+                "capture_outputs_verified_retained_through_replay_only"
+            )
+        elif not retain_outputs:
             output_allocation_mode = "not_retained_unverified"
         elif timed_output_capture_policy == (
             "preallocated_output_contract_no_timed_return_capture"
@@ -2505,7 +2565,11 @@ class OperatorTestFramework:
             input_storage_sets_verified=input_sets_verified,
             input_storage_ptr_count=input_ptr_count,
             input_output_storage_disjoint=bool(
-                verify_independent_storage and retain_outputs
+                dispatch_mode == "captured_chain"
+                or (
+                    verify_independent_storage
+                    and retain_outputs
+                )
             ),
             output_storage_sets_verified=output_sets_verified,
             output_storage_ptr_count=output_ptr_count,

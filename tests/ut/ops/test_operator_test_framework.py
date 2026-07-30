@@ -519,7 +519,7 @@ def test_captured_chain_times_one_replay_of_independent_payloads(
         operator,
         num_iterations=num_iterations,
         retain_outputs=True,
-        verify_independent_storage=True,
+        verify_independent_storage=False,
     )
 
     assert captured_payload_ids == list(range(num_iterations))
@@ -536,6 +536,9 @@ def test_captured_chain_times_one_replay_of_independent_payloads(
     assert metrics.mutable_inputs_restored is True
     assert metrics.graph_replays == 1
     assert metrics.profiler_is_diagnostic is False
+    assert metrics.input_storage_sets_verified == num_iterations
+    assert metrics.output_storage_sets_verified == num_iterations
+    assert metrics.input_output_storage_disjoint is True
     provenance = framework.performance_provenance(metrics)
     assert provenance["timing_method"] == "device_event_graph_replay"
     assert provenance["timing_semantics"] == (
@@ -719,6 +722,149 @@ def test_captured_chain_retains_capture_outputs_through_replay(
     assert len(capture_output_refs) == 2
 
 
+def test_captured_chain_rejects_reused_measured_inputs_without_opt_in(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _ReusedInputOperator()
+    _install_cpu_backed_cuda(monkeypatch)
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        lambda *args, **kwargs: pytest.fail(
+            "invalid measured inputs must fail before capture"
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="reuse device storage",
+    ):
+        _run_captured_chain(
+            framework,
+            operator,
+            num_iterations=2,
+            retain_outputs=False,
+            verify_independent_storage=False,
+        )
+
+
+def test_captured_chain_rejects_reused_capture_outputs_before_replay(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _ReusedOutputOperator()
+    _install_cpu_backed_cuda(monkeypatch)
+    replay_calls = 0
+    restore_calls = 0
+
+    def capture(
+        prepared_payloads,
+        execute_core_operator,
+        implementation,
+        device,
+    ):
+        del device
+        outputs = [
+            execute_core_operator(payload, implementation)
+            for payload in prepared_payloads
+        ]
+
+        def replay():
+            nonlocal replay_calls
+            replay_calls += 1
+
+        return SimpleNamespace(
+            replay=replay,
+            retained_outputs=outputs,
+            logical_invocations=len(prepared_payloads),
+        )
+
+    def restore(*args, **kwargs):
+        nonlocal restore_calls
+        restore_calls += 1
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        capture,
+    )
+    monkeypatch.setattr(
+        operator,
+        "_restore_mutable_graph_inputs",
+        restore,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="reuse device storage",
+    ):
+        _run_captured_chain(
+            framework,
+            operator,
+            num_iterations=2,
+            retain_outputs=False,
+            verify_independent_storage=False,
+        )
+
+    assert restore_calls == 0
+    assert replay_calls == 0
+
+
+def test_captured_chain_rejects_capture_output_input_alias_before_replay(
+    monkeypatch,
+    tmp_path,
+):
+    framework = _framework(tmp_path)
+    operator = _InPlaceInputAliasOperator()
+    _install_cpu_backed_cuda(monkeypatch)
+    replay_calls = 0
+
+    def capture(
+        prepared_payloads,
+        execute_core_operator,
+        implementation,
+        device,
+    ):
+        del device
+        outputs = [
+            execute_core_operator(payload, implementation)
+            for payload in prepared_payloads
+        ]
+
+        def replay():
+            nonlocal replay_calls
+            replay_calls += 1
+
+        return SimpleNamespace(
+            replay=replay,
+            retained_outputs=outputs,
+            logical_invocations=len(prepared_payloads),
+        )
+
+    monkeypatch.setattr(
+        framework,
+        "_capture_prepared_payload_chain_v2",
+        capture,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="input/workspace and output storage domains overlap",
+    ):
+        _run_captured_chain(
+            framework,
+            operator,
+            num_iterations=2,
+            retain_outputs=False,
+            verify_independent_storage=False,
+        )
+
+    assert replay_calls == 0
+
+
 def test_captured_chain_builds_fresh_payloads_and_graph_each_repeat(
     monkeypatch,
     tmp_path,
@@ -732,9 +878,35 @@ def test_captured_chain_builds_fresh_payloads_and_graph_each_repeat(
     operator.event_window_active = event_window_active
     captured_id_groups = []
     captured_pointer_groups = []
-    captured_chains = []
     payload_refs = []
     prior_payloads_alive_at_capture = []
+    graph_refs = []
+    chain_refs = []
+    graph_ids = []
+    chain_ids = []
+    prior_capture_objects_alive = []
+
+    class GraphSentinel:
+
+        def __init__(self, identity):
+            self.identity = identity
+
+        def replay(self):
+            return None
+
+    class ChainSentinel:
+
+        def __init__(
+            self,
+            identity,
+            graph,
+            outputs,
+            logical_invocations,
+        ):
+            self.identity = identity
+            self.replay = graph.replay
+            self.retained_outputs = outputs
+            self.logical_invocations = logical_invocations
 
     def capture(
         prepared_payloads,
@@ -747,6 +919,10 @@ def test_captured_chain_builds_fresh_payloads_and_graph_each_repeat(
         prior_payloads_alive_at_capture.append(
             sum(ref() is not None for ref in payload_refs)
         )
+        prior_capture_objects_alive.append((
+            sum(ref() is not None for ref in graph_refs),
+            sum(ref() is not None for ref in chain_refs),
+        ))
         captured_id_groups.append([
             payload["payload_id"] for payload in prepared_payloads
         ])
@@ -761,12 +937,18 @@ def test_captured_chain_builds_fresh_payloads_and_graph_each_repeat(
             execute_core_operator(payload, implementation)
             for payload in prepared_payloads
         ]
-        chain = SimpleNamespace(
-            replay=lambda: None,
-            retained_outputs=outputs,
-            logical_invocations=len(prepared_payloads),
+        capture_identity = len(graph_ids)
+        graph = GraphSentinel(capture_identity)
+        chain = ChainSentinel(
+            capture_identity,
+            graph,
+            outputs,
+            len(prepared_payloads),
         )
-        captured_chains.append(chain)
+        graph_ids.append(graph.identity)
+        chain_ids.append(chain.identity)
+        graph_refs.append(weakref.ref(graph))
+        chain_refs.append(weakref.ref(chain))
         return chain
 
     monkeypatch.setattr(
@@ -785,12 +967,17 @@ def test_captured_chain_builds_fresh_payloads_and_graph_each_repeat(
     )
 
     assert captured_id_groups == [[1, 2], [4, 5]]
-    assert len({id(chain) for chain in captured_chains}) == 2
+    assert graph_ids == [0, 1]
+    assert chain_ids == [0, 1]
     assert all(
         len(set(pointer_group)) == 2
         for pointer_group in captured_pointer_groups
     )
     assert prior_payloads_alive_at_capture == [0, 0]
+    assert prior_capture_objects_alive == [(0, 0), (0, 0)]
+    gc.collect()
+    assert all(ref() is None for ref in graph_refs)
+    assert all(ref() is None for ref in chain_refs)
     assert metrics.repeat_samples_ms == [3.0, 3.0]
 
 

@@ -80,6 +80,46 @@ def _patch_prepare(monkeypatch, operator, implementation, raw_op):
         )
 
 
+def _dynamic_vllm_oracle(x, residual, weight, eps):
+    combined = x.float() + residual.float()
+    rms = torch.rsqrt(combined.square().mean(dim=-1, keepdim=True) + eps)
+    quant_values = ((combined * rms).to(x.dtype) * weight).float()
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    minimum_scale = 1.0 / (fp8_max * 512.0)
+    scales = (
+        quant_values.abs().amax(dim=-1, keepdim=True) / fp8_max
+    ).clamp_min(minimum_scale)
+    codes = (
+        (quant_values / scales)
+        .clamp(min=-fp8_max, max=fp8_max)
+        .to(torch.float8_e4m3fn)
+    )
+    residual_out = combined.to(x.dtype)
+    return codes, scales.to(torch.float32), residual_out
+
+
+def _dynamic_fake(mode):
+    def fake_raw(output, x, weight, scales, eps, bias, residual):
+        assert bias is None
+        codes, expected_scales, residual_out = _dynamic_vllm_oracle(
+            x,
+            residual,
+            weight,
+            eps,
+        )
+        if mode == "correct":
+            output.copy_(codes)
+            scales.copy_(expected_scales)
+        elif mode == "same_dequant_wrong_scale":
+            output.copy_((codes.float() / 2.0).to(output.dtype))
+            scales.copy_(expected_scales * 2.0)
+        else:
+            raise AssertionError(f"unknown fake mode {mode}")
+        residual.copy_(residual_out)
+
+    return fake_raw
+
+
 def test_common_generation_reference_and_byte_accounting_are_observable():
     operator = _operator(NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8)
     data = _data(operator, tokens=2, hidden=4)
@@ -490,3 +530,114 @@ def test_auxiliary_correctness_rejects_bad_dynamic_scale_before_use(
 
     with pytest.raises(AssertionError, match="dynamic scale"):
         operator.validate_prepared_correctness(data, prepared, outputs)
+
+
+def test_auxiliary_correctness_accepts_vllm_dynamic_scale_and_codes(
+    monkeypatch,
+):
+    operator = _operator(NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8)
+    _patch_prepare(
+        monkeypatch,
+        operator,
+        VLLM_DYNAMIC_ADD,
+        _dynamic_fake("correct"),
+    )
+    data = _data(operator)
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        VLLM_DYNAMIC_ADD,
+    )
+    outputs = operator._execute_core_operator(prepared, VLLM_DYNAMIC_ADD)
+
+    operator.validate_prepared_correctness(data, prepared, outputs)
+
+
+def test_auxiliary_correctness_rejects_wrong_scale_with_same_dequant(
+    monkeypatch,
+):
+    operator = _operator(NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8)
+    _patch_prepare(
+        monkeypatch,
+        operator,
+        VLLM_DYNAMIC_ADD,
+        _dynamic_fake("same_dequant_wrong_scale"),
+    )
+    data = _data(operator)
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        VLLM_DYNAMIC_ADD,
+    )
+    outputs = operator._execute_core_operator(prepared, VLLM_DYNAMIC_ADD)
+    correct_codes, correct_scales, _ = _dynamic_vllm_oracle(
+        prepared["x"],
+        prepared["residual_seed"],
+        prepared["weight"],
+        prepared["eps"],
+    )
+    torch.testing.assert_close(
+        outputs[0].float() * outputs[1],
+        correct_codes.float() * correct_scales,
+        rtol=0,
+        atol=0,
+    )
+
+    with pytest.raises(AssertionError, match="dynamic scale semantics"):
+        operator.validate_prepared_correctness(data, prepared, outputs)
+
+
+def test_auxiliary_correctness_uses_vllm_zero_row_scale_semantics(
+    monkeypatch,
+):
+    operator = _operator(NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8)
+    _patch_prepare(
+        monkeypatch,
+        operator,
+        VLLM_DYNAMIC_ADD,
+        _dynamic_fake("correct"),
+    )
+    data = _data(operator)
+    data["x"].zero_()
+    data["residual"].zero_()
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        VLLM_DYNAMIC_ADD,
+    )
+    outputs = operator._execute_core_operator(prepared, VLLM_DYNAMIC_ADD)
+
+    operator.validate_prepared_correctness(data, prepared, outputs)
+    torch.testing.assert_close(
+        outputs[1],
+        torch.full_like(outputs[1], 1.0 / (448.0 * 512.0)),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.count_nonzero(outputs[0].float()) == 0
+
+
+def test_auxiliary_correctness_rejects_unexpected_static_saturation(
+    monkeypatch,
+):
+    operator = _operator(NormQuantVariant.RMS_NORM_STATIC_FP8)
+
+    def fake_raw(output, x, weight, scale, eps):
+        del x, weight, scale, eps
+        output.fill_(torch.finfo(torch.float8_e4m3fn).max)
+
+    _patch_prepare(monkeypatch, operator, VLLM_STATIC_RMS, fake_raw)
+    data = _data(operator)
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "cpu",
+        PrecisionType.FP8,
+        VLLM_STATIC_RMS,
+    )
+    result = operator._execute_core_operator(prepared, VLLM_STATIC_RMS)
+
+    with pytest.raises(AssertionError, match="static FP8 saturation"):
+        operator.validate_prepared_correctness(data, prepared, result)

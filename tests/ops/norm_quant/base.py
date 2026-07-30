@@ -32,6 +32,11 @@ _MX_VARIANTS = frozenset({
     NormQuantVariant.RMS_NORM_DYNAMIC_MX,
     NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
 })
+_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+_FP8_MIN_DYNAMIC_SCALE = 1.0 / (_FP8_MAX * 512.0)
+_STATIC_FP8_TARGET_CODE = 384.0
+_DYNAMIC_SCALE_RTOL = 2e-3
+_FP8_CODE_MAX_ULP = 1
 
 
 class NormQuantOperatorTestBase(BaseOperatorTest):
@@ -325,6 +330,84 @@ class NormQuantOperatorTestBase(BaseOperatorTest):
     ) -> torch.Tensor:
         return output.float() * scale.float()
 
+    @staticmethod
+    def _vllm_dynamic_quant_values(
+        x: torch.Tensor,
+        residual_seed: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Mirror vLLM's BF16 intermediate before per-token absmax."""
+        combined = x.float() + residual_seed.float()
+        rms = torch.rsqrt(
+            combined.square().mean(dim=-1, keepdim=True) + eps
+        )
+        return ((combined * rms).to(x.dtype) * weight).float()
+
+    @staticmethod
+    def _vllm_static_quant_values(
+        x: torch.Tensor,
+        residual_seed: Optional[torch.Tensor],
+        weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Mirror vLLM's source-dtype add and final BF16 quant input."""
+        normalized_input = (
+            x
+            if residual_seed is None
+            else x.to(x.dtype) + residual_seed.to(x.dtype)
+        )
+        normalized_float = normalized_input.float()
+        rms = torch.rsqrt(
+            normalized_float.square().mean(dim=-1, keepdim=True) + eps
+        )
+        return (
+            normalized_float * rms * weight.float()
+        ).to(x.dtype).float()
+
+    @staticmethod
+    def _dynamic_scale_for_values(
+        quant_values: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            quant_values.abs().amax(dim=-1, keepdim=True) / _FP8_MAX
+        ).clamp_min(_FP8_MIN_DYNAMIC_SCALE).to(torch.float32)
+
+    @staticmethod
+    def _quantize_expected_fp8(
+        quant_values: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            (quant_values / scale)
+            .clamp(min=-_FP8_MAX, max=_FP8_MAX)
+            .to(torch.float8_e4m3fn)
+        )
+
+    @staticmethod
+    def _assert_fp8_codes_close(
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        label: str,
+    ) -> None:
+        """Require matching sign and at most one E4M3 representable code."""
+        actual_bits = actual.contiguous().view(torch.uint8)
+        expected_bits = expected.contiguous().view(torch.uint8)
+        actual_float = actual.float()
+        expected_float = expected.float()
+        both_zero = (actual_float == 0) & (expected_float == 0)
+        sign_mismatch = ((actual_bits ^ expected_bits) & 0x80) != 0
+        if bool((sign_mismatch & ~both_zero).any()):
+            raise AssertionError(f"{label} sign mismatch")
+        actual_magnitude = (actual_bits & 0x7F).to(torch.int16)
+        expected_magnitude = (expected_bits & 0x7F).to(torch.int16)
+        ulp_distance = (actual_magnitude - expected_magnitude).abs()
+        if bool((ulp_distance > _FP8_CODE_MAX_ULP).any()):
+            raise AssertionError(
+                f"{label} exceeds {_FP8_CODE_MAX_ULP} E4M3 ULP"
+            )
+
     def validate_prepared_correctness(
         self,
         data: Dict[str, Any],
@@ -352,8 +435,7 @@ class NormQuantOperatorTestBase(BaseOperatorTest):
         output_codes = output.float()
         if not bool(torch.isfinite(output_codes).all()):
             raise AssertionError("primary FP8 output contains non-finite codes")
-        fp8_limit = torch.finfo(torch.float8_e4m3fn).max
-        if bool((output_codes.abs() > fp8_limit).any()):
+        if bool((output_codes.abs() > _FP8_MAX).any()):
             raise AssertionError("primary FP8 output exceeds E4M3 code range")
 
         reference = self.run_cpu_reference(data).to(output.device)
@@ -365,10 +447,39 @@ class NormQuantOperatorTestBase(BaseOperatorTest):
                 or not scale.is_contiguous()
             ):
                 raise AssertionError("invalid static scale contract")
+            quant_values = self._vllm_static_quant_values(
+                prepared["x"],
+                prepared.get("residual_seed"),
+                prepared["weight"],
+                prepared["eps"],
+            )
+            calibration_values = self._vllm_static_quant_values(
+                data["x"],
+                data.get("residual"),
+                data["weight"],
+                float(data["eps"]),
+            )
             expected_scale = self._static_scale_for_reference(
-                self.run_cpu_reference(data)
+                calibration_values
             ).to(scale.device)
             torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
+            expected_saturation = (
+                (quant_values / expected_scale).abs() >= _FP8_MAX
+            )
+            observed_saturation = output_codes.abs() >= _FP8_MAX
+            if not torch.equal(expected_saturation, observed_saturation):
+                raise AssertionError(
+                    "static FP8 saturation semantics mismatch"
+                )
+            expected_codes = self._quantize_expected_fp8(
+                quant_values,
+                expected_scale,
+            )
+            self._assert_fp8_codes_close(
+                output,
+                expected_codes,
+                label="static FP8 codes",
+            )
         else:
             scale = expected_outputs[1]
             if scale.shape != (tokens, 1) or scale.dtype is not torch.float32:
@@ -381,6 +492,33 @@ class NormQuantOperatorTestBase(BaseOperatorTest):
                 raise AssertionError(
                     "dynamic scale must contain positive finite values"
                 )
+            quant_values = self._vllm_dynamic_quant_values(
+                prepared["x"],
+                prepared["residual_seed"],
+                prepared["weight"],
+                prepared["eps"],
+            )
+            expected_scale = self._dynamic_scale_for_values(quant_values)
+            try:
+                torch.testing.assert_close(
+                    scale,
+                    expected_scale,
+                    rtol=_DYNAMIC_SCALE_RTOL,
+                    atol=0,
+                )
+            except AssertionError as error:
+                raise AssertionError(
+                    "dynamic scale semantics mismatch"
+                ) from error
+            expected_codes = self._quantize_expected_fp8(
+                quant_values,
+                expected_scale,
+            )
+            self._assert_fp8_codes_close(
+                output,
+                expected_codes,
+                label="dynamic FP8 codes",
+            )
 
         dequantized = self._dequantize_fp8(output, scale)
         torch.testing.assert_close(
@@ -408,11 +546,12 @@ class NormQuantOperatorTestBase(BaseOperatorTest):
     def _static_scale_for_reference(
         reference: torch.Tensor,
     ) -> torch.Tensor:
-        fp8_limit = torch.finfo(torch.float8_e4m3fn).max
         maximum = reference.float().abs().amax().clamp_min(
-            torch.finfo(torch.float32).tiny
+            _FP8_MIN_DYNAMIC_SCALE * _STATIC_FP8_TARGET_CODE
         )
-        return (maximum / fp8_limit).reshape(1).to(torch.float32)
+        return (
+            maximum / _STATIC_FP8_TARGET_CODE
+        ).reshape(1).to(torch.float32)
 
     def _restore_mutable_graph_inputs(
         self,

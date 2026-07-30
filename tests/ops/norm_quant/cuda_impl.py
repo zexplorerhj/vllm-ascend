@@ -220,8 +220,14 @@ class CudaNormQuantOperatorTest(NormQuantOperatorTestBase):
             device=device,
         )
         if self.is_static_variant:
+            static_quant_values = self._vllm_static_quant_values(
+                data["x"],
+                data.get("residual"),
+                data["weight"],
+                float(data["eps"]),
+            )
             scale_source = self._static_scale_for_reference(
-                self.run_cpu_reference(data)
+                static_quant_values
             )
             prepared["static_scale"] = self._copy_to_device(
                 scale_source,

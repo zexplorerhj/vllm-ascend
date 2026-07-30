@@ -250,18 +250,24 @@ class _FakeProfiler:
         self.executed_at_start = []
         self.executed_after_steps = []
         self.executed_at_stop = []
+        self.prepared_at_start = []
+        self.prepared_after_steps = []
+        self.prepared_at_stop = []
 
     def start(self):
         self.events.append("start")
         self.executed_at_start = list(self.operator.executed_ids)
+        self.prepared_at_start = list(self.operator.prepared_ids)
 
     def step(self):
         self.events.append("step")
         self.executed_after_steps.append(list(self.operator.executed_ids))
+        self.prepared_after_steps.append(list(self.operator.prepared_ids))
 
     def stop(self):
         self.events.append("stop")
         self.executed_at_stop = list(self.operator.executed_ids)
+        self.prepared_at_stop = list(self.operator.prepared_ids)
 
 
 class _RepeatLifetimeOperator(_FreshCpuOperator):
@@ -355,6 +361,7 @@ def test_prepared_core_profile_dispatches_only_prepared_core_payloads(
     operator = _PreparedProfileOperator()
     profiler = _FakeProfiler(operator)
     profiler_configs = []
+    prepared_ids_at_profiler_creation = []
 
     def prepare_on_cpu(
         self,
@@ -376,6 +383,7 @@ def test_prepared_core_profile_dispatches_only_prepared_core_payloads(
 
     def create_profiler(config):
         profiler_configs.append(config)
+        prepared_ids_at_profiler_creation.append(list(operator.prepared_ids))
         return profiler
 
     monkeypatch.setattr(
@@ -407,6 +415,14 @@ def test_prepared_core_profile_dispatches_only_prepared_core_payloads(
     )
 
     assert operator.prepared_ids == [0, 1, 2, 3, 4]
+    assert prepared_ids_at_profiler_creation == [[0, 1, 2, 3, 4]]
+    assert profiler.prepared_at_start == [0, 1, 2, 3, 4]
+    assert profiler.prepared_after_steps == [
+        [0, 1, 2, 3, 4],
+        [0, 1, 2, 3, 4],
+        [0, 1, 2, 3, 4],
+    ]
+    assert profiler.prepared_at_stop == [0, 1, 2, 3, 4]
     assert profiler.executed_at_start == [0, 1]
     assert profiler.executed_after_steps == [[0, 1, 2], [0, 1, 2, 3], [0, 1, 2, 3, 4]]
     assert profiler.executed_at_stop == [0, 1, 2, 3, 4]

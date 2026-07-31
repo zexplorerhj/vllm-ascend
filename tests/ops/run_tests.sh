@@ -16,14 +16,14 @@ formal_usage() {
     cat >&2 <<'EOF'
 Usage:
   run_tests.sh --formal --operator OP --device DEVICE --output-dir DIR
-      [--precision fp8|mxfp8|mxfp4]
+      [--precision fp16|bf16|fp8|mxfp8|mxfp4]
       [--warmup W] [--iterations I] [--repeats R]
       [--stabilization-repeats S]
       [--task-queue unset|0|1|2]
       [--shard-index N] [--num-shards M] [--quick] [--dry-run]
 
 OP: add | linear | rmsnorm | flashattention | groupgemm | norm_quant |
-    paged_attention | recurrent | all
+    paged_attention | recurrent | vector-fma | all
 EOF
 }
 
@@ -126,6 +126,23 @@ run_recurrent_entry() {
     run_formal_command "${command[@]}"
 }
 
+run_vector_fma_entry() {
+    local precision=${formal_precision:-bf16}
+    local -a command
+    command=(
+        python3 tests/test_vector_fma.py
+        --mode formal
+        --device "$formal_device"
+        --result-dir "$formal_output_dir"
+        --precision "$precision"
+        --warmup 20
+        --iterations 1
+        --samples 30
+        --process-index "$formal_shard_index"
+    )
+    run_formal_command "${command[@]}"
+}
+
 dispatch_formal_operator() {
     local requested_operator=$1
     local command_status=0
@@ -189,6 +206,9 @@ dispatch_formal_operator() {
             ;;
         recurrent)
             run_recurrent_entry || command_status=$?
+            ;;
+        vector-fma)
+            run_vector_fma_entry || command_status=$?
             ;;
         *)
             echo "错误: 未知 formal operator: $requested_operator" >&2
@@ -255,12 +275,18 @@ if [ "$#" -gt 0 ]; then
 
     [ -n "$formal_operator" ] || formal_error "必须指定 --operator"
     case "$formal_operator" in
-        add|linear|rmsnorm|flashattention|groupgemm|norm_quant|paged_attention|recurrent|all) ;;
+        add|linear|rmsnorm|flashattention|groupgemm|norm_quant|paged_attention|recurrent|vector-fma|all) ;;
         *) formal_error "不支持的 operator: $formal_operator" ;;
     esac
     case "$formal_precision" in
-        ''|fp8|mxfp8|mxfp4) ;;
-        *) formal_error "--precision 仅支持 fp8、mxfp8 或 mxfp4" ;;
+        ''|fp16|bf16|fp8|mxfp8|mxfp4) ;;
+        *) formal_error "--precision 不受支持" ;;
+    esac
+    case "$formal_precision" in
+        fp16|bf16)
+            [ "$formal_operator" = "vector-fma" ] || \
+                formal_error "FP16/BF16 显式 precision 仅用于 vector-fma"
+            ;;
     esac
     [ -n "$formal_device" ] || formal_error "必须指定 --device"
     is_formal_device "$formal_device" || \
@@ -311,6 +337,18 @@ if [ "$#" -gt 0 ]; then
     [ "$formal_num_shards" -gt 0 ] || formal_error "--num-shards 必须大于 0"
     [ "$formal_shard_index" -lt "$formal_num_shards" ] || \
         formal_error "shard index 必须小于 num shards"
+    if [ "$formal_operator" = "vector-fma" ]; then
+        [ "$formal_shard_index" -le 2 ] || \
+            formal_error "vector-fma process index 必须是 0、1 或 2"
+        if [ -n "$formal_warmup" ]; then
+            [ "$formal_warmup" -eq 20 ] || \
+                formal_error "vector-fma formal 固定使用 warmup=20"
+        fi
+        if [ -n "$formal_iterations" ]; then
+            [ "$formal_iterations" -eq 1 ] || \
+                formal_error "vector-fma formal 固定使用 iterations=1"
+        fi
+    fi
 
     if [ -n "$formal_warmup" ]; then
         case "$formal_warmup" in

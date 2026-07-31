@@ -25,6 +25,13 @@ else:
 FP16_PROVIDER = "triton_common_fp16_fma"
 BF16_PROVIDER = "triton_common_bf16_fma"
 _SUPPORTED_ACCUMULATORS = (4, 8, 16)
+DEFAULT_TRITON_VECTOR_FMA_CONFIG = VectorFmaConfig(
+    elements=4096,
+    fma_depth=1024,
+    accumulators=8,
+    block_size=256,
+    num_programs=16,
+)
 
 
 if triton is not None:
@@ -34,8 +41,8 @@ if triton is not None:
         a_ptr,
         b_ptr,
         output_ptr,
-        n_elements,
-        fma_depth,
+        n_elements: tl.constexpr,
+        fma_depth: tl.constexpr,
         num_accumulators: tl.constexpr,
         block_size: tl.constexpr,
     ):
@@ -84,11 +91,17 @@ def validate_triton_launch_geometry(config: VectorFmaConfig) -> None:
             "accumulators must be one of "
             f"{_SUPPORTED_ACCUMULATORS}, got {config.accumulators}"
         )
-    capacity = config.block_size * config.num_programs
-    if capacity < config.elements:
+    if config.block_size & (config.block_size - 1):
         raise ValueError(
-            "block_size * num_programs must cover all global scalar lanes: "
-            f"{capacity} < {config.elements}"
+            "block_size must be a power of two for tl.arange, got "
+            f"{config.block_size}"
+        )
+    capacity = config.block_size * config.num_programs
+    if capacity != config.elements:
+        raise ValueError(
+            "block_size * num_programs must be exactly equal to the global "
+            "scalar lanes so physical and accounted FMA lanes match: "
+            f"{capacity} != {config.elements}"
         )
 
 
@@ -114,11 +127,12 @@ class TritonVectorFmaOperatorTest(VectorFmaOperatorTestBase):
     """One cached raw Triton launch with an explicit preallocated output."""
 
     _compiled_probe_keys = set()
+    _unsupported_reasons: Dict[tuple, str] = {}
 
     def __init__(
         self,
         precision: PrecisionType,
-        config: VectorFmaConfig,
+        config: VectorFmaConfig = DEFAULT_TRITON_VECTOR_FMA_CONFIG,
     ) -> None:
         super().__init__(precision, config)
         self.provider_name = (
@@ -127,8 +141,15 @@ class TritonVectorFmaOperatorTest(VectorFmaOperatorTestBase):
             else BF16_PROVIDER
         )
 
-    def _require_runtime(self) -> None:
+    def _unsupported_key(self, device: str) -> tuple:
+        return (device, self.provider_name)
+
+    def _require_runtime(self, device: Optional[str] = None) -> None:
         error = _triton_capability_error()
+        if error is None and device is not None:
+            error = self._unsupported_reasons.get(
+                self._unsupported_key(device)
+            )
         if error is not None:
             raise RuntimeError(error)
 
@@ -137,7 +158,47 @@ class TritonVectorFmaOperatorTest(VectorFmaOperatorTestBase):
             return []
         if _triton_capability_error() is not None:
             return []
+        if self._unsupported_key(device) in self._unsupported_reasons:
+            return []
         return [self.provider_name]
+
+    def _probe_compilation(
+        self,
+        prepared: Dict[str, Any],
+        device: str,
+        precision: PrecisionType,
+    ) -> None:
+        probe_key = (device, precision.name, prepared["config"])
+        if probe_key in self._compiled_probe_keys:
+            return
+
+        output = prepared.get("output")
+        initial_output = (
+            output.clone()
+            if isinstance(output, torch.Tensor)
+            else None
+        )
+        try:
+            prepared["kernel"]()
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(torch.device(device))
+            elif device.startswith("npu"):
+                import torch_npu
+
+                torch_npu.npu.synchronize()
+        except Exception as exc:
+            reason = (
+                f"{self.provider_name} unsupported on {device}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            self._unsupported_reasons[
+                self._unsupported_key(device)
+            ] = reason
+            raise RuntimeError(reason) from exc
+
+        if initial_output is not None:
+            output.copy_(initial_output)
+        self._compiled_probe_keys.add(probe_key)
 
     def _prepare_data_for_core_operator(
         self,
@@ -156,8 +217,8 @@ class TritonVectorFmaOperatorTest(VectorFmaOperatorTestBase):
                 f"implementation {selected!r} does not match "
                 f"{self.provider_name!r}"
             )
-        self._require_runtime()
-        validate_triton_launch_geometry(self.config)
+        self._require_runtime(device)
+        validate_triton_launch_geometry(self._data_config(data))
         prepared = super()._prepare_data_for_core_operator(
             data,
             device,
@@ -172,23 +233,7 @@ class TritonVectorFmaOperatorTest(VectorFmaOperatorTestBase):
             prepared["output"],
             prepared["config"],
         )
-
-        probe_key = (
-            device,
-            precision.name,
-            prepared["config"],
-        )
-        if probe_key not in self._compiled_probe_keys:
-            initial_output = prepared["output"].clone()
-            prepared["kernel"]()
-            if device.startswith("cuda"):
-                torch.cuda.synchronize(torch.device(device))
-            elif device.startswith("npu"):
-                import torch_npu
-
-                torch_npu.npu.synchronize()
-            prepared["output"].copy_(initial_output)
-            self._compiled_probe_keys.add(probe_key)
+        self._probe_compilation(prepared, device, precision)
         return prepared
 
     def _execute_core_operator(

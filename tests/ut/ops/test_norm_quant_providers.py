@@ -1157,6 +1157,22 @@ class _FakeNpuRuntime:
             (x1.to(torch.bfloat16) + x2.to(torch.bfloat16)),
         )
 
+    def npu_rms_norm(
+        self,
+        x,
+        gamma,
+        epsilon=1e-6,
+    ):
+        self._record(
+            "npu_rms_norm", x, gamma, epsilon,
+        )
+        values = _fake_rms_values(
+            x,
+            gamma,
+            epsilon,
+        ).to(torch.bfloat16)
+        return values, torch.empty(0, dtype=torch.float32)
+
     def npu_rms_norm_quant(
         self,
         x,
@@ -2007,6 +2023,51 @@ def test_npu_add_mx_exact_codes_follow_native_unfused_reference(
     )
 
 
+def test_npu_rms_mx_exact_codes_follow_native_unfused_reference(
+    monkeypatch,
+):
+    runtime = _FakeNpuRuntime()
+    operator = _npu_operator(
+        NormQuantVariant.RMS_NORM_DYNAMIC_MX,
+        PrecisionType.MXFP8,
+    )
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+    data = _data(operator, tokens=2, hidden=64)
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "npu:0",
+        PrecisionType.MXFP8,
+    )
+    cpu_reference = operator._reference_on_device(data, prepared)
+    native_reference = cpu_reference.clone()
+    native_reference[0, 0] += 0.08
+    monkeypatch.setattr(
+        runtime,
+        "npu_rms_norm",
+        lambda *args, **kwargs: (
+            native_reference,
+            torch.empty(0, dtype=torch.float32),
+        ),
+    )
+    primary, scale = runtime.npu_dynamic_mx_quant(
+        native_reference,
+        scale_alg=0,
+        round_mode="rint",
+        dst_type=292,
+    )
+    result = (
+        primary,
+        scale,
+        torch.empty(0, dtype=torch.float32),
+    )
+
+    operator.validate_prepared_correctness(
+        data,
+        prepared,
+        result,
+    )
+
+
 @pytest.mark.parametrize(
     ("variant", "precision", "missing_dependency"),
     [
@@ -2019,6 +2080,11 @@ def test_npu_add_mx_exact_codes_follow_native_unfused_reference(
             NormQuantVariant.RMS_NORM_DYNAMIC_MX,
             PrecisionType.MXFP8,
             "npu_dynamic_mx_quant",
+        ),
+        (
+            NormQuantVariant.RMS_NORM_DYNAMIC_MX,
+            PrecisionType.MXFP4,
+            "npu_rms_norm",
         ),
         (
             NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,

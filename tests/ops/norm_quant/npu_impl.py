@@ -228,8 +228,12 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             dependencies.append("npu_dynamic_quant")
         if self.is_mx_variant:
             dependencies.append("npu_dynamic_mx_quant")
-        if self.is_add_variant and not self.is_static_variant:
-            dependencies.append("npu_add_rms_norm")
+        if not self.is_static_variant:
+            dependencies.append(
+                "npu_add_rms_norm"
+                if self.is_add_variant
+                else "npu_rms_norm"
+            )
         return tuple(dependencies)
 
     def _validate_probe_outputs(self, result: Any) -> None:
@@ -775,26 +779,38 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         data: Dict[str, Any],
         prepared: Dict[str, Any],
     ) -> torch.Tensor:
-        if not self.is_add_variant:
+        if self.is_static_variant:
             return self._reference_on_device(data, prepared)
-        add_rms_norm = getattr(
+        native_norm_name = (
+            "npu_add_rms_norm"
+            if self.is_add_variant
+            else "npu_rms_norm"
+        )
+        native_norm = getattr(
             prepared["runtime"],
-            "npu_add_rms_norm",
+            native_norm_name,
             None,
         )
-        if not callable(add_rms_norm):
+        if not callable(native_norm):
             raise AssertionError(
-                "standalone npu_add_rms_norm is unavailable"
+                f"standalone {native_norm_name} is unavailable"
             )
-        outputs = self._result_tuple(
-            add_rms_norm(
+        if self.is_add_variant:
+            result = native_norm(
                 prepared["x"],
                 prepared["residual_seed"],
                 prepared["weight"],
                 prepared["eps"],
-            ),
-            3,
-        )
+            )
+            expected_arity = 3
+        else:
+            result = native_norm(
+                prepared["x"],
+                prepared["weight"],
+                prepared["eps"],
+            )
+            expected_arity = 2
+        outputs = self._result_tuple(result, expected_arity)
         reference = outputs[0]
         self._assert_tensor_contract(
             reference,

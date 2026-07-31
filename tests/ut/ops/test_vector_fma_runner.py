@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import subprocess
 import sys
 
@@ -10,14 +11,19 @@ OPS_ROOT = Path(__file__).resolve().parents[2] / "ops"
 sys.path.insert(0, str(OPS_ROOT))
 
 from operator_test_framework import PrecisionType  # noqa: E402
+import tests.test_vector_fma as vector_fma_runner  # noqa: E402
 from tests.test_vector_fma import (  # noqa: E402
     build_event_row,
     build_formal_row,
+    collect_device_info,
     event_row_sha256,
+    load_event_sidecar,
+    main,
     parse_args,
     precondition_device,
     profile_identity,
     run_formal_measurement,
+    write_event_sidecar,
 )
 from vector_fma.base import VectorFmaConfig, vector_fma_flops  # noqa: E402
 
@@ -62,6 +68,53 @@ def _metrics():
         repeats=30,
         dispatch_loop_policy="python_direct_prepared_payload_loop",
     )
+
+
+def _device_info():
+    return {
+        "device_name": "NVIDIA H20-3e",
+        "device_uuid": "GPU-test",
+        "pci_bus_id": "0000:01:00.0",
+        "compute_units": 78,
+        "telemetry_status": "ok",
+    }
+
+
+def _event_row():
+    args = _args()
+    config = VectorFmaConfig(
+        elements=16,
+        fma_depth=32,
+        accumulators=4,
+        block_size=8,
+        num_programs=2,
+    )
+    return build_event_row(
+        args,
+        config,
+        "triton_common_bf16_fma",
+        _metrics(),
+        _device_info(),
+        _device_info(),
+        {"seconds": 5.2, "launches": 20},
+    )
+
+
+def _verified_manifest(event_row):
+    return {
+        "status": "verified",
+        "identity": profile_identity(event_row),
+        "event_row_sha256": event_row_sha256(event_row),
+        "profile_launch_count": 3,
+        "tensor_or_cube_used": False,
+        "spilled": False,
+        "profile_duration_is_diagnostic": True,
+        "instruction_evidence": [
+            "no tensor/cube; vector instructions found"
+        ],
+        "profile_tool": "synthetic-profiler",
+        "profile_artifacts": ["synthetic.txt"],
+    }
 
 
 def test_formal_defaults_are_exact():
@@ -152,18 +205,8 @@ def test_raw_event_row_keeps_all_samples_and_is_not_publishable():
         config,
         "triton_common_bf16_fma",
         _metrics(),
-        {
-            "device_name": "NVIDIA H20-3e",
-            "device_uuid": "GPU-test",
-            "compute_units": 78,
-            "telemetry_status": "ok",
-        },
-        {
-            "device_name": "NVIDIA H20-3e",
-            "device_uuid": "GPU-test",
-            "compute_units": 78,
-            "telemetry_status": "ok",
-        },
+        _device_info(),
+        _device_info(),
         {"seconds": 5.2, "launches": 260},
     )
 
@@ -178,44 +221,12 @@ def test_raw_event_row_keeps_all_samples_and_is_not_publishable():
     assert row["run_id"] == "unit-run"
     assert row["device_state_before"]["telemetry_status"] == "ok"
     assert row["device_state_after"]["telemetry_status"] == "ok"
+    assert row["telemetry_complete"] is True
 
 
 def test_verified_manifest_must_match_full_event_identity_and_hash():
-    args = _args()
-    config = VectorFmaConfig(
-        elements=16,
-        fma_depth=32,
-        accumulators=4,
-        block_size=8,
-        num_programs=2,
-    )
-    device = {
-        "device_name": "NVIDIA H20-3e",
-        "device_uuid": "GPU-test",
-        "compute_units": 78,
-        "telemetry_status": "ok",
-    }
-    row = build_event_row(
-        args,
-        config,
-        "triton_common_bf16_fma",
-        _metrics(),
-        device,
-        device,
-        {"seconds": 5.2, "launches": 20},
-    )
-    manifest = {
-        "status": "verified",
-        "identity": profile_identity(row),
-        "event_row_sha256": event_row_sha256(row),
-        "profile_launch_count": 3,
-        "tensor_or_cube_used": False,
-        "spilled": False,
-        "profile_duration_is_diagnostic": True,
-        "instruction_evidence": ["no tensor/cube; vector instructions found"],
-        "profile_tool": "synthetic-profiler",
-        "profile_artifacts": ["synthetic.txt"],
-    }
+    row = _event_row()
+    manifest = _verified_manifest(row)
 
     formal = build_formal_row(row, profile_manifest=manifest)
 
@@ -225,6 +236,242 @@ def test_verified_manifest_must_match_full_event_identity_and_hash():
     unrelated["identity"]["fma_depth"] = 64
     with pytest.raises(RuntimeError, match="identity"):
         build_formal_row(row, profile_manifest=unrelated)
+    tampered_hash = dict(manifest)
+    tampered_hash["event_row_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="hash"):
+        build_formal_row(row, profile_manifest=tampered_hash)
+
+
+def test_event_sidecar_is_canonical_typed_and_hash_verified(tmp_path):
+    row = _event_row()
+    sidecar_path = tmp_path / "measurement_event.json"
+
+    sidecar_hash = write_event_sidecar(sidecar_path, row)
+    loaded_row, loaded_hash = load_event_sidecar(sidecar_path)
+
+    assert loaded_row == row
+    assert loaded_hash == event_row_sha256(row) == sidecar_hash
+    on_disk = sidecar_path.read_text(encoding="utf-8")
+    payload = json.loads(on_disk)
+    assert on_disk == json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n"
+    assert isinstance(payload["event_row"]["repeat_samples_ms"], list)
+    assert isinstance(payload["event_row"]["publishable_peak"], bool)
+    assert isinstance(payload["event_row"]["fma_depth"], int)
+    assert isinstance(payload["event_row"]["median_latency_ms"], float)
+
+
+def test_event_sidecar_tamper_fails_closed(tmp_path):
+    row = _event_row()
+    sidecar_path = tmp_path / "measurement_event.json"
+    write_event_sidecar(sidecar_path, row)
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    payload["event_row"]["repeat_samples_ms"][0] += 1.0
+    sidecar_path.write_text(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="hash"):
+        load_event_sidecar(sidecar_path)
+
+
+def test_promote_uses_persisted_event_without_remeasurement(
+    tmp_path, monkeypatch
+):
+    row = _event_row()
+    sidecar_path = tmp_path / "measurement_event.json"
+    manifest_path = tmp_path / "measurement_profile.json"
+    result_dir = tmp_path / "verified"
+    write_event_sidecar(sidecar_path, row)
+    manifest_path.write_text(
+        json.dumps(
+            _verified_manifest(row),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        vector_fma_runner,
+        "run_formal_measurement",
+        lambda *args, **kwargs: pytest.fail(
+            "promote must not run a fresh measurement"
+        ),
+    )
+    monkeypatch.setattr(
+        vector_fma_runner,
+        "collect_device_info",
+        lambda *args, **kwargs: pytest.fail(
+            "promote must not inspect a live device"
+        ),
+    )
+    monkeypatch.setattr(
+        vector_fma_runner,
+        "TritonVectorFmaOperatorTest",
+        lambda *args, **kwargs: pytest.fail(
+            "promote must not initialize an operator"
+        ),
+    )
+
+    result = main(
+        [
+            "--mode",
+            "promote",
+            "--event-json",
+            str(sidecar_path),
+            "--profile-manifest",
+            str(manifest_path),
+            "--result-dir",
+            str(result_dir),
+        ]
+    )
+
+    assert result == 0
+    verified = list(result_dir.glob("*_verified.csv"))
+    assert len(verified) == 1
+    assert sidecar_path.read_text(encoding="utf-8")
+
+
+def test_promote_tampered_manifest_fails_closed(tmp_path):
+    row = _event_row()
+    sidecar_path = tmp_path / "measurement_event.json"
+    manifest_path = tmp_path / "measurement_profile.json"
+    result_dir = tmp_path / "verified"
+    write_event_sidecar(sidecar_path, row)
+    manifest = _verified_manifest(row)
+    manifest["event_row_sha256"] = "0" * 64
+    manifest_path.write_text(
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="bind"):
+        main(
+            [
+                "--mode",
+                "promote",
+                "--event-json",
+                str(sidecar_path),
+                "--profile-manifest",
+                str(manifest_path),
+                "--result-dir",
+                str(result_dir),
+            ]
+        )
+
+    assert not list(result_dir.glob("*_verified.csv"))
+
+
+def test_formal_cannot_promote_a_fresh_measurement():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--mode",
+                "formal",
+                "--device",
+                "cuda:0",
+                "--profile-manifest",
+                "profile.json",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "before", "after"),
+    [
+        ("device_uuid", "", ""),
+        ("device_name", None, None),
+        ("pci_bus_id", None, None),
+        ("device_uuid", "GPU-before", "GPU-after"),
+        ("device_name", "H20-before", "H20-after"),
+        ("pci_bus_id", "0000:01:00.0", "0000:02:00.0"),
+    ],
+)
+def test_telemetry_complete_requires_stable_nonempty_identity(
+    field, before, after
+):
+    args = _args()
+    config = VectorFmaConfig(
+        elements=16,
+        fma_depth=32,
+        accumulators=4,
+        block_size=8,
+        num_programs=2,
+    )
+    device_before = _device_info()
+    device_after = _device_info()
+    device_before[field] = before
+    device_after[field] = after
+
+    row = build_event_row(
+        args,
+        config,
+        "triton_common_bf16_fma",
+        _metrics(),
+        device_before,
+        device_after,
+        {"seconds": 5.2, "launches": 20},
+    )
+
+    assert row["telemetry_complete"] is False
+
+
+def test_950pr_device_info_uses_supported_queries_and_byte_units(monkeypatch):
+    properties = SimpleNamespace(
+        name="Ascend950PR_957b",
+        uuid="0008d80a-d200-0000-0000-004dd5940000",
+        vector_core_num=56,
+        cube_core_num=28,
+        total_memory=115_543_814_976,
+    )
+    fake_torch_npu = SimpleNamespace(
+        npu=SimpleNamespace(
+            get_device_properties=lambda index: (
+                properties if index == 0 else pytest.fail("wrong device")
+            )
+        )
+    )
+    commands = []
+
+    def fake_state(command):
+        commands.append(command)
+        if "board" in command:
+            stdout = "PCIe Bus Info : 0000:11:00.0"
+        else:
+            stdout = "Aicore Freq(MHZ) : 1650"
+        return {"exit_code": 0, "stdout": stdout, "stderr": ""}
+
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    monkeypatch.setattr(vector_fma_runner, "_run_state_command", fake_state)
+
+    result = collect_device_info("npu:0")
+
+    assert result["telemetry_status"] == "ok"
+    assert result["pci_bus_id"] == "0000:11:00.0"
+    assert result["total_memory_bytes"] == properties.total_memory
+    assert commands == [
+        ["npu-smi", "info", "-t", "board", "-i", "0"],
+        ["npu-smi", "info", "-t", "common", "-i", "0"],
+    ]
 
 
 def test_precondition_requires_both_time_and_launch_thresholds():

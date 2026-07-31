@@ -84,10 +84,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("formal", "probe", "profile"),
+        choices=("formal", "probe", "profile", "promote"),
         default="formal",
     )
-    parser.add_argument("--device", required=True)
+    parser.add_argument("--device")
     parser.add_argument(
         "--precision",
         choices=("fp16", "bf16"),
@@ -130,7 +130,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=Path("vector_fma_results"),
     )
     parser.add_argument("--profile-manifest", type=Path)
-    return parser.parse_args(argv)
+    parser.add_argument("--event-json", type=Path)
+    args = parser.parse_args(argv)
+    if args.mode == "promote":
+        if args.event_json is None or args.profile_manifest is None:
+            parser.error(
+                "promote mode requires --event-json and --profile-manifest"
+            )
+    elif args.device is None:
+        parser.error(f"{args.mode} mode requires --device")
+    if args.mode == "formal" and args.profile_manifest is not None:
+        parser.error(
+            "--profile-manifest can only publish a persisted Event row "
+            "through --mode promote"
+        )
+    if args.mode != "promote" and args.event_json is not None:
+        parser.error("--event-json is only valid with --mode promote")
+    return args
 
 
 def _synchronize(device: str) -> None:
@@ -264,6 +280,15 @@ def build_event_row(
     samples = [float(value) for value in metrics.repeat_samples_ms]
     flops = vector_fma_flops(config)
     latency_ms = float(metrics.avg_time_ms)
+    stable_telemetry_fields = ("device_uuid", "device_name", "pci_bus_id")
+    telemetry_identity_stable = all(
+        isinstance(device_info_before.get(field), str)
+        and bool(device_info_before[field].strip())
+        and isinstance(device_info_after.get(field), str)
+        and bool(device_info_after[field].strip())
+        and device_info_before[field] == device_info_after[field]
+        for field in stable_telemetry_fields
+    )
     row = {
         "status": "ok",
         "profile_status": "unverified",
@@ -310,10 +335,7 @@ def build_event_row(
         "telemetry_complete": bool(
             device_info_before.get("telemetry_status") == "ok"
             and device_info_after.get("telemetry_status") == "ok"
-            and device_info_before.get("device_uuid")
-            == device_info_after.get("device_uuid")
-            and device_info_before.get("device_name")
-            == device_info_after.get("device_name")
+            and telemetry_identity_stable
         ),
         "device_state_before": dict(device_info_before),
         "device_state_after": dict(device_info_after),
@@ -344,14 +366,76 @@ def profile_identity(event_row: Dict[str, Any]) -> Dict[str, Any]:
     return {key: event_row[key] for key in PROFILE_IDENTITY_FIELDS}
 
 
-def event_row_sha256(event_row: Dict[str, Any]) -> str:
-    encoded = json.dumps(
-        event_row,
+EVENT_SIDECAR_SCHEMA_VERSION = "vector-fma-event-row-v1"
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
-    ).encode("utf-8")
+    )
+
+
+def event_row_sha256(event_row: Dict[str, Any]) -> str:
+    encoded = _canonical_json(event_row).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def write_event_sidecar(path: Path, event_row: Dict[str, Any]) -> str:
+    """Persist the exact typed Event row with its canonical JSON hash."""
+    if not isinstance(event_row, dict):
+        raise TypeError("event row must be a dictionary")
+    row_hash = event_row_sha256(event_row)
+    payload = {
+        "schema_version": EVENT_SIDECAR_SCHEMA_VERSION,
+        "event_row_sha256": row_hash,
+        "event_row": event_row,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_canonical_json(payload) + "\n", encoding="utf-8")
+    return row_hash
+
+
+def load_event_sidecar(path: Path) -> Tuple[Dict[str, Any], str]:
+    """Load a canonical sidecar, rejecting schema or hash drift."""
+    try:
+        encoded = path.read_text(encoding="utf-8")
+        payload = json.loads(encoded)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load Event sidecar: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Event sidecar must contain a JSON object")
+    expected_fields = {
+        "schema_version",
+        "event_row_sha256",
+        "event_row",
+    }
+    if set(payload) != expected_fields:
+        raise RuntimeError("Event sidecar schema fields do not match")
+    if payload["schema_version"] != EVENT_SIDECAR_SCHEMA_VERSION:
+        raise RuntimeError("Event sidecar schema version does not match")
+    event_row = payload["event_row"]
+    row_hash = payload["event_row_sha256"]
+    if not isinstance(event_row, dict):
+        raise RuntimeError("Event sidecar event_row must be a JSON object")
+    if (
+        not isinstance(row_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", row_hash) is None
+    ):
+        raise RuntimeError("Event sidecar hash is malformed")
+    try:
+        canonical_payload = _canonical_json(payload) + "\n"
+        actual_hash = event_row_sha256(event_row)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Event sidecar is not canonical JSON: {exc}") from exc
+    if encoded != canonical_payload:
+        raise RuntimeError("Event sidecar is not canonical JSON")
+    if not secrets.compare_digest(row_hash, actual_hash):
+        raise RuntimeError("Event sidecar Event-row hash does not match")
+    return event_row, row_hash
 
 
 def build_formal_row(
@@ -493,17 +577,21 @@ def collect_device_info(device: str) -> Dict[str, Any]:
         import torch_npu
 
         properties = torch_npu.npu.get_device_properties(index)
-        state = _run_state_command(
-            ["npu-smi", "info", "-i", str(index), "-c", "0"]
+        board_state = _run_state_command(
+            ["npu-smi", "info", "-t", "board", "-i", str(index)]
+        )
+        common_state = _run_state_command(
+            ["npu-smi", "info", "-t", "common", "-i", str(index)]
         )
         bus_match = re.search(
             r"\b[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:"
             r"[0-9A-Fa-f]{2}\.[0-7]\b",
-            state["stdout"],
+            board_state["stdout"],
         )
         device_uuid = str(getattr(properties, "uuid", "")) or None
         telemetry_ok = (
-            state["exit_code"] == 0
+            board_state["exit_code"] == 0
+            and common_state["exit_code"] == 0
             and device_uuid is not None
             and bus_match is not None
         )
@@ -513,9 +601,14 @@ def collect_device_info(device: str) -> Dict[str, Any]:
             "pci_bus_id": bus_match.group(0) if bus_match else None,
             "compute_units": properties.vector_core_num,
             "cube_units": properties.cube_core_num,
-            "total_memory_bytes": int(properties.total_memory) * 1024 * 1024,
+            # torch_npu reports this property in bytes even though its repr
+            # renders a human-readable MB suffix.
+            "total_memory_bytes": int(properties.total_memory),
             "telemetry_status": "ok" if telemetry_ok else "unavailable",
-            "device_state_raw": state,
+            "device_state_raw": {
+                "board": board_state,
+                "common": common_state,
+            },
         }
     raise ValueError("Vector FMA requires a CUDA or NPU device")
 
@@ -573,8 +666,38 @@ def _generated_run_id() -> str:
     return f"{timestamp}-pid{os.getpid()}-{secrets.token_hex(4)}"
 
 
+def promote_persisted_event(
+    event_json_path: Path,
+    profile_manifest_path: Path,
+    result_dir: Path,
+) -> Path:
+    """Publish a persisted measurement without launching the operator again."""
+    event_row, sidecar_hash = load_event_sidecar(event_json_path)
+    manifest = _load_profile_manifest(profile_manifest_path)
+    if manifest.get("event_row_sha256") != sidecar_hash:
+        raise RuntimeError("profile manifest does not bind the Event sidecar")
+    formal = build_formal_row(
+        event_row,
+        profile_manifest=manifest,
+        profile_manifest_path=str(profile_manifest_path),
+    )
+    formal["event_json"] = str(event_json_path)
+    formal["event_row_sha256"] = sidecar_hash
+    formal_path = result_dir / f"{event_json_path.stem}_verified.csv"
+    write_rows(formal_path, [formal])
+    return formal_path
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.mode == "promote":
+        formal_path = promote_persisted_event(
+            args.event_json,
+            args.profile_manifest,
+            args.result_dir,
+        )
+        print(f"verified formal row: {formal_path}")
+        return 0
     if args.run_id is None:
         args.run_id = _generated_run_id()
     if args.mode != "formal":
@@ -622,19 +745,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"g{config.num_programs}_{args.run_id}"
     )
     event_path = args.result_dir / f"{stem}_events.csv"
+    event_json_path = args.result_dir / f"{stem}_event.json"
+    row_hash = write_event_sidecar(event_json_path, row)
     write_rows(event_path, [row])
     print(f"raw Event row: {event_path}")
-
-    if args.profile_manifest is not None:
-        manifest = _load_profile_manifest(args.profile_manifest)
-        formal = build_formal_row(
-            row,
-            profile_manifest=manifest,
-            profile_manifest_path=str(args.profile_manifest),
-        )
-        formal_path = args.result_dir / f"{stem}_verified.csv"
-        write_rows(formal_path, [formal])
-        print(f"verified formal row: {formal_path}")
+    print(f"typed Event JSON: {event_json_path} sha256={row_hash}")
     return 0
 
 

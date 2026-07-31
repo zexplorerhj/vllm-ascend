@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime, timezone
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
+import re
+import secrets
 import subprocess
 import sys
 import time
@@ -49,6 +54,32 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
+def _precondition_seconds(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 5.0:
+        raise argparse.ArgumentTypeError(
+            "precondition seconds must be finite and >= 5"
+        )
+    return parsed
+
+
+def _precondition_launches(value: str) -> int:
+    parsed = int(value)
+    if parsed < 20:
+        raise argparse.ArgumentTypeError(
+            "precondition launches must be >= 20"
+        )
+    return parsed
+
+
+def _run_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+        raise argparse.ArgumentTypeError(
+            "run id must contain only letters, digits, dot, underscore, dash"
+        )
+    return value
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -82,12 +113,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=(0, 1, 2),
         default=0,
     )
-    parser.add_argument("--precondition-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--precondition-seconds",
+        type=_precondition_seconds,
+        default=5.0,
+    )
     parser.add_argument(
         "--precondition-launches",
-        type=_positive_int,
+        type=_precondition_launches,
         default=20,
     )
+    parser.add_argument("--run-id", type=_run_id)
     parser.add_argument(
         "--result-dir",
         type=Path,
@@ -121,10 +157,10 @@ def precondition_device(
     synchronize_fn: Callable[[str], None] = _synchronize,
 ) -> Dict[str, Any]:
     """Warm one cached raw kernel until both launch and duration gates pass."""
-    if min_seconds < 0:
-        raise ValueError("min_seconds must be non-negative")
-    if min_launches <= 0:
-        raise ValueError("min_launches must be positive")
+    if not math.isfinite(min_seconds) or min_seconds < 5.0:
+        raise ValueError("min_seconds must be finite and >= 5")
+    if min_launches < 20:
+        raise ValueError("min_launches must be >= 20")
     prepared = operator._prepare_data_for_core_operator(
         data,
         device,
@@ -187,6 +223,32 @@ def run_formal_measurement(
         raise RuntimeError(
             "Framework V2 did not return exactly 30 raw Event samples"
         )
+    expected_fields = {
+        "framework_api": (
+            "OperatorTestFramework.run_core_operator_performance_test_v2"
+        ),
+        "protocol_version": "operator-test-framework-v2-fresh-v6",
+        "timing_method": "device_event",
+        "warmup_iterations": 20,
+        "iterations": 1,
+        "repeats": 30,
+        "dispatch_loop_policy": "python_direct_prepared_payload_loop",
+    }
+    for field, expected in expected_fields.items():
+        actual = getattr(metrics, field, None)
+        if actual != expected:
+            raise RuntimeError(
+                f"Framework V2 provenance drift for {field}: "
+                f"{actual!r} != {expected!r}"
+            )
+    if "device elapsed time" not in str(
+        getattr(metrics, "timing_semantics", "")
+    ):
+        raise RuntimeError("Framework V2 did not report device elapsed time")
+    if not 5.0 <= float(metrics.avg_time_ms) <= 20.0:
+        raise RuntimeError(
+            "selected Vector FMA kernel must be in the 5-20 ms gate"
+        )
     return metrics, precondition
 
 
@@ -195,7 +257,8 @@ def build_event_row(
     config: VectorFmaConfig,
     provider: str,
     metrics: Any,
-    device_info: Dict[str, Any],
+    device_info_before: Dict[str, Any],
+    device_info_after: Dict[str, Any],
     precondition: Dict[str, Any],
 ) -> Dict[str, Any]:
     samples = [float(value) for value in metrics.repeat_samples_ms]
@@ -208,6 +271,7 @@ def build_event_row(
         "process_index": args.process_index,
         "process_pid": os.getpid(),
         "host": platform.node(),
+        "run_id": args.run_id,
         "device": args.device,
         "precision": args.precision,
         "provider": provider,
@@ -231,37 +295,139 @@ def build_event_row(
         "warmup": args.warmup,
         "iterations": args.iterations,
         "samples": args.samples,
-        "timing_method": "device_event",
-        "dispatch_mode": "eager_direct",
+        "timing_method": metrics.timing_method,
+        "timing_semantics": metrics.timing_semantics,
+        "dispatch_mode": metrics.dispatch_loop_policy,
         "precondition_seconds": precondition["seconds"],
         "precondition_launches": precondition["launches"],
         "precondition_timed": precondition.get("timed", False),
-        **device_info,
+        "device_name": device_info_before.get("device_name"),
+        "device_uuid": device_info_before.get("device_uuid"),
+        "pci_bus_id": device_info_before.get("pci_bus_id"),
+        "compute_units": device_info_before.get("compute_units"),
+        "cube_units": device_info_before.get("cube_units"),
+        "total_memory_bytes": device_info_before.get("total_memory_bytes"),
+        "telemetry_complete": bool(
+            device_info_before.get("telemetry_status") == "ok"
+            and device_info_after.get("telemetry_status") == "ok"
+            and device_info_before.get("device_uuid")
+            == device_info_after.get("device_uuid")
+            and device_info_before.get("device_name")
+            == device_info_after.get("device_name")
+        ),
+        "device_state_before": dict(device_info_before),
+        "device_state_after": dict(device_info_after),
     }
     return row
+
+
+PROFILE_IDENTITY_FIELDS = (
+    "run_id",
+    "process_index",
+    "device",
+    "device_uuid",
+    "device_name",
+    "precision",
+    "provider",
+    "elements",
+    "fma_depth",
+    "accumulators",
+    "block_size",
+    "num_programs",
+)
+
+
+def profile_identity(event_row: Dict[str, Any]) -> Dict[str, Any]:
+    missing = [key for key in PROFILE_IDENTITY_FIELDS if key not in event_row]
+    if missing:
+        raise RuntimeError(f"event row lacks profile identity fields: {missing}")
+    return {key: event_row[key] for key in PROFILE_IDENTITY_FIELDS}
+
+
+def event_row_sha256(event_row: Dict[str, Any]) -> str:
+    encoded = json.dumps(
+        event_row,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def build_formal_row(
     event_row: Dict[str, Any],
     *,
-    profile_status: str,
-    tensor_or_cube_used: bool = False,
-    spilled: bool = False,
-    profile_manifest: Optional[str] = None,
+    profile_manifest: Dict[str, Any],
+    profile_manifest_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Promote one raw Event row only after a matching profile gate passes."""
-    if profile_status != "verified":
+    required_fields = (
+        "status",
+        "identity",
+        "event_row_sha256",
+        "profile_launch_count",
+        "tensor_or_cube_used",
+        "spilled",
+        "profile_duration_is_diagnostic",
+        "instruction_evidence",
+        "profile_tool",
+        "profile_artifacts",
+    )
+    if profile_manifest.get("status") != "verified":
         raise RuntimeError("profile verification is required for publication")
-    if tensor_or_cube_used:
+    missing = [key for key in required_fields if key not in profile_manifest]
+    if missing:
+        raise RuntimeError(f"required profile field missing: {missing}")
+    if profile_manifest["identity"] != profile_identity(event_row):
+        raise RuntimeError("profile identity does not match the Event row")
+    if profile_manifest["event_row_sha256"] != event_row_sha256(event_row):
+        raise RuntimeError("profile Event-row hash does not match")
+    launch_count = profile_manifest["profile_launch_count"]
+    if (
+        not isinstance(launch_count, int)
+        or isinstance(launch_count, bool)
+        or launch_count < 3
+    ):
+        raise RuntimeError("profile verification requires at least 3 launches")
+    for field in (
+        "tensor_or_cube_used",
+        "spilled",
+        "profile_duration_is_diagnostic",
+    ):
+        if type(profile_manifest[field]) is not bool:
+            raise RuntimeError(f"profile field {field} must be an exact bool")
+    if profile_manifest["tensor_or_cube_used"]:
         raise RuntimeError("Tensor/Cube execution cannot be published")
-    if spilled:
+    if profile_manifest["spilled"]:
         raise RuntimeError("spilled Vector FMA configuration cannot be published")
+    if not profile_manifest["profile_duration_is_diagnostic"]:
+        raise RuntimeError("profile duration must remain diagnostic only")
+    evidence = profile_manifest["instruction_evidence"]
+    artifacts = profile_manifest["profile_artifacts"]
+    if (
+        not isinstance(evidence, list)
+        or not evidence
+        or not all(isinstance(item, str) and item for item in evidence)
+    ):
+        raise RuntimeError("instruction evidence must be a non-empty string list")
+    if (
+        not isinstance(profile_manifest["profile_tool"], str)
+        or not profile_manifest["profile_tool"]
+        or not isinstance(artifacts, list)
+        or not artifacts
+        or not all(isinstance(item, str) and item for item in artifacts)
+    ):
+        raise RuntimeError("profile tool and artifacts must be explicit")
+    if event_row.get("telemetry_complete") is not True:
+        raise RuntimeError("complete before/after device telemetry is required")
     row = dict(event_row)
     row.update(
         {
             "profile_status": "verified",
             "publishable_peak": True,
-            "profile_manifest": profile_manifest,
+            "profile_manifest": profile_manifest_path,
+            "profile_tool": profile_manifest["profile_tool"],
+            "profile_launch_count": launch_count,
         }
     )
     return row
@@ -271,7 +437,7 @@ def _device_index(device: str) -> int:
     return int(device.split(":", 1)[1]) if ":" in device else 0
 
 
-def _run_state_command(command: Sequence[str]) -> str:
+def _run_state_command(command: Sequence[str]) -> Dict[str, Any]:
     try:
         result = subprocess.run(
             list(command),
@@ -281,9 +447,16 @@ def _run_state_command(command: Sequence[str]) -> str:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return f"unavailable: {type(exc).__name__}: {exc}"
-    output = result.stdout.strip() or result.stderr.strip()
-    return f"exit={result.returncode}; {output}"
+        return {
+            "exit_code": None,
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "exit_code": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
 
 
 def collect_device_info(device: str) -> Dict[str, Any]:
@@ -294,19 +467,26 @@ def collect_device_info(device: str) -> Dict[str, Any]:
             [
                 "nvidia-smi",
                 f"--id={index}",
-                "--query-gpu=name,pstate,clocks.current.sm,"
+                "--query-gpu=uuid,pci.bus_id,name,pstate,clocks.current.sm,"
                 "clocks.current.memory,temperature.gpu,power.draw,"
                 "memory.used,memory.free",
                 "--format=csv,noheader,nounits",
             ]
         )
+        state_values = [
+            value.strip() for value in state["stdout"].split(",")
+        ]
+        telemetry_ok = state["exit_code"] == 0 and len(state_values) == 10
         return {
             "device_name": properties.name,
+            "device_uuid": state_values[0] if telemetry_ok else None,
+            "pci_bus_id": state_values[1] if telemetry_ok else None,
             "compute_units": properties.multi_processor_count,
             "total_memory_bytes": properties.total_memory,
             "compute_capability": ".".join(
                 str(value) for value in torch.cuda.get_device_capability(index)
             ),
+            "telemetry_status": "ok" if telemetry_ok else "unavailable",
             "device_state_raw": state,
         }
     if device.startswith("npu"):
@@ -316,11 +496,25 @@ def collect_device_info(device: str) -> Dict[str, Any]:
         state = _run_state_command(
             ["npu-smi", "info", "-i", str(index), "-c", "0"]
         )
+        bus_match = re.search(
+            r"\b[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:"
+            r"[0-9A-Fa-f]{2}\.[0-7]\b",
+            state["stdout"],
+        )
+        device_uuid = str(getattr(properties, "uuid", "")) or None
+        telemetry_ok = (
+            state["exit_code"] == 0
+            and device_uuid is not None
+            and bus_match is not None
+        )
         return {
             "device_name": properties.name,
+            "device_uuid": device_uuid,
+            "pci_bus_id": bus_match.group(0) if bus_match else None,
             "compute_units": properties.vector_core_num,
             "cube_units": properties.cube_core_num,
             "total_memory_bytes": int(properties.total_memory) * 1024 * 1024,
+            "telemetry_status": "ok" if telemetry_ok else "unavailable",
             "device_state_raw": state,
         }
     raise ValueError("Vector FMA requires a CUDA or NPU device")
@@ -374,8 +568,15 @@ def _load_profile_manifest(path: Path) -> Dict[str, Any]:
     return manifest
 
 
+def _generated_run_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{timestamp}-pid{os.getpid()}-{secrets.token_hex(4)}"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.run_id is None:
+        args.run_id = _generated_run_id()
     if args.mode != "formal":
         raise RuntimeError(
             f"{args.mode} mode is reserved for the native/profile tasks"
@@ -394,6 +595,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     data = operator.generate_test_data(seed=17)
     framework = OperatorTestFramework(str(args.result_dir))
+    device_info_before = collect_device_info(args.device)
     metrics, precondition = run_formal_measurement(
         args,
         operator,
@@ -402,19 +604,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         precision,
         operator.provider_name,
     )
+    device_info_after = collect_device_info(args.device)
     row = build_event_row(
         args,
         config,
         operator.provider_name,
         metrics,
-        collect_device_info(args.device),
+        device_info_before,
+        device_info_after,
         precondition,
     )
     safe_device = args.device.replace(":", "")
     stem = (
         f"vector_fma_{safe_device}_{args.precision}_{operator.provider_name}_"
         f"p{args.process_index}_n{config.elements}_r{config.fma_depth}_"
-        f"a{config.accumulators}"
+        f"a{config.accumulators}_b{config.block_size}_"
+        f"g{config.num_programs}_{args.run_id}"
     )
     event_path = args.result_dir / f"{stem}_events.csv"
     write_rows(event_path, [row])
@@ -424,12 +629,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         manifest = _load_profile_manifest(args.profile_manifest)
         formal = build_formal_row(
             row,
-            profile_status=str(manifest.get("status", "unverified")),
-            tensor_or_cube_used=bool(
-                manifest.get("tensor_or_cube_used", False)
-            ),
-            spilled=bool(manifest.get("spilled", False)),
-            profile_manifest=str(args.profile_manifest),
+            profile_manifest=manifest,
+            profile_manifest_path=str(args.profile_manifest),
         )
         formal_path = args.result_dir / f"{stem}_verified.csv"
         write_rows(formal_path, [formal])

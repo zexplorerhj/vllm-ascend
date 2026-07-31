@@ -128,19 +128,33 @@ run_recurrent_entry() {
 
 run_vector_fma_entry() {
     local precision=${formal_precision:-bf16}
+    local process_index
+    local command_status=0
+    local -a process_indices
     local -a command
-    command=(
-        python3 tests/test_vector_fma.py
-        --mode formal
-        --device "$formal_device"
-        --result-dir "$formal_output_dir"
-        --precision "$precision"
-        --warmup 20
-        --iterations 1
-        --samples 30
-        --process-index "$formal_shard_index"
-    )
-    run_formal_command "${command[@]}"
+    if [ "$formal_num_shards" -eq 1 ]; then
+        process_indices=(0 1 2)
+    elif [ "$formal_num_shards" -eq 3 ]; then
+        process_indices=("$formal_shard_index")
+    else
+        echo "错误: vector-fma num-shards 仅支持 1 或 3" >&2
+        return 2
+    fi
+    for process_index in "${process_indices[@]}"; do
+        command=(
+            python3 tests/test_vector_fma.py
+            --mode formal
+            --device "$formal_device"
+            --result-dir "$formal_output_dir"
+            --precision "$precision"
+            --warmup 20
+            --iterations 1
+            --samples 30
+            --process-index "$process_index"
+        )
+        run_formal_command "${command[@]}" || command_status=$?
+    done
+    return "$command_status"
 }
 
 dispatch_formal_operator() {
@@ -229,6 +243,7 @@ if [ "$#" -gt 0 ]; then
     formal_warmup=""
     formal_iterations=""
     formal_repeats=5
+    formal_repeats_was_set=0
     formal_stabilization_repeats=2
     formal_task_queue=unset
     formal_shard_index=0
@@ -247,7 +262,10 @@ if [ "$#" -gt 0 ]; then
                     --precision) formal_precision=$2 ;;
                     --warmup) formal_warmup=$2 ;;
                     --iterations) formal_iterations=$2 ;;
-                    --repeats) formal_repeats=$2 ;;
+                    --repeats)
+                        formal_repeats=$2
+                        formal_repeats_was_set=1
+                        ;;
                     --stabilization-repeats) formal_stabilization_repeats=$2 ;;
                     --task-queue) formal_task_queue=$2 ;;
                     --shard-index) formal_shard_index=$2 ;;
@@ -338,8 +356,14 @@ if [ "$#" -gt 0 ]; then
     [ "$formal_shard_index" -lt "$formal_num_shards" ] || \
         formal_error "shard index 必须小于 num shards"
     if [ "$formal_operator" = "vector-fma" ]; then
-        [ "$formal_shard_index" -le 2 ] || \
-            formal_error "vector-fma process index 必须是 0、1 或 2"
+        case "$formal_num_shards" in
+            1|3) ;;
+            *) formal_error "vector-fma num-shards 仅支持 1 或 3" ;;
+        esac
+        if [ "$formal_num_shards" -eq 3 ]; then
+            [ "$formal_shard_index" -le 2 ] || \
+                formal_error "vector-fma process index 必须是 0、1 或 2"
+        fi
         if [ -n "$formal_warmup" ]; then
             [ "$formal_warmup" -eq 20 ] || \
                 formal_error "vector-fma formal 固定使用 warmup=20"
@@ -347,6 +371,10 @@ if [ "$#" -gt 0 ]; then
         if [ -n "$formal_iterations" ]; then
             [ "$formal_iterations" -eq 1 ] || \
                 formal_error "vector-fma formal 固定使用 iterations=1"
+        fi
+        if [ "$formal_repeats_was_set" -eq 1 ]; then
+            [ "$formal_repeats" -eq 30 ] || \
+                formal_error "vector-fma formal 固定使用 repeats=30"
         fi
     fi
 

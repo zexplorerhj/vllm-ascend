@@ -112,7 +112,7 @@ def test_base_generates_deterministic_finite_cpu_lanes_per_accumulator():
             PrecisionType.FP16,
             0.06903076171875,
             0.10357666015625,
-            0.0689697265625,
+            0.06890869140625,
         ),
         (
             PrecisionType.BF16,

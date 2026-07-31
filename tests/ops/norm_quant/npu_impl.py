@@ -229,7 +229,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         elif self.variant is NormQuantVariant.ADD_RMS_NORM_STATIC_FP8:
             specs = (
                 ((1, 64), fp8_dtype),
-                ((0,), fp8_dtype),
+                ((1, 64), fp8_dtype),
                 ((1, 64), torch.bfloat16),
             )
         elif self.variant is NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8:
@@ -246,13 +246,19 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 if self.precision is PrecisionType.MXFP8
                 else ((1, 32), torch.uint8)
             )
-            specs = (
-                primary_spec,
-                ((1, 1, 2), torch.uint8),
-                *((((1, 64), torch.bfloat16),)
-                  if self.is_add_variant else ()),
-                ((0,), torch.float32),
-            )
+            if self.is_add_variant:
+                specs = (
+                    primary_spec,
+                    ((1, 64), torch.bfloat16),
+                    ((1, 1, 2), torch.uint8),
+                    ((0,), torch.float32),
+                )
+            else:
+                specs = (
+                    primary_spec,
+                    ((1, 1, 2), torch.uint8),
+                    ((0,), torch.float32),
+                )
         outputs = result if isinstance(result, (tuple, list)) else (result,)
         if len(outputs) != len(specs):
             raise RuntimeError(
@@ -595,6 +601,8 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         matrix_elements = tokens * hidden
         if self.is_static_variant:
             total = matrix_elements
+            if self.is_add_variant:
+                total += matrix_elements
         elif self.is_dynamic_fp8_variant:
             total = matrix_elements + tokens * 4
         elif self.is_mx_variant:
@@ -794,10 +802,11 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 primary.float() - offset.reshape(1, hidden)
             ) / scale.reshape(1, hidden)
             if self.is_add_variant:
-                self._assert_empty_output(
+                self._assert_tensor_contract(
                     outputs[1],
+                    shape=(tokens, hidden),
                     dtype=self._fp8_dtype(),
-                    label="static secondary disabled",
+                    label="static secondary",
                 )
                 self._assert_tensor_contract(
                     outputs[2],
@@ -878,7 +887,14 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         tokens, hidden = data["x"].shape
         expected_arity = 4 if self.is_add_variant else 3
         outputs = self._result_tuple(result, expected_arity)
-        primary, scale = outputs[:2]
+        primary = outputs[0]
+        if self.is_add_variant:
+            x_out = outputs[1]
+            scale = outputs[2]
+            rstd = outputs[3]
+        else:
+            scale = outputs[1]
+            rstd = outputs[2]
         primary_shape = (
             (tokens, hidden)
             if self.precision is PrecisionType.MXFP8
@@ -901,20 +917,19 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             dtype=torch.uint8,
             label="MX E8M0 scale",
         )
-        rstd_index = 3 if self.is_add_variant else 2
         self._assert_empty_output(
-            outputs[rstd_index],
+            rstd,
             dtype=torch.float32,
             label="MX rstd disabled",
         )
         if self.is_add_variant:
             self._assert_tensor_contract(
-                outputs[2],
+                x_out,
                 shape=(tokens, hidden),
                 dtype=torch.bfloat16,
                 label="MX x_out",
             )
-            self._validate_x_out(prepared, outputs[2])
+            self._validate_x_out(prepared, x_out)
 
         dynamic_mx_quant = getattr(
             prepared["runtime"],

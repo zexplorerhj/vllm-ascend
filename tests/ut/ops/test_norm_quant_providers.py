@@ -1188,7 +1188,7 @@ class _FakeNpuRuntime:
         )
         return (
             y1,
-            torch.empty(0, dtype=torch.float8_e4m3fn),
+            torch.full_like(y1, 1.0),
             (x1.to(torch.bfloat16) + x2.to(torch.bfloat16)),
         )
 
@@ -1279,8 +1279,8 @@ class _FakeNpuRuntime:
         )
         return (
             quantized,
-            scale,
             (x1.to(torch.bfloat16) + x2.to(torch.bfloat16)),
+            scale,
             torch.empty(0, dtype=torch.float32),
         )
 
@@ -1366,8 +1366,8 @@ _NPU_PROVIDER_CASES = [
             NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
             PrecisionType.FP8,
             64_516,
-            93_184,
-            107_520,
+            100_352,
+            114_688,
         ),
         (
             NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8,
@@ -1897,6 +1897,41 @@ def _run_fake_npu_provider(monkeypatch, variant, precision):
     )
     result = operator._execute_core_operator(prepared)
     return operator, runtime, data, prepared, result
+
+
+def test_npu_add_static_accepts_full_secondary_950pr_output(
+    monkeypatch,
+):
+    operator, _, data, prepared, result = _run_fake_npu_provider(
+        monkeypatch,
+        NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+        PrecisionType.FP8,
+    )
+
+    assert tuple(result[1].shape) == (2, 64)
+    assert result[1].dtype is torch.float8_e4m3fn
+    operator.validate_prepared_correctness(data, prepared, result)
+
+
+@pytest.mark.parametrize(
+    "precision",
+    [PrecisionType.MXFP8, PrecisionType.MXFP4],
+)
+def test_npu_add_mx_uses_950pr_primary_xout_scale_rstd_order(
+    monkeypatch,
+    precision,
+):
+    operator, _, data, prepared, result = _run_fake_npu_provider(
+        monkeypatch,
+        NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
+        precision,
+    )
+
+    assert tuple(result[1].shape) == (2, 64)
+    assert result[1].dtype is torch.bfloat16
+    assert tuple(result[2].shape) == (2, 1, 2)
+    assert result[2].dtype is torch.uint8
+    operator.validate_prepared_correctness(data, prepared, result)
 
 
 @pytest.mark.parametrize(

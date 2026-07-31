@@ -15,8 +15,10 @@ from operator_test_framework import BaseOperatorTest, DeviceType, PrecisionType
 class VectorFmaConfig:
     """Vector FMA workload shape.
 
-    ``elements`` is the scalar-lane count per independent accumulator.  The
-    total active scalar lanes are therefore ``elements * accumulators``.
+    ``elements`` is the global scalar-lane count for each independent
+    accumulator, partitioned across ``num_programs``. ``num_programs`` is
+    launch geometry and is not a FLOP multiplier. The total active scalar
+    lanes are therefore ``elements * accumulators``.
     """
 
     elements: int
@@ -144,12 +146,15 @@ class VectorFmaOperatorTestBase(BaseOperatorTest):
         }
 
     def run_cpu_reference(self, data: Dict[str, Any]) -> torch.Tensor:
-        """Compute the same scalar-lane recurrence without mutating input data."""
+        """Compute FP32 ``acc = acc * a + b`` and cast the final result once."""
         config = self._data_config(data)
-        accumulator = data["output"].clone()
+        destination_dtype = data["output"].dtype
+        a = data["a"].float()
+        b = data["b"].float()
+        accumulator = data["output"].float()
         for _ in range(config.fma_depth):
-            accumulator = torch.addcmul(accumulator, data["a"], data["b"])
-        return accumulator
+            accumulator = torch.addcmul(b, accumulator, a)
+        return accumulator.to(destination_dtype)
 
     def get_available_implementations(self, device: str) -> List[str]:
         del device

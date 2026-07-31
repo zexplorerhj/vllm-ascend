@@ -105,6 +105,52 @@ def test_base_generates_deterministic_finite_cpu_lanes_per_accumulator():
     assert first["metadata"]["active_scalar_lanes"] == 40
 
 
+@pytest.mark.parametrize(
+    ("precision", "expected", "wrong_order", "per_step_rounded"),
+    [
+        (
+            PrecisionType.FP16,
+            0.06903076171875,
+            0.10357666015625,
+            0.0689697265625,
+        ),
+        (
+            PrecisionType.BF16,
+            0.06884765625,
+            0.103515625,
+            0.068359375,
+        ),
+    ],
+)
+def test_cpu_reference_uses_fp32_acc_times_a_plus_b_then_casts_once(
+    precision,
+    expected,
+    wrong_order,
+    per_step_rounded,
+):
+    config = VectorFmaConfig(
+        elements=1,
+        fma_depth=4,
+        accumulators=1,
+        block_size=1,
+        num_programs=1,
+    )
+    operator = _PreparedPayloadOperator(precision, config)
+    data = {
+        "a": torch.tensor([[0.9]], dtype=precision.value),
+        "b": torch.tensor([[0.001]], dtype=precision.value),
+        "output": torch.tensor([[0.1]], dtype=precision.value),
+        "config": config,
+    }
+
+    result = operator.run_cpu_reference(data)
+
+    assert result.dtype is precision.value
+    assert result.item() == expected
+    assert result.item() != wrong_order
+    assert result.item() != per_step_rounded
+
+
 def test_base_prepared_payload_exposes_configuration_and_tflops():
     config = _config()
     operator = _PreparedPayloadOperator(PrecisionType.FP16, config)

@@ -222,6 +222,16 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 return False
         return True
 
+    def _correctness_dependencies(self) -> Tuple[str, ...]:
+        dependencies: List[str] = []
+        if self.is_dynamic_fp8_variant:
+            dependencies.append("npu_dynamic_quant")
+        if self.is_mx_variant:
+            dependencies.append("npu_dynamic_mx_quant")
+        if self.is_add_variant and not self.is_static_variant:
+            dependencies.append("npu_add_rms_norm")
+        return tuple(dependencies)
+
     def _validate_probe_outputs(self, result: Any) -> None:
         fp8_dtype = self._fp8_dtype()
         if self.variant is NormQuantVariant.RMS_NORM_STATIC_FP8:
@@ -384,6 +394,12 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             return self._reject_formal(
                 f"{implementation} required native dtype is unavailable"
             )
+        for dependency in self._correctness_dependencies():
+            if not callable(getattr(runtime, dependency, None)):
+                return self._reject_formal(
+                    f"{implementation} untimed correctness dependency "
+                    f"{dependency} is unavailable"
+                )
         capability = self._probe_capability(
             device,
             runtime,
@@ -754,6 +770,40 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             dtype=torch.bfloat16,
         )
 
+    def _quantization_reference_on_device(
+        self,
+        data: Dict[str, Any],
+        prepared: Dict[str, Any],
+    ) -> torch.Tensor:
+        if not self.is_add_variant:
+            return self._reference_on_device(data, prepared)
+        add_rms_norm = getattr(
+            prepared["runtime"],
+            "npu_add_rms_norm",
+            None,
+        )
+        if not callable(add_rms_norm):
+            raise AssertionError(
+                "standalone npu_add_rms_norm is unavailable"
+            )
+        outputs = self._result_tuple(
+            add_rms_norm(
+                prepared["x"],
+                prepared["residual_seed"],
+                prepared["weight"],
+                prepared["eps"],
+            ),
+            3,
+        )
+        reference = outputs[0]
+        self._assert_tensor_contract(
+            reference,
+            shape=tuple(prepared["x"].shape),
+            dtype=torch.bfloat16,
+            label="native unfused AddRMSNorm reference",
+        )
+        return reference
+
     @staticmethod
     def _validate_x_out(
         prepared: Dict[str, Any],
@@ -850,7 +900,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                     "standalone npu_dynamic_quant is unavailable"
                 )
             expected_primary, expected_scale = dynamic_quant(
-                self._reference_on_device(data, prepared),
+                self._quantization_reference_on_device(data, prepared),
                 dst_type=self._fp8_dtype(),
             )
             self._assert_same_storage_values(
@@ -941,7 +991,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 "standalone npu_dynamic_mx_quant is unavailable"
             )
         expected_primary, expected_scale = dynamic_mx_quant(
-            self._reference_on_device(data, prepared),
+            self._quantization_reference_on_device(data, prepared),
             scale_alg=0,
             round_mode="rint",
             dst_type=self._dtype_code(),

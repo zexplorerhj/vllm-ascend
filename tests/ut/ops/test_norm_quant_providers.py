@@ -1135,6 +1135,28 @@ class _FakeNpuRuntime:
         )
         return _fake_mx_quant(source.float(), dst_type)
 
+    def npu_add_rms_norm(
+        self,
+        x1,
+        x2,
+        gamma,
+        epsilon=1e-6,
+    ):
+        self._record(
+            "npu_add_rms_norm", x1, x2, gamma, epsilon,
+        )
+        values = _fake_rms_values(
+            x1,
+            gamma,
+            epsilon,
+            residual=x2,
+        ).to(torch.bfloat16)
+        return (
+            values,
+            torch.empty(0, dtype=torch.float32),
+            (x1.to(torch.bfloat16) + x2.to(torch.bfloat16)),
+        )
+
     def npu_rms_norm_quant(
         self,
         x,
@@ -1932,6 +1954,94 @@ def test_npu_add_mx_uses_950pr_primary_xout_scale_rstd_order(
     assert tuple(result[2].shape) == (2, 1, 2)
     assert result[2].dtype is torch.uint8
     operator.validate_prepared_correctness(data, prepared, result)
+
+
+def test_npu_add_mx_exact_codes_follow_native_unfused_reference(
+    monkeypatch,
+):
+    runtime = _FakeNpuRuntime()
+    operator = _npu_operator(
+        NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
+        PrecisionType.MXFP8,
+    )
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+    data = _data(operator, tokens=2, hidden=64)
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "npu:0",
+        PrecisionType.MXFP8,
+    )
+    cpu_reference = operator._reference_on_device(data, prepared)
+    native_reference = cpu_reference.clone()
+    native_reference[0, 0] += 0.02
+    x_out = (
+        prepared["x"].to(torch.bfloat16)
+        + prepared["residual_seed"].to(torch.bfloat16)
+    )
+    monkeypatch.setattr(
+        runtime,
+        "npu_add_rms_norm",
+        lambda *args, **kwargs: (
+            native_reference,
+            torch.empty(0, dtype=torch.float32),
+            x_out,
+        ),
+    )
+    primary, scale = runtime.npu_dynamic_mx_quant(
+        native_reference,
+        scale_alg=0,
+        round_mode="rint",
+        dst_type=292,
+    )
+    result = (
+        primary,
+        x_out,
+        scale,
+        torch.empty(0, dtype=torch.float32),
+    )
+
+    operator.validate_prepared_correctness(
+        data,
+        prepared,
+        result,
+    )
+
+
+@pytest.mark.parametrize(
+    ("variant", "precision", "missing_dependency"),
+    [
+        (
+            NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8,
+            PrecisionType.FP8,
+            "npu_dynamic_quant",
+        ),
+        (
+            NormQuantVariant.RMS_NORM_DYNAMIC_MX,
+            PrecisionType.MXFP8,
+            "npu_dynamic_mx_quant",
+        ),
+        (
+            NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
+            PrecisionType.MXFP4,
+            "npu_add_rms_norm",
+        ),
+    ],
+)
+def test_npu_formal_gate_requires_untimed_correctness_dependencies(
+    monkeypatch,
+    variant,
+    precision,
+    missing_dependency,
+):
+    runtime = _FakeNpuRuntime()
+    setattr(runtime, missing_dependency, None)
+    operator = _npu_operator(variant, precision)
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+
+    assert operator.get_formal_implementations("npu:0") == []
+    assert isinstance(operator.capability_error, RuntimeError)
+    assert "correctness dependency" in str(operator.capability_error)
+    assert missing_dependency in str(operator.capability_error)
 
 
 @pytest.mark.parametrize(

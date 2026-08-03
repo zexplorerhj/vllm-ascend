@@ -783,13 +783,11 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         self,
         data: Dict[str, Any],
     ) -> int:
-        """Count the complete allocating NPU tuple, including x_out."""
+        """Count output traffic, excluding the disabled static y2 placeholder."""
         tokens, hidden = data["x"].shape
         matrix_elements = tokens * hidden
         if self.is_static_variant:
             total = matrix_elements
-            if self.is_add_variant:
-                total += matrix_elements
         elif self.is_dynamic_fp8_variant:
             total = matrix_elements + tokens * 4
         elif self.is_mx_variant:
@@ -827,10 +825,11 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         data: Dict[str, Any],
         outputs: Optional[Any] = None,
     ) -> int:
-        """Return the retained native NPU input plus full tuple output bytes."""
+        """Return native kernel traffic, excluding disabled static Add y2."""
         output_bytes = (
             self._native_output_contract_bytes(data)
             if outputs is None
+            or self.variant is NormQuantVariant.ADD_RMS_NORM_STATIC_FP8
             else self.observable_output_bytes(outputs)
         )
         return self._native_input_bytes(data) + output_bytes

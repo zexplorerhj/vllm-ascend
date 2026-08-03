@@ -1460,7 +1460,7 @@ def test_npu_triton_static_add_is_declared_preallocated_and_logical_bytes(
             NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
             PrecisionType.FP8,
             64_516,
-            100_352,
+            93_184,
             114_688,
         ),
         (
@@ -1540,7 +1540,10 @@ def test_npu_950pr_separates_native_traffic_from_retained_footprint(
         retained_prepared_input_bytes + actual_output_bytes
         == expected_retained
     )
-    assert native_input_bytes + actual_output_bytes == expected_physical
+    assert (
+        native_input_bytes + operator._native_output_contract_bytes(data)
+        == expected_physical
+    )
     assert operator.physical_bytes(data) == expected_physical
     assert operator.physical_bytes(data, outputs) == expected_physical
 

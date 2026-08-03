@@ -730,6 +730,21 @@ class NormQuantTestSuite:
         return provider
 
     @staticmethod
+    def _physical_bytes(
+        operator: Any,
+        data: Dict[str, Any],
+        provider: str,
+    ) -> int:
+        provider_aware = getattr(
+            operator,
+            "physical_bytes_for_implementation",
+            None,
+        )
+        if callable(provider_aware):
+            return provider_aware(data, provider)
+        return operator.physical_bytes(data)
+
+    @staticmethod
     def _residual_semantics(variant: NormQuantVariant) -> str:
         if variant in (
             NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
@@ -801,7 +816,7 @@ class NormQuantTestSuite:
             hidden=point["hidden"],
             seed=0,
             logical_bytes=operator.logical_bytes(data),
-            physical_bytes=operator.physical_bytes(data),
+            physical_bytes=self._physical_bytes(operator, data, provider),
             residual_semantics=self._residual_semantics(variant),
             status="pending",
             capability_status="supported",
@@ -1894,7 +1909,11 @@ class NormQuantTestSuite:
                                             "logical_bytes / Event latency"
                                         ),
                                         physical_bandwidth_gb_s=(
-                                            operator.physical_bytes(data)
+                                            self._physical_bytes(
+                                                operator,
+                                                data,
+                                                provider,
+                                            )
                                             / (latency * 1e6)
                                         ),
                                         status="ok",

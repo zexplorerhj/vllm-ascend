@@ -21,6 +21,7 @@ try:
     from norm_quant import NpuNormQuantOperatorTest  # noqa: E402
 except ImportError:
     NpuNormQuantOperatorTest = None
+from norm_quant import npu_impl as npu_impl_module  # noqa: E402
 from operator_test_framework import PrecisionType  # noqa: E402
 
 
@@ -1345,6 +1346,20 @@ def _patch_npu_runtime(monkeypatch, operator, runtime, **ops_kwargs):
     )
 
 
+def _patch_npu_triton(monkeypatch):
+    def fake_triton(output, x, residual, weight, scale, eps):
+        del weight, scale, eps
+        output.copy_(x.to(torch.float32).to(output.dtype))
+        residual.add_(x)
+        return output
+
+    monkeypatch.setattr(
+        npu_impl_module.npu_triton_impl,
+        "run_triton_add_rms_norm_static_fp8_quant_out",
+        fake_triton,
+    )
+
+
 _NPU_PROVIDER_CASES = [
     (
         NormQuantVariant.RMS_NORM_STATIC_FP8,
@@ -1382,6 +1397,47 @@ _NPU_PROVIDER_CASES = [
         "npu_add_rms_norm_dynamic_mx_quant_mxfp4_e2m1_e8m0_g32",
     ),
 ]
+
+
+def test_npu_triton_static_add_is_declared_preallocated_and_logical_bytes(
+    monkeypatch,
+):
+    """Fails if the Triton provider loses its out/alias traffic contract."""
+    runtime = _FakeNpuRuntime()
+    operator = _npu_operator(
+        NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+        PrecisionType.FP8,
+    )
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+    _patch_npu_triton(monkeypatch)
+    data = _data(operator, tokens=2, hidden=64)
+
+    assert operator.get_declared_implementations() == [
+        operator.ADD_STATIC_FP8,
+        operator.TRITON_STATIC_ADD,
+    ]
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "npu:0",
+        PrecisionType.FP8,
+        operator.TRITON_STATIC_ADD,
+    )
+
+    assert prepared["static_scale"].shape == (1,)
+    assert prepared["static_scale"].dtype is torch.float32
+    result = operator._execute_core_operator(
+        prepared,
+        operator.TRITON_STATIC_ADD,
+    )
+    assert result is prepared["output"]
+    assert operator._declares_preallocated_output_contract(
+        prepared,
+        operator.TRITON_STATIC_ADD,
+    )
+    assert operator.physical_bytes_for_implementation(
+        data,
+        operator.TRITON_STATIC_ADD,
+    ) == operator.logical_bytes(data)
 
 
 @pytest.mark.parametrize(

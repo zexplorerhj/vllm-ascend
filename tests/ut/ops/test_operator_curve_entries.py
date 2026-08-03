@@ -446,6 +446,7 @@ class _NormQuantFakeOperator:
         providers=("provider_a",),
         capability_error=None,
         events=None,
+        provider_physical_bytes=None,
     ):
         self.variant = variant
         self.precision = precision
@@ -453,6 +454,7 @@ class _NormQuantFakeOperator:
         self.providers = list(providers)
         self.capability_error = capability_error
         self.events = events if events is not None else []
+        self.provider_physical_bytes = provider_physical_bytes
 
     def get_formal_implementations(self, device):
         del device
@@ -496,6 +498,11 @@ class _NormQuantFakeOperator:
 
     def physical_bytes(self, data):
         return self.logical_bytes(data) + data["metadata"]["tokens"] * 4
+
+    def physical_bytes_for_implementation(self, data, implementation):
+        if self.provider_physical_bytes is None:
+            return self.physical_bytes(data)
+        return self.provider_physical_bytes[implementation]
 
     def calculate_bandwidth(self, data, avg_time_ms):
         return self.logical_bytes(data) / (avg_time_ms * 1e6)
@@ -767,6 +774,51 @@ def test_norm_quant_correctness_precedes_identical_eager_and_graph_protocol(
         assert row["effective_bandwidth_semantics"] == (
             "logical_bytes / Event latency"
         )
+        assert row["physical_bandwidth_gb_s"] == pytest.approx(
+            row["physical_bytes"] / (row["latency_ms"] * 1e6)
+        )
+
+
+def test_norm_quant_uses_provider_specific_physical_bytes(tmp_path):
+    """Fails if a provider's physical traffic is replaced by the default."""
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    events = []
+    suite = NormQuantTestSuite(
+        precision="fp8",
+        device="cuda:0",
+        operator_factory=lambda device, variant, precision: (
+            _NormQuantFakeOperator(
+                variant,
+                precision,
+                providers=("provider_a", "provider_b"),
+                events=events,
+                provider_physical_bytes={
+                    "provider_a": 101,
+                    "provider_b": 202,
+                },
+            )
+        ),
+    )
+    suite.framework = _NormQuantFakeFramework(tmp_path, events)
+
+    result = suite.run_curve_test(
+        variants=[NormQuantVariant.RMS_NORM_STATIC_FP8],
+        tokens=[1],
+        hidden_sizes=[4],
+        num_warmup=2,
+        num_iterations=2,
+        num_repeats=1,
+        num_stabilization_repeats=0,
+        dispatch_mode="eager",
+        plot_results=False,
+    )
+
+    rows_by_provider = {row["provider"]: row for row in result["rows"]}
+    assert rows_by_provider["provider_a"]["physical_bytes"] == 101
+    assert rows_by_provider["provider_b"]["physical_bytes"] == 202
+    for row in rows_by_provider.values():
         assert row["physical_bandwidth_gb_s"] == pytest.approx(
             row["physical_bytes"] / (row["latency_ms"] * 1e6)
         )

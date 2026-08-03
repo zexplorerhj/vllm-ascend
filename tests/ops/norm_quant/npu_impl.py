@@ -8,6 +8,7 @@ import torch
 from operator_test_framework import DeviceType, PrecisionType
 
 from .base import NormQuantOperatorTestBase, NormQuantVariant
+from . import npu_triton_impl
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
 
     RMS_STATIC_FP8 = "npu_rms_norm_quant_fp8_e4m3_static"
     ADD_STATIC_FP8 = "npu_add_rms_norm_quant_fp8_e4m3_static"
+    TRITON_STATIC_ADD = "npu_triton_fused_add_rms_norm_static_fp8_quant_out"
     ADD_DYNAMIC_FP8 = (
         "npu_add_rms_norm_dynamic_quant_fp8_e4m3_per_token"
     )
@@ -72,6 +74,30 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         ADD_MXFP8: "npu_add_rms_norm_dynamic_mx_quant",
         ADD_MXFP4: "npu_add_rms_norm_dynamic_mx_quant",
     }
+    _DECLARED_PROVIDERS = {
+        (NormQuantVariant.RMS_NORM_STATIC_FP8, PrecisionType.FP8): (
+            RMS_STATIC_FP8,
+        ),
+        (NormQuantVariant.ADD_RMS_NORM_STATIC_FP8, PrecisionType.FP8): (
+            ADD_STATIC_FP8,
+            TRITON_STATIC_ADD,
+        ),
+        (NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8, PrecisionType.FP8): (
+            ADD_DYNAMIC_FP8,
+        ),
+        (NormQuantVariant.RMS_NORM_DYNAMIC_MX, PrecisionType.MXFP8): (
+            RMS_MXFP8,
+        ),
+        (NormQuantVariant.RMS_NORM_DYNAMIC_MX, PrecisionType.MXFP4): (
+            RMS_MXFP4,
+        ),
+        (NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX, PrecisionType.MXFP8): (
+            ADD_MXFP8,
+        ),
+        (NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX, PrecisionType.MXFP4): (
+            ADD_MXFP4,
+        ),
+    }
     _SCHEMA_CONTRACTS = {
         "npu_rms_norm_quant": (frozenset({"dst_dtype"}), 1),
         "npu_add_rms_norm_quant": (frozenset({"dst_type"}), 3),
@@ -115,6 +141,9 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             Tuple[str, str, str, int], CapabilityResult
         ] = {}
         self._capability_error: Optional[BaseException] = None
+
+    def get_declared_implementations(self) -> List[str]:
+        return list(self._DECLARED_PROVIDERS[(self.variant, self.precision)])
 
     @property
     def capability_error(self) -> Optional[BaseException]:
@@ -365,6 +394,82 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         self._capability_error = probe_result.error
         return probe_result
 
+    def _probe_triton_capability(
+        self,
+        device: str,
+        runtime: Any,
+    ) -> CapabilityResult:
+        version = str(getattr(runtime, "__version__", "unknown"))
+        key = (device, version, self.TRITON_STATIC_ADD, self.FP8_DTYPE_CODE)
+        cached = self._capability_cache.get(key)
+        if cached is not None:
+            self._capability_error = cached.error
+            return cached
+        try:
+            x = self._copy_to_device(
+                torch.ones(1, 64, dtype=torch.bfloat16),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            residual = self._copy_to_device(
+                torch.zeros(1, 64, dtype=torch.bfloat16),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            weight = self._copy_to_device(
+                torch.ones(64, dtype=torch.bfloat16),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            scale = self._copy_to_device(
+                torch.ones(1, dtype=torch.float32),
+                device=device,
+                dtype=torch.float32,
+            )
+            output = torch.empty(
+                x.shape,
+                dtype=self._fp8_dtype(),
+                device=device,
+            )
+            result = npu_triton_impl.run_triton_add_rms_norm_static_fp8_quant_out(
+                output,
+                x,
+                residual,
+                weight,
+                scale,
+                1e-6,
+            )
+            if result is not output:
+                raise RuntimeError("Triton probe did not return the output buffer")
+            self._assert_tensor_contract(
+                output,
+                shape=(1, 64),
+                dtype=self._fp8_dtype(),
+                label="Triton probe output",
+            )
+            self._assert_tensor_contract(
+                residual,
+                shape=(1, 64),
+                dtype=torch.bfloat16,
+                label="Triton probe residual",
+            )
+            torch.testing.assert_close(
+                residual,
+                x,
+                rtol=0,
+                atol=0,
+            )
+            synchronize = getattr(runtime.npu, "synchronize", None)
+            if not callable(synchronize):
+                raise RuntimeError("torch_npu.npu.synchronize is unavailable")
+            synchronize(self._device_index(device))
+            probe_result = CapabilityResult(True)
+        except Exception as error:
+            probe_result = CapabilityResult(False, error)
+        self._capability_cache[key] = probe_result
+        self._capability_error = probe_result.error
+        return probe_result
+
     def get_formal_implementations(self, device: str) -> List[str]:
         if not device.startswith("npu"):
             return self._reject_formal(
@@ -385,32 +490,60 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             )
         implementation = self._PROVIDERS[(self.variant, self.precision)]
         native_op = self._NATIVE_OPS[implementation]
+        supported: List[str] = []
+        errors: List[BaseException] = []
         if not callable(getattr(runtime, native_op, None)):
-            return self._reject_formal(
-                f"torch_npu runtime symbol {native_op} is unavailable"
+            errors.append(
+                RuntimeError(f"torch_npu runtime symbol {native_op} is unavailable")
             )
-        if not self._schema_supported(native_op):
-            return self._reject_formal(
-                f"torch.ops.npu.{native_op} schema does not satisfy "
-                "the captured 950PR ABI"
-            )
-        if not self._runtime_dtype_supported(runtime):
-            return self._reject_formal(
-                f"{implementation} required native dtype is unavailable"
-            )
-        for dependency in self._correctness_dependencies():
-            if not callable(getattr(runtime, dependency, None)):
-                return self._reject_formal(
-                    f"{implementation} untimed correctness dependency "
-                    f"{dependency} is unavailable"
+        elif not self._schema_supported(native_op):
+            errors.append(
+                RuntimeError(
+                    f"torch.ops.npu.{native_op} schema does not satisfy "
+                    "the captured 950PR ABI"
                 )
-        capability = self._probe_capability(
-            device,
-            runtime,
-            native_op,
-            self._dtype_code(),
-        )
-        return [implementation] if capability.supported else []
+            )
+        elif not self._runtime_dtype_supported(runtime):
+            errors.append(
+                RuntimeError(
+                    f"{implementation} required native dtype is unavailable"
+                )
+            )
+        else:
+            missing_dependency = next(
+                (
+                    dependency
+                    for dependency in self._correctness_dependencies()
+                    if not callable(getattr(runtime, dependency, None))
+                ),
+                None,
+            )
+            if missing_dependency is not None:
+                errors.append(
+                    RuntimeError(
+                        f"{implementation} untimed correctness dependency "
+                        f"{missing_dependency} is unavailable"
+                    )
+                )
+            else:
+                capability = self._probe_capability(
+                    device,
+                    runtime,
+                    native_op,
+                    self._dtype_code(),
+                )
+                if capability.supported:
+                    supported.append(implementation)
+                elif capability.error is not None:
+                    errors.append(capability.error)
+        if self.variant is NormQuantVariant.ADD_RMS_NORM_STATIC_FP8:
+            triton_capability = self._probe_triton_capability(device, runtime)
+            if triton_capability.supported:
+                supported.append(self.TRITON_STATIC_ADD)
+            elif triton_capability.error is not None:
+                errors.append(triton_capability.error)
+        self._capability_error = None if supported else (errors[0] if errors else None)
+        return supported
 
     def get_available_implementations(self, device: str) -> List[str]:
         return self.get_formal_implementations(device)
@@ -522,12 +655,6 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             )
 
         runtime = self._load_torch_npu()
-        native_op = self._NATIVE_OPS[resolved]
-        op = getattr(runtime, native_op, None)
-        if not callable(op):
-            raise RuntimeError(
-                f"torch_npu.{native_op} became unavailable after probe"
-            )
         x = self._copy_to_device(
             x_source,
             device=device,
@@ -540,13 +667,43 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         )
         prepared: Dict[str, Any] = {
             "implementation": resolved,
-            "op": op,
             "runtime": runtime,
             "device": device,
             "x": x,
             "weight": weight,
             "eps": float(data["eps"]),
         }
+        if resolved == self.TRITON_STATIC_ADD:
+            if not self.is_add_variant:
+                raise ValueError("Triton provider requires AddRMSNorm")
+            prepared["op"] = (
+                npu_triton_impl.run_triton_add_rms_norm_static_fp8_quant_out
+            )
+            prepared["static_scale"] = self._copy_to_device(
+                self._static_scale_for_reference(
+                    self._vllm_static_quant_values(
+                        data["x"],
+                        data.get("residual"),
+                        data["weight"],
+                        float(data["eps"]),
+                    )
+                ),
+                device=device,
+                dtype=torch.float32,
+            ).contiguous()
+            prepared["output"] = torch.empty(
+                x.shape,
+                dtype=self._fp8_dtype(),
+                device=device,
+            )
+        else:
+            native_op = self._NATIVE_OPS[resolved]
+            op = getattr(runtime, native_op, None)
+            if not callable(op):
+                raise RuntimeError(
+                    f"torch_npu.{native_op} became unavailable after probe"
+                )
+            prepared["op"] = op
         if resolved == self.RMS_STATIC_FP8:
             prepared["beta"] = self._copy_to_device(
                 torch.zeros_like(weight_source),
@@ -589,6 +746,16 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 "NormQuant prepared data provenance mismatch: "
                 f"prepared for {resolved!r}, requested {implementation!r}"
             )
+        if resolved == self.TRITON_STATIC_ADD:
+            prepared_data["op"](
+                prepared_data["output"],
+                prepared_data["x"],
+                prepared_data["residual"],
+                prepared_data["weight"],
+                prepared_data["static_scale"],
+                prepared_data["eps"],
+            )
+            return prepared_data["output"]
         return self._invoke_native(prepared_data)
 
     def _retained_prepared_input_bytes(
@@ -667,6 +834,15 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             else self.observable_output_bytes(outputs)
         )
         return self._native_input_bytes(data) + output_bytes
+
+    def physical_bytes_for_implementation(
+        self,
+        data: Dict[str, Any],
+        implementation: str,
+    ) -> int:
+        if implementation == self.TRITON_STATIC_ADD:
+            return super().physical_bytes(data)
+        return self.physical_bytes(data)
 
     @staticmethod
     def _result_tuple(result: Any, expected_arity: int) -> Tuple[Any, ...]:
@@ -1059,6 +1235,31 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         result: Any,
     ) -> None:
         """Validate allocating NPU primary and auxiliary outputs untimed."""
+        if prepared.get("implementation") == self.TRITON_STATIC_ADD:
+            tokens, hidden = data["x"].shape
+            self._assert_tensor_contract(
+                result,
+                shape=(tokens, hidden),
+                dtype=self._fp8_dtype(),
+                label="Triton static FP8 primary",
+            )
+            expected_values = self._vllm_static_quant_values(
+                prepared["x"],
+                prepared["residual_seed"],
+                prepared["weight"],
+                prepared["eps"],
+            )
+            expected = self._quantize_expected_fp8(
+                expected_values,
+                prepared["static_scale"],
+            )
+            self._assert_fp8_codes_close(
+                result,
+                expected,
+                label="Triton static FP8 codes",
+            )
+            self._validate_x_out(prepared, prepared["residual"])
+            return
         if self.is_mx_variant:
             self._validate_mx_correctness(data, prepared, result)
         else:
@@ -1069,5 +1270,5 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         prepared_data: Dict[str, Any],
         implementation: str = "default",
     ) -> bool:
-        del prepared_data, implementation
-        return False
+        resolved = prepared_data.get("implementation", implementation)
+        return resolved == self.TRITON_STATIC_ADD

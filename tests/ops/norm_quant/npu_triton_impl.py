@@ -144,7 +144,10 @@ def run_triton_add_rms_norm_static_fp8_quant_out(
         raise ValueError("Triton AddRMSNorm requires an NPU tensor")
     if any(tensor.device != x.device for tensor in (output, residual, weight, scale)):
         raise ValueError("all Triton AddRMSNorm tensors must share one device")
-    block_size = triton.next_power_of_2(cols)
+    # Ascend Triton accepts an exact constexpr arange width.  Keeping the
+    # logical hidden size avoids carrying masked lanes through the full
+    # Add/RMSNorm/quant pipeline (for example, 7168 -> 8192 wastes 12.5%).
+    block_size = cols
     programs = min(rows, _num_vectorcore(x.device))
     _add_rms_norm_static_fp8_kernel[(programs,)](
         output,

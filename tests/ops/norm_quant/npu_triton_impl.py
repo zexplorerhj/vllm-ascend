@@ -1,5 +1,6 @@
 """Preallocated Triton AddRMSNorm static-FP8 provider for Ascend 950PR."""
 
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -25,6 +26,7 @@ if triton is not None:
         cols: tl.constexpr,
         eps: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
+        ROUND_BF16_INTERMEDIATES: tl.constexpr,
     ):
         pid = tl.program_id(0)
         programs = tl.num_programs(0)
@@ -36,7 +38,7 @@ if triton is not None:
         scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
         for row in range(pid, rows, programs):
             row_offsets = row * cols + offsets
-            summed = (
+            h_f32 = (
                 tl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(
                     tl.float32
                 )
@@ -45,15 +47,18 @@ if triton is not None:
                     mask=mask,
                     other=0.0,
                 ).to(tl.float32)
-            ).to(tl.bfloat16)
-            tl.store(residual_ptr + row_offsets, summed, mask=mask)
-            summed_f32 = summed.to(tl.float32)
-            inv_rms = 1.0 / tl.sqrt(
-                tl.sum(summed_f32 * summed_f32, axis=0) / cols + eps
             )
-            normalized = (
-                summed_f32 * inv_rms * weight
-            ).to(tl.bfloat16).to(tl.float32)
+            residual_out = h_f32.to(tl.bfloat16)
+            tl.store(residual_ptr + row_offsets, residual_out, mask=mask)
+            norm_input = h_f32
+            if ROUND_BF16_INTERMEDIATES:
+                norm_input = residual_out.to(tl.float32)
+            inv_rms = 1.0 / tl.sqrt(
+                tl.sum(norm_input * norm_input, axis=0) / cols + eps
+            )
+            normalized = norm_input * inv_rms * weight
+            if ROUND_BF16_INTERMEDIATES:
+                normalized = normalized.to(tl.bfloat16).to(tl.float32)
             quantized = tl.maximum(
                 -448.0,
                 tl.minimum(448.0, normalized * scale_inv),
@@ -83,11 +88,12 @@ def _require_tensor(
     return value
 
 
-def _num_vectorcore(device: torch.device) -> int:
+@lru_cache(maxsize=None)
+def _num_vectorcore_for_index(device_index: int) -> int:
     if triton is None:
         raise RuntimeError("Triton is unavailable")
     properties = triton.runtime.driver.active.utils.get_device_properties(
-        device.index or 0
+        device_index
     )
     count = int(properties["num_vectorcore"])
     if count <= 0:
@@ -95,15 +101,21 @@ def _num_vectorcore(device: torch.device) -> int:
     return count
 
 
-def run_triton_add_rms_norm_static_fp8_quant_out(
+def _num_vectorcore(device: torch.device) -> int:
+    """Return the cached vector-core count for one NPU device."""
+    return _num_vectorcore_for_index(device.index or 0)
+
+
+def _run_triton_add_rms_norm_static_fp8_quant_out(
     output: torch.Tensor,
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
     eps: float,
+    *,
+    round_bf16_intermediates: bool,
 ) -> torch.Tensor:
-    """Quantize one BF16 AddRMSNorm result into the provided E4M3 buffer."""
     if triton is None:
         raise RuntimeError("Triton is unavailable")
     output = _require_tensor(
@@ -159,5 +171,46 @@ def run_triton_add_rms_norm_static_fp8_quant_out(
         cols=cols,
         eps=eps,
         BLOCK_SIZE=block_size,
+        ROUND_BF16_INTERMEDIATES=round_bf16_intermediates,
     )
     return output
+
+
+def run_triton_add_rms_norm_static_fp8_quant_out(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Run the vLLM-style BF16-rounded AddRMSNorm FP8 contract."""
+    return _run_triton_add_rms_norm_static_fp8_quant_out(
+        output,
+        x,
+        residual,
+        weight,
+        scale,
+        eps,
+        round_bf16_intermediates=True,
+    )
+
+
+def run_triton_flashinfer_add_rms_norm_static_fp8_quant_out(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Keep FP32 h through RMSNorm and convert its result directly to FP8."""
+    return _run_triton_add_rms_norm_static_fp8_quant_out(
+        output,
+        x,
+        residual,
+        weight,
+        scale,
+        eps,
+        round_bf16_intermediates=False,
+    )

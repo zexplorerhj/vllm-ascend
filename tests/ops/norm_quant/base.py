@@ -366,6 +366,20 @@ class NormQuantOperatorTestBase(BaseOperatorTest):
         ).to(x.dtype).float()
 
     @staticmethod
+    def _flashinfer_static_add_quant_values(
+        x: torch.Tensor,
+        residual_seed: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Mirror FlashInfer's FP32 h and direct FP8 quantization input."""
+        combined = x.float() + residual_seed.float()
+        rms = torch.rsqrt(
+            combined.square().mean(dim=-1, keepdim=True) + eps
+        )
+        return combined * rms * weight.float()
+
+    @staticmethod
     def _dynamic_scale_for_values(
         quant_values: torch.Tensor,
     ) -> torch.Tensor:

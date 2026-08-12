@@ -1358,6 +1358,11 @@ def _patch_npu_triton(monkeypatch):
         "run_triton_add_rms_norm_static_fp8_quant_out",
         fake_triton,
     )
+    monkeypatch.setattr(
+        npu_impl_module.npu_triton_impl,
+        "run_triton_flashinfer_add_rms_norm_static_fp8_quant_out",
+        fake_triton,
+    )
 
 
 _NPU_PROVIDER_CASES = [
@@ -1399,8 +1404,13 @@ _NPU_PROVIDER_CASES = [
 ]
 
 
+@pytest.mark.parametrize(
+    "implementation_attribute",
+    ["TRITON_STATIC_ADD", "TRITON_FLASHINFER_STATIC_ADD"],
+)
 def test_npu_triton_static_add_is_declared_preallocated_and_logical_bytes(
     monkeypatch,
+    implementation_attribute,
 ):
     """Fails if the Triton provider loses its out/alias traffic contract."""
     runtime = _FakeNpuRuntime()
@@ -1415,29 +1425,193 @@ def test_npu_triton_static_add_is_declared_preallocated_and_logical_bytes(
     assert operator.get_declared_implementations() == [
         operator.ADD_STATIC_FP8,
         operator.TRITON_STATIC_ADD,
+        operator.TRITON_FLASHINFER_STATIC_ADD,
     ]
+    implementation = getattr(operator, implementation_attribute)
     prepared = operator._prepare_data_for_core_operator(
         data,
         "npu:0",
         PrecisionType.FP8,
-        operator.TRITON_STATIC_ADD,
+        implementation,
     )
 
     assert prepared["static_scale"].shape == (1,)
     assert prepared["static_scale"].dtype is torch.float32
     result = operator._execute_core_operator(
         prepared,
-        operator.TRITON_STATIC_ADD,
+        implementation,
     )
     assert result is prepared["output"]
     assert operator._declares_preallocated_output_contract(
         prepared,
-        operator.TRITON_STATIC_ADD,
+        implementation,
     )
     assert operator.physical_bytes_for_implementation(
         data,
-        operator.TRITON_STATIC_ADD,
+        implementation,
     ) == operator.logical_bytes(data)
+
+
+def test_npu_triton_flashinfer_static_add_validates_fp32_h(monkeypatch):
+    runtime = _FakeNpuRuntime()
+    operator = _npu_operator(
+        NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+        PrecisionType.FP8,
+    )
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+    _patch_npu_triton(monkeypatch)
+
+    def fake_flashinfer(output, x, residual, weight, scale, eps):
+        h_f32 = x.float() + residual.float()
+        residual.copy_(h_f32.to(torch.bfloat16))
+        inv_rms = torch.rsqrt(
+            h_f32.square().mean(dim=-1, keepdim=True) + eps
+        )
+        normalized = h_f32 * inv_rms * weight.float()
+        output.copy_(
+            (normalized / scale)
+            .clamp(min=-448.0, max=448.0)
+            .to(output.dtype)
+        )
+        return output
+
+    monkeypatch.setattr(
+        npu_impl_module.npu_triton_impl,
+        "run_triton_flashinfer_add_rms_norm_static_fp8_quant_out",
+        fake_flashinfer,
+    )
+    data = _data(operator, tokens=2, hidden=64)
+    vllm_values = operator._vllm_static_quant_values(
+        data["x"],
+        data["residual"],
+        data["weight"],
+        data["eps"],
+    )
+    flashinfer_values = operator._flashinfer_static_add_quant_values(
+        data["x"],
+        data["residual"],
+        data["weight"],
+        data["eps"],
+    )
+    common_scale = operator._static_scale_for_reference(vllm_values)
+    assert not torch.equal(
+        operator._quantize_expected_fp8(vllm_values, common_scale),
+        operator._quantize_expected_fp8(flashinfer_values, common_scale),
+    )
+    prepared = operator._prepare_data_for_core_operator(
+        data,
+        "npu:0",
+        PrecisionType.FP8,
+        operator.TRITON_FLASHINFER_STATIC_ADD,
+    )
+    result = operator._execute_core_operator(
+        prepared,
+        operator.TRITON_FLASHINFER_STATIC_ADD,
+    )
+
+    expected_flashinfer = operator._quantize_expected_fp8(
+        operator._flashinfer_static_add_quant_values(
+            prepared["x"],
+            prepared["residual_seed"],
+            prepared["weight"],
+            prepared["eps"],
+        ),
+        prepared["static_scale"],
+    )
+    expected_vllm = operator._quantize_expected_fp8(
+        operator._vllm_static_quant_values(
+            prepared["x"],
+            prepared["residual_seed"],
+            prepared["weight"],
+            prepared["eps"],
+        ),
+        prepared["static_scale"],
+    )
+    assert torch.equal(result, expected_flashinfer)
+    assert not torch.equal(result, expected_vllm)
+
+    operator.validate_prepared_correctness(data, prepared, result)
+
+
+@pytest.mark.parametrize(
+    ("wrapper_name", "expected_rounding"),
+    [
+        ("run_triton_add_rms_norm_static_fp8_quant_out", True),
+        (
+            "run_triton_flashinfer_add_rms_norm_static_fp8_quant_out",
+            False,
+        ),
+    ],
+)
+def test_npu_triton_public_wrappers_select_bf16_rounding_specialization(
+    monkeypatch,
+    wrapper_name,
+    expected_rounding,
+):
+    calls = []
+    sentinel = object()
+
+    def fake_launch(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(
+        npu_impl_module.npu_triton_impl,
+        "_run_triton_add_rms_norm_static_fp8_quant_out",
+        fake_launch,
+    )
+    wrapper = getattr(npu_impl_module.npu_triton_impl, wrapper_name)
+
+    assert wrapper(*([object()] * 6)) is sentinel
+    assert len(calls) == 1
+    assert calls[0][1] == {
+        "round_bf16_intermediates": expected_rounding,
+    }
+
+
+@pytest.mark.parametrize(
+    ("failing_symbol", "missing_provider", "kept_provider"),
+    [
+        (
+            "run_triton_add_rms_norm_static_fp8_quant_out",
+            "TRITON_STATIC_ADD",
+            "TRITON_FLASHINFER_STATIC_ADD",
+        ),
+        (
+            "run_triton_flashinfer_add_rms_norm_static_fp8_quant_out",
+            "TRITON_FLASHINFER_STATIC_ADD",
+            "TRITON_STATIC_ADD",
+        ),
+    ],
+)
+def test_npu_triton_capability_failures_are_provider_isolated(
+    monkeypatch,
+    failing_symbol,
+    missing_provider,
+    kept_provider,
+):
+    runtime = _FakeNpuRuntime()
+    operator = _npu_operator(
+        NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+        PrecisionType.FP8,
+    )
+    _patch_npu_runtime(monkeypatch, operator, runtime)
+    _patch_npu_triton(monkeypatch)
+
+    def fail_probe(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("provider-specific Triton compile failure")
+
+    monkeypatch.setattr(
+        npu_impl_module.npu_triton_impl,
+        failing_symbol,
+        fail_probe,
+    )
+    formal = operator.get_formal_implementations("npu:0")
+
+    assert operator.ADD_STATIC_FP8 in formal
+    assert getattr(operator, kept_provider) in formal
+    assert getattr(operator, missing_provider) not in formal
 
 
 @pytest.mark.parametrize(

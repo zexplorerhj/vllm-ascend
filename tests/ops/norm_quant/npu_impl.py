@@ -29,6 +29,9 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
     RMS_STATIC_FP8 = "npu_rms_norm_quant_fp8_e4m3_static"
     ADD_STATIC_FP8 = "npu_add_rms_norm_quant_fp8_e4m3_static"
     TRITON_STATIC_ADD = "npu_triton_fused_add_rms_norm_static_fp8_quant_out"
+    TRITON_FLASHINFER_STATIC_ADD = (
+        "npu_triton_flashinfer_fused_add_rms_norm_static_fp8_quant_out"
+    )
     ADD_DYNAMIC_FP8 = (
         "npu_add_rms_norm_dynamic_quant_fp8_e4m3_per_token"
     )
@@ -44,6 +47,15 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
     ADD_MXFP4 = (
         "npu_add_rms_norm_dynamic_mx_quant_mxfp4_e2m1_e8m0_g32"
     )
+
+    _TRITON_SYMBOLS = {
+        TRITON_STATIC_ADD: (
+            "run_triton_add_rms_norm_static_fp8_quant_out"
+        ),
+        TRITON_FLASHINFER_STATIC_ADD: (
+            "run_triton_flashinfer_add_rms_norm_static_fp8_quant_out"
+        ),
+    }
 
     _PROVIDERS = {
         (NormQuantVariant.RMS_NORM_STATIC_FP8, PrecisionType.FP8):
@@ -81,6 +93,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         (NormQuantVariant.ADD_RMS_NORM_STATIC_FP8, PrecisionType.FP8): (
             ADD_STATIC_FP8,
             TRITON_STATIC_ADD,
+            TRITON_FLASHINFER_STATIC_ADD,
         ),
         (NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8, PrecisionType.FP8): (
             ADD_DYNAMIC_FP8,
@@ -398,9 +411,10 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         self,
         device: str,
         runtime: Any,
+        implementation: str,
     ) -> CapabilityResult:
         version = str(getattr(runtime, "__version__", "unknown"))
-        key = (device, version, self.TRITON_STATIC_ADD, self.FP8_DTYPE_CODE)
+        key = (device, version, implementation, self.FP8_DTYPE_CODE)
         cached = self._capability_cache.get(key)
         if cached is not None:
             self._capability_error = cached.error
@@ -426,12 +440,15 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 device=device,
                 dtype=torch.float32,
             )
-            output = torch.empty(
-                x.shape,
+            output = torch.empty_like(
+                x,
                 dtype=self._fp8_dtype(),
-                device=device,
             )
-            result = npu_triton_impl.run_triton_add_rms_norm_static_fp8_quant_out(
+            op = getattr(
+                npu_triton_impl,
+                self._TRITON_SYMBOLS[implementation],
+            )
+            result = op(
                 output,
                 x,
                 residual,
@@ -537,11 +554,16 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 elif capability.error is not None:
                     errors.append(capability.error)
         if self.variant is NormQuantVariant.ADD_RMS_NORM_STATIC_FP8:
-            triton_capability = self._probe_triton_capability(device, runtime)
-            if triton_capability.supported:
-                supported.append(self.TRITON_STATIC_ADD)
-            elif triton_capability.error is not None:
-                errors.append(triton_capability.error)
+            for triton_implementation in self._TRITON_SYMBOLS:
+                triton_capability = self._probe_triton_capability(
+                    device,
+                    runtime,
+                    triton_implementation,
+                )
+                if triton_capability.supported:
+                    supported.append(triton_implementation)
+                elif triton_capability.error is not None:
+                    errors.append(triton_capability.error)
         self._capability_error = None if supported else (errors[0] if errors else None)
         return supported
 
@@ -673,11 +695,12 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
             "weight": weight,
             "eps": float(data["eps"]),
         }
-        if resolved == self.TRITON_STATIC_ADD:
+        if resolved in self._TRITON_SYMBOLS:
             if not self.is_add_variant:
                 raise ValueError("Triton provider requires AddRMSNorm")
-            prepared["op"] = (
-                npu_triton_impl.run_triton_add_rms_norm_static_fp8_quant_out
+            prepared["op"] = getattr(
+                npu_triton_impl,
+                self._TRITON_SYMBOLS[resolved],
             )
             prepared["static_scale"] = self._copy_to_device(
                 self._static_scale_for_reference(
@@ -691,10 +714,9 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 device=device,
                 dtype=torch.float32,
             ).contiguous()
-            prepared["output"] = torch.empty(
-                x.shape,
+            prepared["output"] = torch.empty_like(
+                x,
                 dtype=self._fp8_dtype(),
-                device=device,
             )
         else:
             native_op = self._NATIVE_OPS[resolved]
@@ -710,7 +732,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 device=device,
                 dtype=torch.bfloat16,
             )
-        if self.is_static_variant:
+        if self.is_static_variant and resolved not in self._TRITON_SYMBOLS:
             prepared["scale"] = self._copy_to_device(
                 torch.ones_like(weight_source),
                 device=device,
@@ -746,7 +768,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 "NormQuant prepared data provenance mismatch: "
                 f"prepared for {resolved!r}, requested {implementation!r}"
             )
-        if resolved == self.TRITON_STATIC_ADD:
+        if resolved in self._TRITON_SYMBOLS:
             prepared_data["op"](
                 prepared_data["output"],
                 prepared_data["x"],
@@ -839,7 +861,7 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         data: Dict[str, Any],
         implementation: str,
     ) -> int:
-        if implementation == self.TRITON_STATIC_ADD:
+        if implementation in self._TRITON_SYMBOLS:
             return super().physical_bytes(data)
         return self.physical_bytes(data)
 
@@ -1234,7 +1256,8 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         result: Any,
     ) -> None:
         """Validate allocating NPU primary and auxiliary outputs untimed."""
-        if prepared.get("implementation") == self.TRITON_STATIC_ADD:
+        implementation = prepared.get("implementation")
+        if implementation in self._TRITON_SYMBOLS:
             tokens, hidden = data["x"].shape
             self._assert_tensor_contract(
                 result,
@@ -1242,12 +1265,20 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
                 dtype=self._fp8_dtype(),
                 label="Triton static FP8 primary",
             )
-            expected_values = self._vllm_static_quant_values(
-                prepared["x"],
-                prepared["residual_seed"],
-                prepared["weight"],
-                prepared["eps"],
-            )
+            if implementation == self.TRITON_FLASHINFER_STATIC_ADD:
+                expected_values = self._flashinfer_static_add_quant_values(
+                    prepared["x"],
+                    prepared["residual_seed"],
+                    prepared["weight"],
+                    prepared["eps"],
+                )
+            else:
+                expected_values = self._vllm_static_quant_values(
+                    prepared["x"],
+                    prepared["residual_seed"],
+                    prepared["weight"],
+                    prepared["eps"],
+                )
             expected = self._quantize_expected_fp8(
                 expected_values,
                 prepared["static_scale"],
@@ -1270,4 +1301,4 @@ class NpuNormQuantOperatorTest(NormQuantOperatorTestBase):
         implementation: str = "default",
     ) -> bool:
         resolved = prepared_data.get("implementation", implementation)
-        return resolved == self.TRITON_STATIC_ADD
+        return resolved in self._TRITON_SYMBOLS

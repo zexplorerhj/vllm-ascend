@@ -344,6 +344,35 @@ def test_norm_quant_entry_exposes_formal_suite():
     assert NormQuantTestSuite.__name__ == "NormQuantTestSuite"
 
 
+def test_norm_quant_default_variants_follow_device_capability():
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    npu_suite = NormQuantTestSuite(precision="fp8", device="npu:0")
+    cuda_suite = NormQuantTestSuite(precision="fp8", device="cuda:0")
+
+    assert npu_suite.default_variants == (
+        NormQuantVariant.RMS_NORM_STATIC_FP8,
+        NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+    )
+    assert cuda_suite.default_variants == (
+        NormQuantVariant.RMS_NORM_STATIC_FP8,
+        NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+        NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8,
+    )
+
+
+def test_npu_dynamic_fp8_variant_remains_available_when_explicit():
+    from norm_quant import NormQuantVariant
+    from tests.test_norm_quant import NormQuantTestSuite
+
+    suite = NormQuantTestSuite(precision="fp8", device="npu:0")
+
+    assert suite._normalize_variants([
+        NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8,
+    ]) == [NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8]
+
+
 @pytest.mark.parametrize(
     ("device", "variant", "precision", "tokens", "hidden", "expected"),
     [

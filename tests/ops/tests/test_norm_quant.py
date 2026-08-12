@@ -70,6 +70,10 @@ FP8_VARIANTS = (
     NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
     NormQuantVariant.ADD_RMS_NORM_DYNAMIC_FP8,
 )
+NPU_FP8_DEFAULT_VARIANTS = (
+    NormQuantVariant.RMS_NORM_STATIC_FP8,
+    NormQuantVariant.ADD_RMS_NORM_STATIC_FP8,
+)
 MX_VARIANTS = (
     NormQuantVariant.RMS_NORM_DYNAMIC_MX,
     NormQuantVariant.ADD_RMS_NORM_DYNAMIC_MX,
@@ -657,11 +661,15 @@ class NormQuantTestSuite:
 
     @property
     def default_variants(self) -> Tuple[NormQuantVariant, ...]:
-        return (
-            FP8_VARIANTS
-            if self.precision is PrecisionType.FP8
-            else MX_VARIANTS
-        )
+        if self.precision is not PrecisionType.FP8:
+            return MX_VARIANTS
+        if self.device.startswith("npu"):
+            # The current 950PR CANN ABI accepts only INT8/QUINT4X2 as the
+            # y_dtype of npu_add_rms_norm_dynamic_quant.  Keep that provider
+            # available for explicit capability diagnostics, but do not make
+            # the unsupported FP8 output part of the default PR curve suite.
+            return NPU_FP8_DEFAULT_VARIANTS
+        return FP8_VARIANTS
 
     def _require_framework(self) -> OperatorTestFramework:
         if self.framework is None:
